@@ -1,0 +1,13 @@
+{
+  "name": "virgo-server",
+  "version": "1.0.0",
+  "description": "VIRGO: Space Dominion Game Server",
+  "main": "server.js",
+  "scripts": {
+    "start": "node server.js"
+  },
+  "dependencies": {
+    "express": "^4.18.2",
+    "axios": "^1.6.0"
+  }
+}
