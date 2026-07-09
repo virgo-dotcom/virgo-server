@@ -2,6 +2,17 @@
 //  VIRGO: Space Dominion — Game Server
 //  Node.js Server für Render.com
 //  Ersetzt PlayFab CloudScript für Spiellogik
+//
+//  ÄNDERUNG (Juli 2026):
+//  /processFleet hat bisher die verarbeitete Flotte NIE aus
+//  commander.activeFleets entfernt und eine neu erzeugte
+//  Rückflug-Flotte NIE gespeichert. Dadurch:
+//   - blieben "Geister-Flotten" (hasArrived=true) für immer
+//     in activeFleets stehen
+//   - gingen Rückflüge (Schiffe!) komplett verloren, sobald
+//     der Spieler beim Ankommen der Angriffsflotte online war
+//  /serverTick hatte das schon richtig gemacht (splice + push).
+//  /processFleet macht es jetzt genauso.
 // ============================================================
 
 const express = require('express');
@@ -37,10 +48,12 @@ async function playfabServer(endpoint, data) {
 
 // -------------------------------------------------------
 // Flotte verarbeiten (Kampf, Rückflug, etc.)
+// Wird von Unity aufgerufen, sobald eine Flotte (clientseitig
+// erkannt) angekommen ist.
 // -------------------------------------------------------
 app.post('/processFleet', async (req, res) => {
     const { playFabId, fleetId } = req.body;
-    if (!playFabId || !fleetId) 
+    if (!playFabId || !fleetId)
         return res.status(400).json({ error: 'playFabId und fleetId erforderlich' });
 
     try {
@@ -56,24 +69,46 @@ app.post('/processFleet', async (req, res) => {
         const commander = JSON.parse(userData.Data['commander_data'].Value);
         const now = new Date();
 
-        // Flotte finden
-        const fleetIndex = commander.activeFleets?.findIndex(f => f.fleetId === fleetId);
-        if (fleetIndex === -1 || fleetIndex === undefined)
-            return res.status(404).json({ error: 'Flotte nicht gefunden' });
+        if (!commander.activeFleets) commander.activeFleets = [];
+
+        const fleetIndex = commander.activeFleets.findIndex(f => f.fleetId === fleetId);
+
+        // Flotte nicht (mehr) vorhanden -> wurde vermutlich schon von
+        // /serverTick oder einem parallelen Aufruf verarbeitet. Kein Fehler.
+        if (fleetIndex === -1) {
+            return res.json({ success: true, message: 'Flotte nicht (mehr) vorhanden, vermutlich bereits verarbeitet' });
+        }
 
         const fleet = commander.activeFleets[fleetIndex];
 
-        // Bereits verarbeitet?
-        if (fleet.hasArrived)
-            return res.json({ success: true, message: 'Bereits verarbeitet' });
+        // Geister-Flotte aus einem alten Client-Stand (hasArrived=true, aber
+        // nie aus der Liste entfernt) -> jetzt bereinigen und Schluss.
+        if (fleet.hasArrived) {
+            commander.activeFleets.splice(fleetIndex, 1);
+            await playfabServer('/Server/UpdateUserData', {
+                PlayFabId: playFabId,
+                Data: { 'commander_data': JSON.stringify(commander) },
+                Permission: 'Private'
+            });
+            return res.json({ success: true, message: 'Geister-Flotte bereinigt (war bereits verarbeitet)' });
+        }
 
         // Noch nicht angekommen?
-        if (new Date(fleet.arrivalUtc) > now)
-            return res.json({ success: false, message: 'Noch nicht angekommen', remainingSeconds: (new Date(fleet.arrivalUtc) - now) / 1000 });
+        if (new Date(fleet.arrivalUtc) > now) {
+            return res.json({
+                success: false,
+                message: 'Noch nicht angekommen',
+                remainingSeconds: (new Date(fleet.arrivalUtc) - now) / 1000
+            });
+        }
 
-        // Flotte verarbeiten
-        commander.activeFleets[fleetIndex].hasArrived = true;
-        const result = await processFleetArrival(playFabId, commander, fleet, now);
+        // Flotte verarbeiten (Kampf oder Rückflug-Landung)
+        const returnFleet = await processFleetArrival(playFabId, commander, fleet, now);
+
+        // WICHTIG: alte Flotte aus der Liste entfernen,
+        // ggf. neue Rückflug-Flotte hinzufügen (wie in /serverTick)
+        commander.activeFleets.splice(fleetIndex, 1);
+        if (returnFleet) commander.activeFleets.push(returnFleet);
 
         // Commander speichern
         await playfabServer('/Server/UpdateUserData', {
@@ -82,7 +117,7 @@ app.post('/processFleet', async (req, res) => {
             Permission: 'Private'
         });
 
-        res.json({ success: true, result });
+        res.json({ success: true, returnFleetCreated: !!returnFleet });
 
     } catch (error) {
         console.error('[Server] Fehler:', error.message);
@@ -179,7 +214,7 @@ app.post('/serverTick', async (req, res) => {
                 }
 
                 // Forschung prüfen
-                if (commander.activeResearch?.endTimeUtc && 
+                if (commander.activeResearch?.endTimeUtc &&
                     new Date(commander.activeResearch.endTimeUtc) <= now) {
                     applyResearch(commander, commander.activeResearch.type, commander.activeResearch.targetLevel);
                     commander.activeResearch = null;
@@ -226,6 +261,14 @@ function produceResources(planet, elapsedSeconds) {
     return planet;
 }
 
+// HINWEIS (nicht behoben, nur dokumentiert):
+// defWarships ist hier immer [0,0,0,0,0,0,0,0,0,0] — die tatsächliche
+// Verteidigung (NPC- oder Spieler-Schiffe auf dem Zielplaneten) wird
+// aktuell NICHT eingelesen. Der Angreifer gewinnt dadurch praktisch
+// immer. Das ist ein separates, noch offenes Balancing-/Feature-Thema
+// (Verteidigung ist wohl schlicht noch nicht implementiert) und wurde
+// hier bewusst NICHT mit angefasst, um den Rückflug-Fix nicht mit
+// unabhängigen Änderungen zu vermischen.
 async function processAttack(attackerPlayFabId, commander, fleet, now, log) {
     // Kampfberechnung
     const defWarships = [0,0,0,0,0,0,0,0,0,0];
@@ -235,14 +278,14 @@ async function processAttack(attackerPlayFabId, commander, fleet, now, log) {
 
     const total = attackPower + defensePower || 1;
     const attackerSurvival = Math.max(0.1, 1 - defensePower / total);
-    const attackerRemaining = fleet.warships.map((n, i) => 
+    const attackerRemaining = fleet.warships.map((n, i) =>
         Math.max(n > 0 ? 1 : 0, n - Math.floor(n * (1 - attackerSurvival)))
     );
     const attackerLosses = fleet.warships.map((n, i) => n - attackerRemaining[i]);
     const lossCount = attackerLosses.reduce((a, b) => a + b, 0);
 
     // Mail senden
-    sendMail(commander, 
+    sendMail(commander,
         `Kampfbericht: ${fleet.destinationCoord}`,
         `Siegreicher Kampf. Verluste: ${lossCount} Schiffe.`,
         2);
@@ -274,8 +317,8 @@ async function processReturn(playFabId, commander, fleet, log) {
     // Schiffe auf Heimatplanet gutschreiben
     const planetKey = `planet_${fleet.destinationCoord.replace(/:/g, '_')}`;
     try {
-        const pData = await playfabServer('/Server/GetUserData', { 
-            PlayFabId: playFabId, Keys: [planetKey] 
+        const pData = await playfabServer('/Server/GetUserData', {
+            PlayFabId: playFabId, Keys: [planetKey]
         });
         if (pData.Data?.[planetKey]) {
             const planet = JSON.parse(pData.Data[planetKey].Value);
