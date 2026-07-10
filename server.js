@@ -3,37 +3,49 @@
 //  Node.js Server für Render.com
 //  Ersetzt PlayFab CloudScript für Spiellogik
 //
-//  ÄNDERUNG (Juli 2026) — zwei Themen behoben:
+//  ÄNDERUNG (Juli 2026) — drei Themen behoben:
 //
-//  1) /processFleet hat bisher die verarbeitete Flotte NIE aus
-//     commander.activeFleets entfernt und eine neu erzeugte
-//     Rückflug-Flotte NIE gespeichert ("Geister-Flotten", verlorene
-//     Rückflüge). Jetzt wie /serverTick: splice + push.
+//  1) /processFleet entfernt die verarbeitete Flotte jetzt wirklich
+//     aus commander.activeFleets und speichert eine neu erzeugte
+//     Rückflug-Flotte tatsächlich mit ab (wie /serverTick: splice + push).
 //
-//  2) Kampf war nur eine grobe Platzhalter-Rechnung ohne echte
-//     Verteidigung (defWarships war immer [0,...,0]) und ohne
-//     vollständigen Kampfbericht (kein Schild, keine Verluste pro
-//     Schiffstyp, kein Recycling/Reparatur/Erfahrung). Das ist jetzt
-//     eine vollständige Portierung der Kampf-Formeln aus
-//     CombatManager.cs (Client-Vorschau), inkl. echtem CombatReport-
-//     Objekt, das direkt in mail.reportData landet und von
-//     CombatReportController.OpenReportFromMail() angezeigt werden kann.
+//  2) Kampf ist jetzt eine vollständige Portierung der Formeln aus
+//     CombatManager.cs: echte Verteidigung (liest den Zielplaneten über
+//     den pfid-Besitzer-Lookup), planetares Schild, Waffen-/Schild-
+//     Forschungsboni, Flottenbonus, Recycling, Reparatur, Erfahrung.
 //
-//     Um die Verteidiger-Schiffe eines Zielplaneten lesen zu können,
-//     muss der Server wissen, welchem PlayFab-Account der Planet
-//     gehört. Dafür wird jetzt das Feld "pfid" aus den öffentlichen
-//     Planetendaten (sys_G_S_S Title Data, siehe CloudScript) genutzt.
-//     Für NPC-Ziele (900001/900002) gibt es noch keinen echten
-//     PlayFab-Account — dort bleibt die Verteidigung vorerst 0
-//     (bekannte, bereits auf der Roadmap stehende Einschränkung:
-//     "NPC-Accounts betretbar machen").
+//  3) NEU: Kampfberichte werden nicht mehr in der Mail oder in PlayFab
+//     Title Data gespeichert, sondern dauerhaft in einer eigenen
+//     PostgreSQL-Datenbank (auf Render gehostet). Jeder Bericht ist
+//     eine eigene Zeile -> kein Größenlimit, keine Race Conditions bei
+//     gleichzeitigen Kämpfen (im Gegensatz zu einem einzelnen, geteilten
+//     Title-Data-Blob). Mails tragen nur noch die reportId als Verweis,
+//     nicht mehr den kompletten Bericht.
 // ============================================================
 
 const express = require('express');
 const axios   = require('axios');
+const { Pool } = require('pg');
 const app     = express();
 
 app.use(express.json());
+
+// -------------------------------------------------------
+// CORS — WICHTIG für WebGL-Builds!
+// Der WebGL-Build läuft im Browser (auf itch.io), Anfragen an
+// virgo-server.onrender.com sind also Cross-Origin-Requests. Ohne
+// diese Header blockiert der Browser den Request stillschweigend,
+// bevor er den Server überhaupt erreicht (im Unity-Editor tritt das
+// NIE auf, da dort keine Browser-CORS-Regeln gelten — deshalb fiel
+// es erst beim WebGL-Test auf).
+// -------------------------------------------------------
+app.use((req, res, next) => {
+    res.header('Access-Control-Allow-Origin', '*');
+    res.header('Access-Control-Allow-Methods', 'GET,POST,OPTIONS');
+    res.header('Access-Control-Allow-Headers', 'Content-Type');
+    if (req.method === 'OPTIONS') return res.sendStatus(204);
+    next();
+});
 
 // PlayFab Konfiguration
 const PLAYFAB_TITLE_ID  = '192413';
@@ -41,44 +53,114 @@ const PLAYFAB_SECRET    = process.env.PLAYFAB_SECRET_KEY;
 const PLAYFAB_BASE_URL  = `https://${PLAYFAB_TITLE_ID}.playfabapi.com`;
 
 // -------------------------------------------------------
-// Schiffs-Basiswerte (Alpha-Scope: Warship01-04)
-// Quelle: PROJEKT_ZUSAMMENFASSUNG (Schiffswerte-Tabelle)
-// Index 0-3 = Warship01-04. Index 4-9 (WS05-10) sind in der Alpha
-// noch nicht im Einsatz und bleiben auf 0.
+// PostgreSQL Verbindung (Kampfberichte)
+// DATABASE_URL wird als Environment Variable in Render gesetzt
+// (Internal Database URL der Render-Postgres-Instanz)
 // -------------------------------------------------------
-const SHIP_WEAPON = [
-    [10, 2, 0],      // Warship01
-    [31, 10, 4],     // Warship02
-    [92, 37, 18],    // Warship03
-    [268, 131, 74],  // Warship04
-    [0,0,0],[0,0,0],[0,0,0],[0,0,0],[0,0,0],[0,0,0]
-];
-const SHIP_SHIELD = [
-    [3, 1, 0],       // Warship01
-    [8, 2, 1],       // Warship02
-    [23, 9, 4],      // Warship03
-    [67, 33, 19],    // Warship04
-    [0,0,0],[0,0,0],[0,0,0],[0,0,0],[0,0,0],[0,0,0]
-];
-const SHIP_BUILD_COST = [100, 300, 900, 2700, 8100, 24300, 72900, 218700, 656100, 1968300];
-const HP_MULT_FIGHTER = 3.1;  // Warship01-03
-const HP_MULT_CARRIER = 4.1;  // Warship04-10
+const pool = new Pool({
+    connectionString: process.env.DATABASE_URL,
+    ssl: { rejectUnauthorized: false }
+});
 
-const SHIELD_BUILDING_INDEX   = 10;   // Building10
-const SHIELD_HP_PER_LEVEL     = 5000;
-const IRON_RESERVE_PER_LEVEL  = 1000;
-const RECYCLING_BASE          = 0.10;
-const REPAIR_BASE             = 0.10;
-const LOSER_LOSS_MIN          = 0.45;
-const LOSER_LOSS_MAX          = 0.55;
-const WINNER_LOSS_BASE        = 0.10;
-const WINNER_LOSS_MAX         = 0.35;
+async function initDatabase() {
+    try {
+        await pool.query(`
+            CREATE TABLE IF NOT EXISTS combat_reports (
+                report_id TEXT PRIMARY KEY,
+                planet_coord TEXT,
+                attacker_commander_id INTEGER,
+                defender_commander_id INTEGER,
+                attacker_wins BOOLEAN,
+                shield_held BOOLEAN,
+                created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+                data JSONB NOT NULL
+            );
+        `);
+        await pool.query(`CREATE INDEX IF NOT EXISTS idx_combat_reports_created_at ON combat_reports (created_at DESC);`);
+        await pool.query(`CREATE INDEX IF NOT EXISTS idx_combat_reports_attacker ON combat_reports (attacker_commander_id);`);
+        await pool.query(`CREATE INDEX IF NOT EXISTS idx_combat_reports_defender ON combat_reports (defender_commander_id);`);
+        console.log('[DB] Tabelle combat_reports bereit.');
+    } catch (e) {
+        console.error('[DB] Init fehlgeschlagen (DATABASE_URL gesetzt?):', e.message);
+    }
+}
+initDatabase();
+
+async function saveReportToDatabase(report) {
+    try {
+        const attackerId = report.attackers && report.attackers[0] ? report.attackers[0].commanderId : null;
+        await pool.query(
+            `INSERT INTO combat_reports
+                (report_id, planet_coord, attacker_commander_id, defender_commander_id, attacker_wins, shield_held, data)
+             VALUES ($1, $2, $3, $4, $5, $6, $7)
+             ON CONFLICT (report_id) DO NOTHING`,
+            [report.reportId, report.planetCoord, attackerId, report.planetOwnerId,
+             report.attackerWins, report.shieldHeld, JSON.stringify(report)]
+        );
+    } catch (e) {
+        console.error('[DB] Bericht speichern fehlgeschlagen:', e.message);
+    }
+}
+
+async function getReportById(reportId) {
+    try {
+        const result = await pool.query('SELECT data FROM combat_reports WHERE report_id = $1', [reportId]);
+        if (result.rows.length === 0) return null;
+        return result.rows[0].data; // JSONB kommt von pg bereits als Objekt zurück
+    } catch (e) {
+        console.error('[DB] Bericht laden fehlgeschlagen:', e.message);
+        return null;
+    }
+}
 
 // -------------------------------------------------------
 // Health Check
 // -------------------------------------------------------
 app.get('/', (req, res) => {
     res.json({ status: 'VIRGO Server läuft', time: new Date().toISOString() });
+});
+
+// -------------------------------------------------------
+// Kampfbericht abrufen (für Unity: Mail/Chat "Bericht öffnen")
+// -------------------------------------------------------
+app.get('/report/:reportId', async (req, res) => {
+    const report = await getReportById(req.params.reportId);
+    if (!report) return res.status(404).json({ success: false, error: 'Bericht nicht gefunden' });
+    res.json({ success: true, report });
+});
+
+// -------------------------------------------------------
+// Kampfbericht speichern (für CombatManager.cs lokale Vorschau-Kämpfe;
+// serverseitige Kämpfe aus resolveCombat() speichern direkt über
+// saveReportToDatabase(), ohne den Umweg über HTTP)
+// -------------------------------------------------------
+app.post('/saveReport', async (req, res) => {
+    const report = req.body;
+    if (!report || !report.reportId)
+        return res.status(400).json({ success: false, error: 'Ungueltiger Bericht' });
+    await saveReportToDatabase(report);
+    res.json({ success: true });
+});
+
+// -------------------------------------------------------
+// Admin: letzte Kampfberichte stichprobenartig einsehen
+// Aufruf im Browser: https://virgo-server.onrender.com/admin/reports?key=DEIN_ADMIN_KEY
+// Optional: &limit=20 (max 200)
+// -------------------------------------------------------
+app.get('/admin/reports', async (req, res) => {
+    if (!process.env.ADMIN_KEY || req.query.key !== process.env.ADMIN_KEY) {
+        return res.status(403).json({ success: false, error: 'Nicht autorisiert' });
+    }
+    const limit = Math.min(parseInt(req.query.limit) || 50, 200);
+    try {
+        const result = await pool.query(
+            'SELECT data FROM combat_reports ORDER BY created_at DESC LIMIT $1',
+            [limit]
+        );
+        res.json({ success: true, count: result.rows.length, reports: result.rows.map(r => r.data) });
+    } catch (e) {
+        res.status(500).json({ success: false, error: e.message });
+    }
 });
 
 // -------------------------------------------------------
@@ -312,6 +394,34 @@ function produceResources(planet, elapsedSeconds) {
 // KAMPF-HILFSFUNKTIONEN (Portierung aus CombatManager.cs)
 // =========================================================
 
+const SHIP_WEAPON = [
+    [10, 2, 0],      // Warship01
+    [31, 10, 4],     // Warship02
+    [92, 37, 18],    // Warship03
+    [268, 131, 74],  // Warship04
+    [0,0,0],[0,0,0],[0,0,0],[0,0,0],[0,0,0],[0,0,0]
+];
+const SHIP_SHIELD = [
+    [3, 1, 0],       // Warship01
+    [8, 2, 1],       // Warship02
+    [23, 9, 4],      // Warship03
+    [67, 33, 19],    // Warship04
+    [0,0,0],[0,0,0],[0,0,0],[0,0,0],[0,0,0],[0,0,0]
+];
+const SHIP_BUILD_COST = [100, 300, 900, 2700, 8100, 24300, 72900, 218700, 656100, 1968300];
+const HP_MULT_FIGHTER = 3.1;  // Warship01-03
+const HP_MULT_CARRIER = 4.1;  // Warship04-10
+
+const SHIELD_BUILDING_INDEX   = 10;   // Building10
+const SHIELD_HP_PER_LEVEL     = 5000;
+const IRON_RESERVE_PER_LEVEL  = 1000;
+const RECYCLING_BASE          = 0.10;
+const REPAIR_BASE             = 0.10;
+const LOSER_LOSS_MIN          = 0.45;
+const LOSER_LOSS_MAX          = 0.55;
+const WINNER_LOSS_BASE        = 0.10;
+const WINNER_LOSS_MAX         = 0.35;
+
 function sumArray(arr) {
     return (arr || []).reduce((a, b) => a + (b || 0), 0);
 }
@@ -486,7 +596,7 @@ async function getPlanetOwnerInfo(coord) {
 }
 
 // =========================================================
-// KAMPF AUFLÖSEN (ersetzt die alte processAttack-Platzhalterlogik)
+// KAMPF AUFLÖSEN
 // =========================================================
 async function resolveCombat(attackerPlayFabId, attackerCommander, attackerFleet, now, log = []) {
     const destCoord = attackerFleet.destinationCoord;
@@ -571,6 +681,7 @@ async function resolveCombat(attackerPlayFabId, attackerCommander, attackerFleet
             report.attackers.push(p);
             report.totalAttackerShips += p.totalShipsBefore;
 
+            await saveReportToDatabase(report);
             sendCombatMail(attackerCommander, report, true);
             if (defenderPfid && defenderCommander) {
                 sendCombatMail(defenderCommander, report, false);
@@ -766,7 +877,9 @@ async function resolveCombat(attackerPlayFabId, attackerCommander, attackerFleet
         }
     }
 
-    // Angreifer-Mail
+    // Bericht dauerhaft in der Datenbank speichern (eigene Zeile,
+    // unabhängig von Mails/PlayFab) + Angreifer-Mail
+    await saveReportToDatabase(report);
     sendCombatMail(attackerCommander, report, true);
 
     log.push(`Kampf: ${attackerFleet.fleetId} | ${attackerWins ? 'Angreifer siegt' : 'Verteidiger siegt'} | Verluste ${report.totalAttackerLosses}/${report.totalDefenderLosses}`);
@@ -796,8 +909,8 @@ function buildReturnFleet(fleet, now, warshipsRemaining, lootRessources) {
     };
 }
 
-// Kampfbericht-Mail inkl. vollständiger reportData (JSON) für
-// CombatReportController.OpenReportFromMail() in Unity.
+// Kampfbericht-Mail — trägt jetzt NUR NOCH die reportId als Verweis,
+// nicht mehr den kompletten Bericht (der lebt jetzt dauerhaft in der DB).
 function sendCombatMail(commander, report, isAttackerMail) {
     if (!commander) return;
     const victory      = isAttackerMail ? report.attackerWins : !report.attackerWins;
@@ -825,8 +938,7 @@ function sendCombatMail(commander, report, isAttackerMail) {
         isRead: false,
         isFavorite: false,
         timestamp: formatTimestamp(new Date()),
-        reportId: report.reportId,
-        reportData: JSON.stringify(report)
+        reportId: report.reportId
     });
 }
 
