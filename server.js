@@ -87,12 +87,40 @@ async function initDatabase() {
         // Millisekunden-Zeitstempel-Ansatz).
         await pool.query(`CREATE SEQUENCE IF NOT EXISTS combat_report_seq;`);
 
-        console.log('[DB] Tabelle combat_reports + Sequenz bereit.');
+        // Sperre gegen doppelte Flottenverarbeitung. Egal WOHER ein doppelter
+        // Aufruf für dieselbe Flotte kommt (Client-Doppelklick, zwei offene
+        // Tabs, ein zusätzlicher /serverTick-Trigger, der zufällig zur
+        // gleichen Zeit reinkommt wie der Client-Request) — nur der erste
+        // Versuch, eine bestimmte fleetId hier einzutragen, gewinnt. Jeder
+        // weitere Versuch scheitert an der PRIMARY KEY-Regel und bricht
+        // sauber ab, statt den Kampf ein zweites Mal zu verarbeiten.
+        await pool.query(`
+            CREATE TABLE IF NOT EXISTS processed_fleets (
+                fleet_id TEXT PRIMARY KEY,
+                processed_at TIMESTAMPTZ NOT NULL DEFAULT now()
+            );
+        `);
+        await pool.query(`CREATE INDEX IF NOT EXISTS idx_processed_fleets_time ON processed_fleets (processed_at);`);
+
+        console.log('[DB] Tabelle combat_reports + Sequenz + Flotten-Sperre bereit.');
     } catch (e) {
         console.error('[DB] Init fehlgeschlagen (DATABASE_URL gesetzt?):', e.message);
     }
 }
 initDatabase();
+
+// Versucht, eine Flotte exklusiv "zu beanspruchen", bevor sie verarbeitet
+// wird. Gibt true zurück, wenn dieser Aufruf die Flotte verarbeiten darf;
+// false, wenn ein anderer Prozess sie bereits (zeitgleich) übernommen hat.
+async function claimFleetForProcessing(fleetId) {
+    try {
+        await pool.query('INSERT INTO processed_fleets (fleet_id) VALUES ($1)', [fleetId]);
+        return true;
+    } catch (e) {
+        // Unique-Constraint-Verletzung = bereits vergeben
+        return false;
+    }
+}
 
 // Nächste fortlaufende Bericht-Nummer atomar aus der Datenbank holen
 async function getNextReportSeq() {
@@ -245,6 +273,15 @@ app.post('/processFleet', async (req, res) => {
             });
         }
 
+        // Race-Guard: sicherstellen, dass diese Flotte nicht GERADE JETZT
+        // von einem anderen Aufruf verarbeitet wird (z.B. zeitgleicher
+        // /serverTick, doppelter Client-Request). Nur wer die Flotte
+        // erfolgreich "beansprucht", macht mit der Verarbeitung weiter.
+        const claimed = await claimFleetForProcessing(fleet.fleetId);
+        if (!claimed) {
+            return res.json({ success: true, message: 'Flotte wird bereits verarbeitet (Duplikat verhindert)' });
+        }
+
         // Flotte verarbeiten (Kampf oder Rückflug-Landung)
         const returnFleet = await processFleetArrival(playFabId, commander, fleet, now);
 
@@ -332,6 +369,13 @@ app.post('/serverTick', async (req, res) => {
                         if (!fleet || !fleet.arrivalUtc) continue;
                         if (fleet.hasArrived) { toRemove.push(f); continue; }
                         if (new Date(fleet.arrivalUtc) > now) continue;
+
+                        // Race-Guard: wird diese Flotte gerade zeitgleich woanders
+                        // verarbeitet (z.B. Client-Request über /processFleet)?
+                        // Falls ja, hier überspringen statt doppelt zu verarbeiten —
+                        // der andere Prozess kümmert sich darum.
+                        const claimed = await claimFleetForProcessing(fleet.fleetId);
+                        if (!claimed) continue;
 
                         commander.activeFleets[f].hasArrived = true;
                         const missionNum = fleet.mission;
