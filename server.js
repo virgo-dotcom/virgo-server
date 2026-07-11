@@ -254,8 +254,12 @@ app.post('/processFleet', async (req, res) => {
 
         // Geister-Flotte aus einem alten Client-Stand (hasArrived=true, aber
         // nie aus der Liste entfernt) -> jetzt bereinigen und Schluss.
+        // WICHTIG: nach fleetId filtern statt nur den einen Index zu
+        // entfernen — falls durch einen alten Bug dieselbe fleetId mehrfach
+        // in der Liste steht, werden hier ALLE Kopien auf einmal entfernt
+        // (sonst bleibt ein "Zwilling" für immer als Zombie-Eintrag stehen).
         if (fleet.hasArrived) {
-            commander.activeFleets.splice(fleetIndex, 1);
+            commander.activeFleets = commander.activeFleets.filter(f => f.fleetId !== fleet.fleetId);
             await playfabServer('/Server/UpdateUserData', {
                 PlayFabId: playFabId,
                 Data: { 'commander_data': JSON.stringify(commander) },
@@ -285,9 +289,10 @@ app.post('/processFleet', async (req, res) => {
         // Flotte verarbeiten (Kampf oder Rückflug-Landung)
         const returnFleet = await processFleetArrival(playFabId, commander, fleet, now);
 
-        // WICHTIG: alte Flotte aus der Liste entfernen,
-        // ggf. neue Rückflug-Flotte hinzufügen (wie in /serverTick)
-        commander.activeFleets.splice(fleetIndex, 1);
+        // WICHTIG: alte Flotte(n) aus der Liste entfernen (alle mit
+        // gleicher fleetId, siehe Kommentar oben), ggf. neue
+        // Rückflug-Flotte hinzufügen (wie in /serverTick)
+        commander.activeFleets = commander.activeFleets.filter(f => f.fleetId !== fleet.fleetId);
         if (returnFleet) commander.activeFleets.push(returnFleet);
 
         // Commander speichern
@@ -362,12 +367,12 @@ app.post('/serverTick', async (req, res) => {
                 // Flotten verarbeiten
                 if (commander.activeFleets?.length > 0) {
                     const returnFleets = [];
-                    const toRemove = [];
+                    const idsToRemove = new Set();
 
                     for (let f = 0; f < commander.activeFleets.length; f++) {
                         const fleet = commander.activeFleets[f];
                         if (!fleet || !fleet.arrivalUtc) continue;
-                        if (fleet.hasArrived) { toRemove.push(f); continue; }
+                        if (fleet.hasArrived) { idsToRemove.add(fleet.fleetId); continue; }
                         if (new Date(fleet.arrivalUtc) > now) continue;
 
                         // Race-Guard: wird diese Flotte gerade zeitgleich woanders
@@ -387,13 +392,15 @@ app.post('/serverTick', async (req, res) => {
                             await processReturn(playFabId, commander, fleet, log);
                         }
 
-                        toRemove.push(f);
+                        idsToRemove.add(fleet.fleetId);
                         changed = true;
                     }
 
-                    // Verarbeitete entfernen
-                    for (let r = toRemove.length - 1; r >= 0; r--)
-                        commander.activeFleets.splice(toRemove[r], 1);
+                    // Verarbeitete entfernen — nach fleetId statt nach Index,
+                    // damit evtl. Duplikat-Zwillinge (gleiche fleetId mehrfach
+                    // in der Liste, durch alte Bugs) gemeinsam mit entfernt werden.
+                    if (idsToRemove.size > 0)
+                        commander.activeFleets = commander.activeFleets.filter(f => !idsToRemove.has(f.fleetId));
 
                     // Rückflüge hinzufügen
                     for (const rf of returnFleets)
