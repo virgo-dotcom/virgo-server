@@ -617,21 +617,35 @@ function recalcParticipantLosses(participant, before10, beforeShips, after10, af
         : 0;
 }
 
-function formatTimestamp(date) {
-    const dd = String(date.getDate()).padStart(2, '0');
-    const mm = String(date.getMonth() + 1).padStart(2, '0');
-    const hh = String(date.getHours()).padStart(2, '0');
-    const mi = String(date.getMinutes()).padStart(2, '0');
-    const ss = String(date.getSeconds()).padStart(2, '0');
-    return `${dd}.${mm}. ${hh}:${mi}:${ss}`;
+// WICHTIG: Der Render-Server läuft in UTC, nicht in deutscher Zeit.
+// date.getHours() etc. würden also die Serverzeit zeigen (im Sommer
+// 2 Stunden, im Winter 1 Stunde hinter der deutschen Zeit). Über
+// Intl.DateTimeFormat mit Zeitzone "Europe/Berlin" wird das korrekt
+// umgerechnet — inklusive automatischer Sommer-/Winterzeit-Umstellung,
+// die sich nicht mehr von Hand nachpflegen muss.
+function getBerlinParts(date) {
+    const parts = new Intl.DateTimeFormat('de-DE', {
+        timeZone: 'Europe/Berlin',
+        year: 'numeric', month: '2-digit', day: '2-digit',
+        hour: '2-digit', minute: '2-digit', second: '2-digit',
+        hour12: false
+    }).formatToParts(date);
+    const get = (type) => parts.find(p => p.type === type)?.value || '00';
+    return {
+        year: get('year'), month: get('month'), day: get('day'),
+        hour: get('hour'), minute: get('minute'), second: get('second')
+    };
 }
 
-// Datum als YYYYMMDD (für die Bericht-ID)
+function formatTimestamp(date) {
+    const p = getBerlinParts(date);
+    return `${p.day}.${p.month}. ${p.hour}:${p.minute}:${p.second}`;
+}
+
+// Datum als YYYYMMDD (für die Bericht-ID), ebenfalls in deutscher Zeit
 function formatDateForId(date) {
-    const yyyy = date.getFullYear();
-    const mm = String(date.getMonth() + 1).padStart(2, '0');
-    const dd = String(date.getDate()).padStart(2, '0');
-    return `${yyyy}${mm}${dd}`;
+    const p = getBerlinParts(date);
+    return `${p.year}${p.month}${p.day}`;
 }
 
 // Ermittelt Besitzer-Commander-ID + PlayFabId eines Zielplaneten über
