@@ -313,7 +313,13 @@ app.post('/processFleet', async (req, res) => {
 // -------------------------------------------------------
 // Server Tick (alle 5 Minuten von außen aufrufen)
 // -------------------------------------------------------
-app.post('/serverTick', async (req, res) => {
+// serverTickHandler ist als eigene Funktion definiert, damit sie sowohl per
+// POST (z.B. für manuelle/Debug-Aufrufe) als auch per GET (für kostenlose
+// externe Scheduler wie cron-job.org, die meist nur GET-Pings können)
+// erreichbar ist. OHNE einen automatischen, regelmäßigen Aufruf verarbeitet
+// NIEMAND Flotten, deren Besitzer bei Ankunft offline ist — das war die
+// eigentliche Ursache hinter den "Zombie-Flotten".
+async function serverTickHandler(req, res) {
     const log = [];
     const now = new Date();
 
@@ -435,7 +441,10 @@ app.post('/serverTick', async (req, res) => {
     }
 
     res.json({ success: true, log, timestamp: now.toISOString() });
-});
+}
+
+app.post('/serverTick', serverTickHandler);
+app.get('/serverTick', serverTickHandler);
 
 // -------------------------------------------------------
 // Ressourcenproduktion
