@@ -79,12 +79,26 @@ async function initDatabase() {
         await pool.query(`CREATE INDEX IF NOT EXISTS idx_combat_reports_created_at ON combat_reports (created_at DESC);`);
         await pool.query(`CREATE INDEX IF NOT EXISTS idx_combat_reports_attacker ON combat_reports (attacker_commander_id);`);
         await pool.query(`CREATE INDEX IF NOT EXISTS idx_combat_reports_defender ON combat_reports (defender_commander_id);`);
-        console.log('[DB] Tabelle combat_reports bereit.');
+
+        // Globale, garantiert eindeutige, fortlaufende Nummer für Bericht-IDs.
+        // Postgres-Sequenzen sind atomar — auch wenn irgendwo im Spiel
+        // gleichzeitig mehrere Kämpfe abgeschlossen werden, kann es NIE
+        // zwei Berichte mit derselben Nummer geben (im Gegensatz zum alten
+        // Millisekunden-Zeitstempel-Ansatz).
+        await pool.query(`CREATE SEQUENCE IF NOT EXISTS combat_report_seq;`);
+
+        console.log('[DB] Tabelle combat_reports + Sequenz bereit.');
     } catch (e) {
         console.error('[DB] Init fehlgeschlagen (DATABASE_URL gesetzt?):', e.message);
     }
 }
 initDatabase();
+
+// Nächste fortlaufende Bericht-Nummer atomar aus der Datenbank holen
+async function getNextReportSeq() {
+    const result = await pool.query("SELECT nextval('combat_report_seq') AS seq");
+    return result.rows[0].seq;
+}
 
 async function saveReportToDatabase(report) {
     try {
@@ -564,7 +578,16 @@ function formatTimestamp(date) {
     const mm = String(date.getMonth() + 1).padStart(2, '0');
     const hh = String(date.getHours()).padStart(2, '0');
     const mi = String(date.getMinutes()).padStart(2, '0');
-    return `${dd}.${mm}. ${hh}:${mi}`;
+    const ss = String(date.getSeconds()).padStart(2, '0');
+    return `${dd}.${mm}. ${hh}:${mi}:${ss}`;
+}
+
+// Datum als YYYYMMDD (für die Bericht-ID)
+function formatDateForId(date) {
+    const yyyy = date.getFullYear();
+    const mm = String(date.getMonth() + 1).padStart(2, '0');
+    const dd = String(date.getDate()).padStart(2, '0');
+    return `${yyyy}${mm}${dd}`;
 }
 
 // Ermittelt Besitzer-Commander-ID + PlayFabId eines Zielplaneten über
@@ -630,8 +653,15 @@ async function resolveCombat(attackerPlayFabId, attackerCommander, attackerFleet
     const defShips     = defenderPlanet ? [...defenderPlanet.ships]    : [0,0,0,0,0,0];
     const defBuildings = defenderPlanet ? defenderPlanet.buildings     : [];
 
+    // Neue Bericht-ID: {planetOwnerId}-{Datum}-{fortlaufende Sequenz-Nummer}
+    // Die Sequenz-Nummer kommt atomar aus Postgres — dadurch garantiert
+    // eindeutig, selbst wenn irgendwo im Spiel gleichzeitig andere Kämpfe
+    // abgeschlossen werden (kein Millisekunden-Kollisionsrisiko mehr).
+    const reportOwnerId = ownerInfo ? ownerInfo.ownerCommanderId : 0;
+    const reportSeq = await getNextReportSeq();
+
     const report = {
-        reportId: `CR-${ownerInfo ? ownerInfo.ownerCommanderId : 0}-${now.getTime()}`,
+        reportId: `CR-${reportOwnerId}-${formatDateForId(now)}-${reportSeq}`,
         timestamp: formatTimestamp(now),
         unixTimestamp: Math.floor(now.getTime() / 1000),
         planetCoord: destCoord,
