@@ -775,15 +775,27 @@ async function resolveCombat(attackerPlayFabId, attackerCommander, attackerFleet
         shieldLevelBefore: 0,
         shieldLevelAfter: 0,
         shieldHP: 0,
-        attackerStrengthVsShield: 0
+        attackerStrengthVsShield: 0,
+        // NEU: Platzhalter, bis die Schild-Mechanik wirklich fertig ist.
+        // Das Gebäude existiert schon, die Kampf-Funktion aber noch nicht —
+        // Phase 1 wird deshalb aktuell IMMER übersprungen. Dieses Feld
+        // sorgt dafür, dass Spieletester im Bericht trotzdem sehen, dass
+        // ein Schild-System geplant ist, nur eben noch nicht aktiv.
+        shieldImplemented: false
     };
 
     const attackerFleetBonus  = calculateFleetBonus(attackerFleet.warships);
     const attackerStrengthRaw = calculateShipStrength(attackerFleet.warships, attackerFleet.ships, attackerCommander)
                                 * (1 + attackerFleetBonus);
 
-    // PHASE 1: Planetares Schild (nur wenn echte Verteidiger-Daten vorliegen)
-    if (defenderPlanet && (defBuildings[SHIELD_BUILDING_INDEX] || 0) > 0) {
+    // PHASE 1: Planetares Schild — AKTUELL DEAKTIVIERT.
+    // Die Gebäude-Stufe (Building10) existiert bereits auf den Planeten,
+    // aber die eigentliche Schild-Mechanik ist noch nicht fertig entwickelt
+    // (Balancing/Regeln noch nicht final). Bis dahin wird dieser Schritt
+    // immer übersprungen, egal welche Gebäude-Stufe der Verteidiger hat —
+    // siehe report.shieldImplemented (oben) für die Platzhalter-Anzeige
+    // im Kampfbericht.
+    if (false) {
         const shieldLevel = defBuildings[SHIELD_BUILDING_INDEX];
         const shieldHP = shieldLevel * SHIELD_HP_PER_LEVEL;
         report.shieldLevelBefore = shieldLevel;
