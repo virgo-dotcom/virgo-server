@@ -727,7 +727,13 @@ async function resolveCombat(attackerPlayFabId, attackerCommander, attackerFleet
     const destCoord = attackerFleet.destinationCoord;
     const ownerInfo = await getPlanetOwnerInfo(destCoord);
 
-    const isRealPlayerDefender = !!(ownerInfo && ownerInfo.pfid && ownerInfo.ownerCommanderId < 900000);
+    // FIX: Commander-IDs echter Spieler starten bei 1.000.000 (7-stellig).
+    // NPCs liegen im Bereich 900.001-999.999. Die alte Bedingung
+    // "< 900000" schloss dadurch versehentlich JEDEN echten Spieler aus
+    // (1.000.000 ist nie kleiner als 900.000!) — der Verteidiger-Datenabruf
+    // lief dadurch nie, egal ob pfid vorhanden war oder nicht. Das war die
+    // eigentliche Ursache für "Verteidiger: 0 Schiffe" bei allen PvP-Kämpfen.
+    const isRealPlayerDefender = !!(ownerInfo && ownerInfo.pfid && ownerInfo.ownerCommanderId >= 1000000);
 
     let defenderPfid = null;
     let defenderCommander = null;
