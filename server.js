@@ -517,27 +517,38 @@ function sumArray(arr) {
     return (arr || []).reduce((a, b) => a + (b || 0), 0);
 }
 
-// Flottenbonus (max +40%) — geometrische Kette WS04 -> WS03 -> WS02 -> WS01
+// ---------------------------------------------------------------
+// FLOTTENBONUS-EINSTELLUNGEN (Kampf-Balancing)
+// Geometrische Kette: WS04 -> WS03 -> WS02 -> WS01
+// Jede Stufe braucht mindestens 1 Schiff der Stufe darüber, um
+// überhaupt zu zählen (kein WS04 = kompletter Bonus = 0%).
+// Optimale Mischung für den vollen Bonus: 1×WS04, 2×WS03, 4×WS02, 8×WS01.
+// ---------------------------------------------------------------
+const FLEET_BONUS_PER_TIER      = 0.10;  // Bonus-Anteil pro Stufe (4 Stufen × 10% = 40% max)
+const FLEET_BONUS_MAX           = 0.40;  // Gesamt-Obergrenze
+const FLEET_BONUS_COVERAGE_RATIO = 2;    // Wie viele Schiffe der Stufe darunter 1 Schiff "deckt"
+
+// Flottenbonus — geometrische Kette WS04 -> WS03 -> WS02 -> WS01
 function calculateFleetBonus(warships) {
     const ws04 = warships[3] || 0;
     const ws03 = warships[2] || 0;
     const ws02 = warships[1] || 0;
     const ws01 = warships[0] || 0;
 
-    const cap03 = ws04 * 2;
-    const cap02 = Math.min(ws03, cap03) * 2;
-    const cap01 = Math.min(ws02, cap02) * 2;
+    const cap03 = ws04 * FLEET_BONUS_COVERAGE_RATIO;
+    const cap02 = Math.min(ws03, cap03) * FLEET_BONUS_COVERAGE_RATIO;
+    const cap01 = Math.min(ws02, cap02) * FLEET_BONUS_COVERAGE_RATIO;
 
     const eff03 = Math.min(ws03, cap03);
     const eff02 = Math.min(ws02, cap02);
     const eff01 = Math.min(ws01, cap01);
 
-    const b04 = ws04 > 0 ? 0.10 : 0;
-    const b03 = cap03 > 0 ? 0.10 * (eff03 / cap03) : 0;
-    const b02 = cap02 > 0 ? 0.10 * (eff02 / cap02) : 0;
-    const b01 = cap01 > 0 ? 0.10 * (eff01 / cap01) : 0;
+    const b04 = ws04 > 0 ? FLEET_BONUS_PER_TIER : 0;
+    const b03 = cap03 > 0 ? FLEET_BONUS_PER_TIER * (eff03 / cap03) : 0;
+    const b02 = cap02 > 0 ? FLEET_BONUS_PER_TIER * (eff02 / cap02) : 0;
+    const b01 = cap01 > 0 ? FLEET_BONUS_PER_TIER * (eff01 / cap01) : 0;
 
-    return Math.min(b04 + b03 + b02 + b01, 0.40);
+    return Math.min(b04 + b03 + b02 + b01, FLEET_BONUS_MAX);
 }
 
 // Schiffsstärke (Angriffskraft) inkl. Waffen-Forschungsboni
@@ -781,12 +792,18 @@ async function resolveCombat(attackerPlayFabId, attackerCommander, attackerFleet
         // Phase 1 wird deshalb aktuell IMMER übersprungen. Dieses Feld
         // sorgt dafür, dass Spieletester im Bericht trotzdem sehen, dass
         // ein Schild-System geplant ist, nur eben noch nicht aktiv.
-        shieldImplemented: false
+        shieldImplemented: false,
+        // NEU: Sichtbare Gesamt-Bonuswerte im Bericht — OHNE zu verraten,
+        // wodurch sie zustande kommen (bewusst kein Hinweis auf die
+        // Flottenzusammensetzung im Bericht).
+        attackerBonusPercent: 0,
+        defenderBonusPercent: 0
     };
 
     const attackerFleetBonus  = calculateFleetBonus(attackerFleet.warships);
     const attackerStrengthRaw = calculateShipStrength(attackerFleet.warships, attackerFleet.ships, attackerCommander)
                                 * (1 + attackerFleetBonus);
+    report.attackerBonusPercent = Math.round(attackerFleetBonus * 1000) / 10; // z.B. 27.5
 
     // PHASE 1: Planetares Schild — AKTUELL DEAKTIVIERT.
     // Die Gebäude-Stufe (Building10) existiert bereits auf den Planeten,
@@ -840,6 +857,7 @@ async function resolveCombat(attackerPlayFabId, attackerCommander, attackerFleet
     // PHASE 2+3: Stärke & HP
     const attackerStrength = attackerStrengthRaw;
     const defenderFleetBonus = calculateFleetBonus(defWarships);
+    report.defenderBonusPercent = Math.round(defenderFleetBonus * 1000) / 10;
     const defenderStrength = calculateShipStrength(defWarships, defShips, defenderCommander) * (1 + defenderFleetBonus);
     const defenderHP        = calculateShipHP(defWarships, defShips, defenderCommander) * (1 + defenderFleetBonus);
 
