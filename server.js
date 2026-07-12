@@ -87,6 +87,17 @@ async function initDatabase() {
         // Millisekunden-Zeitstempel-Ansatz).
         await pool.query(`CREATE SEQUENCE IF NOT EXISTS combat_report_seq;`);
 
+        // NEU: eigene Sequenz für Mail-IDs. Grund: mailId wurde bisher aus
+        // commander.nextMailCounter gebildet (im commander_data-JSON
+        // gespeichert). Wenn zwei /processFleet-Aufrufe für denselben
+        // Commander dicht hintereinander liefen, konnte der zweite Aufruf
+        // noch den alten (nicht erhöhten) Zähler lesen, bevor der erste
+        // seine Erhöhung fertig gespeichert hatte -> zwei Mails mit exakt
+        // derselben mailId. Eine Postgres-Sequenz ist atomar und kann das
+        // nicht mehr passieren lassen, egal wie viele Anfragen gleichzeitig
+        // eintreffen.
+        await pool.query(`CREATE SEQUENCE IF NOT EXISTS mail_id_seq;`);
+
         // Sperre gegen doppelte Flottenverarbeitung. Egal WOHER ein doppelter
         // Aufruf für dieselbe Flotte kommt (Client-Doppelklick, zwei offene
         // Tabs, ein zusätzlicher /serverTick-Trigger, der zufällig zur
@@ -125,6 +136,12 @@ async function claimFleetForProcessing(fleetId) {
 // Nächste fortlaufende Bericht-Nummer atomar aus der Datenbank holen
 async function getNextReportSeq() {
     const result = await pool.query("SELECT nextval('combat_report_seq') AS seq");
+    return result.rows[0].seq;
+}
+
+// Nächste fortlaufende Mail-Nummer atomar aus der Datenbank holen
+async function getNextMailSeq() {
+    const result = await pool.query("SELECT nextval('mail_id_seq') AS seq");
     return result.rows[0].seq;
 }
 
@@ -786,9 +803,9 @@ async function resolveCombat(attackerPlayFabId, attackerCommander, attackerFleet
             report.totalAttackerShips += p.totalShipsBefore;
 
             await saveReportToDatabase(report);
-            sendCombatMail(attackerCommander, report, true);
+            await sendCombatMail(attackerCommander, report, true);
             if (defenderPfid && defenderCommander) {
-                sendCombatMail(defenderCommander, report, false);
+                await sendCombatMail(defenderCommander, report, false);
                 try {
                     await playfabServer('/Server/UpdateUserData', {
                         PlayFabId: defenderPfid,
@@ -968,7 +985,7 @@ async function resolveCombat(attackerPlayFabId, attackerCommander, attackerFleet
         }
 
         if (defenderCommander) {
-            sendCombatMail(defenderCommander, report, false);
+            await sendCombatMail(defenderCommander, report, false);
             try {
                 await playfabServer('/Server/UpdateUserData', {
                     PlayFabId: defenderPfid,
@@ -984,7 +1001,7 @@ async function resolveCombat(attackerPlayFabId, attackerCommander, attackerFleet
     // Bericht dauerhaft in der Datenbank speichern (eigene Zeile,
     // unabhängig von Mails/PlayFab) + Angreifer-Mail
     await saveReportToDatabase(report);
-    sendCombatMail(attackerCommander, report, true);
+    await sendCombatMail(attackerCommander, report, true);
 
     log.push(`Kampf: ${attackerFleet.fleetId} | ${attackerWins ? 'Angreifer siegt' : 'Verteidiger siegt'} | Verluste ${report.totalAttackerLosses}/${report.totalDefenderLosses}`);
 
@@ -1015,7 +1032,7 @@ function buildReturnFleet(fleet, now, warshipsRemaining, lootRessources) {
 
 // Kampfbericht-Mail — trägt jetzt NUR NOCH die reportId als Verweis,
 // nicht mehr den kompletten Bericht (der lebt jetzt dauerhaft in der DB).
-function sendCombatMail(commander, report, isAttackerMail) {
+async function sendCombatMail(commander, report, isAttackerMail) {
     if (!commander) return;
     const victory      = isAttackerMail ? report.attackerWins : !report.attackerWins;
     const ownLosses     = isAttackerMail ? report.totalAttackerLosses : report.totalDefenderLosses;
@@ -1030,10 +1047,16 @@ function sendCombatMail(commander, report, isAttackerMail) {
     }
 
     if (!commander.inbox) commander.inbox = [];
-    if (!commander.nextMailCounter) commander.nextMailCounter = 1;
+
+    // WICHTIG: mailId kommt jetzt aus der atomaren Postgres-Sequenz
+    // (mail_id_seq), NICHT mehr aus commander.nextMailCounter. Der alte
+    // Zähler lebte im commander_data-JSON und war anfällig für Race
+    // Conditions bei dicht aufeinanderfolgenden Aufrufen (siehe Kommentar
+    // bei der Sequenz-Erstellung in initDatabase).
+    const mailSeq = await getNextMailSeq();
 
     commander.inbox.push({
-        mailId: `M-${commander.commanderId}-${commander.nextMailCounter++}`,
+        mailId: `M-${commander.commanderId}-${mailSeq}`,
         category: 2, // Military
         subject,
         body,
@@ -1068,7 +1091,7 @@ async function processReturn(playFabId, commander, fleet, log) {
         }
     } catch(e) {}
 
-    sendMail(commander, 'Flotte zurückgekehrt',
+    await sendMail(commander, 'Flotte zurückgekehrt',
         `Flotte ${fleet.fleetId} ist auf ${fleet.destinationCoord} gelandet.`, 1);
 
     log.push(`Rückflug gelandet: ${fleet.fleetId}`);
@@ -1088,11 +1111,11 @@ function calculateFlightTime(from, to, engineLevel = 1, fuelFactor = 1) {
 }
 
 // Generische, nicht kampfbezogene Mail (z.B. "Flotte zurückgekehrt")
-function sendMail(commander, subject, body, category) {
+async function sendMail(commander, subject, body, category) {
     if (!commander.inbox) commander.inbox = [];
-    if (!commander.nextMailCounter) commander.nextMailCounter = 1;
+    const mailSeq = await getNextMailSeq();
     commander.inbox.push({
-        mailId:    `M-${commander.commanderId}-${commander.nextMailCounter++}`,
+        mailId:    `M-${commander.commanderId}-${mailSeq}`,
         category,
         subject,
         body,
