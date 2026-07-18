@@ -202,6 +202,79 @@ app.post('/saveReport', async (req, res) => {
 });
 
 // -------------------------------------------------------
+// Angriffs-Warnung an den Verteidiger schicken — wird vom ANGREIFER-Client
+// direkt nach dem Losschicken einer Attack-Flotte aufgerufen.
+//
+// WICHTIG: Das kann NICHT der Client selbst erledigen (er hat keinen
+// Zugriff auf den PlayFab-Account eines anderen Spielers) — deshalb läuft
+// das hier über den Server, genau wie beim Kampfbericht: pfid-Lookup über
+// die öffentlichen Systemdaten, dann direkter Schreibzugriff mit dem
+// Secret Key.
+//
+// Bei NPCs oder unbekannten Zielen passiert einfach nichts (kein Fehler),
+// da NPCs keinen echten Account haben.
+// -------------------------------------------------------
+app.post('/notifyAttack', async (req, res) => {
+    const { attackerName, originCoord, destinationCoord, arrivalUtc } = req.body;
+    if (!attackerName || !originCoord || !destinationCoord || !arrivalUtc)
+        return res.status(400).json({ success: false, error: 'Fehlende Parameter' });
+
+    try {
+        const ownerInfo = await getPlanetOwnerInfo(destinationCoord);
+        const isRealPlayerDefender = !!(ownerInfo && ownerInfo.pfid && ownerInfo.ownerCommanderId >= 1000000);
+
+        if (!isRealPlayerDefender) {
+            // NPC oder unbekanntes Ziel -> nichts zu tun, aber kein Fehler
+            return res.json({ success: true, notified: false });
+        }
+
+        const defenderData = await playfabServer('/Server/GetUserData', {
+            PlayFabId: ownerInfo.pfid,
+            Keys: ['commander_data']
+        });
+        if (!defenderData.Data?.['commander_data'])
+            return res.json({ success: true, notified: false });
+
+        const defenderCommander = JSON.parse(defenderData.Data['commander_data'].Value);
+
+        const arrivalDate = new Date(arrivalUtc);
+        const remainingSeconds = Math.max(0, Math.round((arrivalDate - new Date()) / 1000));
+
+        if (!defenderCommander.inbox) defenderCommander.inbox = [];
+        const mailSeq = await getNextMailSeq();
+        defenderCommander.inbox.push({
+            mailId: `M-${defenderCommander.commanderId}-${mailSeq}`,
+            category: 2, // Military
+            subject: `Angriff auf ${destinationCoord}`,
+            body: `Achtung, Sie werden angegriffen von ${attackerName}. Die Angriffsflotte n\u00e4hert sich von ${originCoord}, Ankunft in ${formatDurationText(remainingSeconds)}, um ${formatTimestamp(arrivalDate)}.`,
+            senderName: 'Milit\u00e4rkommando',
+            senderId: 0,
+            isRead: false,
+            isFavorite: false,
+            timestamp: formatTimestamp(new Date()),
+            reportId: '',
+            // NEU: markiert diese Mail als aktive Angriffs-Warnung, solange
+            // die Flotte noch nicht angekommen ist. Das Dashboard des
+            // Verteidigers nutzt dieses Feld, um eine fette, rote Warnzeile
+            // anzuzeigen, bis der Angriff tats\u00e4chlich stattgefunden hat.
+            attackArrivalUtc: arrivalUtc,
+            attackTargetCoord: destinationCoord
+        });
+
+        await playfabServer('/Server/UpdateUserData', {
+            PlayFabId: ownerInfo.pfid,
+            Data: { 'commander_data': JSON.stringify(defenderCommander) },
+            Permission: 'Private'
+        });
+
+        res.json({ success: true, notified: true });
+    } catch (error) {
+        console.error('[Server] notifyAttack Fehler:', error.message);
+        res.status(500).json({ success: false, error: error.message });
+    }
+});
+
+// -------------------------------------------------------
 // Admin: letzte Kampfberichte stichprobenartig einsehen
 // Aufruf im Browser: https://virgo-server.onrender.com/admin/reports?key=DEIN_ADMIN_KEY
 // Optional: &limit=20 (max 200)
@@ -679,6 +752,19 @@ function getBerlinParts(date) {
         year: get('year'), month: get('month'), day: get('day'),
         hour: get('hour'), minute: get('minute'), second: get('second')
     };
+}
+
+// Restzeit als lesbaren Text formatieren, z.B. "1d 03:12:05" oder "00:04:32"
+function formatDurationText(totalSeconds) {
+    const s = Math.max(0, Math.round(totalSeconds));
+    const days = Math.floor(s / 86400);
+    const hours = Math.floor((s % 86400) / 3600);
+    const minutes = Math.floor((s % 3600) / 60);
+    const secs = s % 60;
+    const hh = String(hours).padStart(2, '0');
+    const mm = String(minutes).padStart(2, '0');
+    const ss = String(secs).padStart(2, '0');
+    return days > 0 ? `${days}d ${hh}:${mm}:${ss}` : `${hh}:${mm}:${ss}`;
 }
 
 function formatTimestamp(date) {
