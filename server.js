@@ -113,7 +113,46 @@ async function initDatabase() {
         `);
         await pool.query(`CREATE INDEX IF NOT EXISTS idx_processed_fleets_time ON processed_fleets (processed_at);`);
 
-        console.log('[DB] Tabelle combat_reports + Sequenz + Flotten-Sperre bereit.');
+        // NEU: Angriffs-Verfolgung ("Angriffs-Akte"). Protokolliert pro
+        // Angriffs-Flotte JEDEN Schritt des Lebenszyklus, dauerhaft und
+        // unabhängig davon, wer gerade eingeloggt ist (im Gegensatz zum
+        // rein lokalen FleetDebugTracker im Client, der nur sieht, was in
+        // der jeweils aktiven Unity-Sitzung passiert). Das ist die
+        // Grundlage für den "Fehler melden"-Button im Debug-Fenster:
+        // Egal welcher Schritt hängen bleibt (Warnung, Kampf, Rückflug),
+        // hier steht es mit Zeitstempel drin.
+        await pool.query(`
+            CREATE TABLE IF NOT EXISTS attack_traces (
+                fleet_id TEXT PRIMARY KEY,
+                attacker_commander_id INTEGER,
+                defender_commander_id INTEGER,
+                origin_coord TEXT,
+                destination_coord TEXT,
+
+                launched_at TIMESTAMPTZ,
+                expected_arrival_utc TIMESTAMPTZ,
+
+                notify_attack_at TIMESTAMPTZ,
+                notify_attack_success BOOLEAN,
+
+                combat_started_at TIMESTAMPTZ,
+                combat_processed_at TIMESTAMPTZ,
+                combat_success BOOLEAN,
+                combat_report_id TEXT,
+                shield_held BOOLEAN,
+
+                return_fleet_id TEXT,
+                return_processed_at TIMESTAMPTZ,
+                return_success BOOLEAN,
+
+                last_updated_at TIMESTAMPTZ NOT NULL DEFAULT now()
+            );
+        `);
+        await pool.query(`CREATE INDEX IF NOT EXISTS idx_attack_traces_attacker ON attack_traces (attacker_commander_id);`);
+        await pool.query(`CREATE INDEX IF NOT EXISTS idx_attack_traces_defender ON attack_traces (defender_commander_id);`);
+        await pool.query(`CREATE INDEX IF NOT EXISTS idx_attack_traces_updated ON attack_traces (last_updated_at DESC);`);
+
+        console.log('[DB] Tabelle combat_reports + Sequenz + Flotten-Sperre + Angriffs-Verfolgung bereit.');
     } catch (e) {
         console.error('[DB] Init fehlgeschlagen (DATABASE_URL gesetzt?):', e.message);
     }
@@ -130,6 +169,60 @@ async function claimFleetForProcessing(fleetId) {
     } catch (e) {
         // Unique-Constraint-Verletzung = bereits vergeben
         return false;
+    }
+}
+
+// -------------------------------------------------------
+// Angriffs-Verfolgung: Zeile anlegen (falls noch nicht vorhanden) und die
+// übergebenen Felder aktualisieren. "fields" ist ein einfaches Objekt wie
+// { combat_processed_at: new Date(), combat_success: true }. Die
+// Feldnamen kommen ausschließlich aus unserem eigenen Code (nie aus
+// Nutzereingaben) — SQL-Injection ist dadurch kein Thema.
+// -------------------------------------------------------
+async function upsertAttackTrace(fleetId, fields) {
+    try {
+        await pool.query(
+            'INSERT INTO attack_traces (fleet_id) VALUES ($1) ON CONFLICT (fleet_id) DO NOTHING',
+            [fleetId]
+        );
+
+        const keys = Object.keys(fields || {});
+        if (keys.length === 0) return;
+
+        const setClauses = keys.map((k, i) => `${k} = $${i + 2}`).join(', ');
+        const values = keys.map(k => fields[k]);
+
+        await pool.query(
+            `UPDATE attack_traces SET ${setClauses}, last_updated_at = now() WHERE fleet_id = $1`,
+            [fleetId, ...values]
+        );
+    } catch (e) {
+        console.error(`[DB] upsertAttackTrace Fehler (${fleetId}):`, e.message);
+    }
+}
+
+async function getAttackTrace(fleetId) {
+    try {
+        const result = await pool.query('SELECT * FROM attack_traces WHERE fleet_id = $1', [fleetId]);
+        return result.rows.length > 0 ? result.rows[0] : null;
+    } catch (e) {
+        console.error('[DB] getAttackTrace Fehler:', e.message);
+        return null;
+    }
+}
+
+async function getRecentAttackTraces(commanderId, limit) {
+    try {
+        const result = await pool.query(
+            `SELECT * FROM attack_traces
+             WHERE attacker_commander_id = $1 OR defender_commander_id = $1
+             ORDER BY last_updated_at DESC LIMIT $2`,
+            [commanderId, limit]
+        );
+        return result.rows;
+    } catch (e) {
+        console.error('[DB] getRecentAttackTraces Fehler:', e.message);
+        return [];
     }
 }
 
@@ -189,6 +282,29 @@ app.get('/report/:reportId', async (req, res) => {
 });
 
 // -------------------------------------------------------
+// Angriffs-Akte abrufen — für den "Fehler melden"-Button im Client.
+// Zeigt den kompletten, serverseitig protokollierten Lebenszyklus einer
+// einzelnen Angriffs-Flotte (Warnung/Kampf/Rückflug), unabhängig davon,
+// wer gerade eingeloggt ist.
+// -------------------------------------------------------
+app.get('/attackTrace/:fleetId', async (req, res) => {
+    const trace = await getAttackTrace(req.params.fleetId);
+    if (!trace) return res.status(404).json({ success: false, error: 'Keine Akte gefunden' });
+    res.json({ success: true, trace });
+});
+
+// Letzte Angriffs-Akten eines Commanders (als Angreifer ODER Verteidiger)
+// — z.B. für eine Übersicht "meine letzten Angriffe/Verteidigungen" im
+// Debug-Fenster.
+app.get('/attackTraces/recent', async (req, res) => {
+    const commanderId = parseInt(req.query.commanderId, 10);
+    if (!commanderId) return res.status(400).json({ success: false, error: 'commanderId erforderlich' });
+    const limit = Math.min(parseInt(req.query.limit) || 20, 100);
+    const traces = await getRecentAttackTraces(commanderId, limit);
+    res.json({ success: true, traces });
+});
+
+// -------------------------------------------------------
 // Kampfbericht speichern (für CombatManager.cs lokale Vorschau-Kämpfe;
 // serverseitige Kämpfe aus resolveCombat() speichern direkt über
 // saveReportToDatabase(), ohne den Umweg über HTTP)
@@ -215,16 +331,31 @@ app.post('/saveReport', async (req, res) => {
 // da NPCs keinen echten Account haben.
 // -------------------------------------------------------
 app.post('/notifyAttack', async (req, res) => {
-    const { attackerName, originCoord, destinationCoord, arrivalUtc } = req.body;
-    if (!attackerName || !originCoord || !destinationCoord || !arrivalUtc)
+    const { fleetId, attackerCommanderId, attackerName, originCoord, destinationCoord, arrivalUtc } = req.body;
+    if (!fleetId || !attackerName || !originCoord || !destinationCoord || !arrivalUtc)
         return res.status(400).json({ success: false, error: 'Fehlende Parameter' });
 
     try {
         const ownerInfo = await getPlanetOwnerInfo(destinationCoord);
         const isRealPlayerDefender = !!(ownerInfo && ownerInfo.pfid && ownerInfo.ownerCommanderId >= 1000000);
 
+        // Angriffs-Akte anlegen — passiert IMMER, unabhängig davon, ob der
+        // Verteidiger ein echter Spieler ist oder nicht, damit die
+        // komplette Kette (Start → Warnung → Kampf → Rückflug) für JEDEN
+        // Angriff nachvollziehbar bleibt.
+        await upsertAttackTrace(fleetId, {
+            attacker_commander_id: attackerCommanderId || null,
+            defender_commander_id: ownerInfo ? ownerInfo.ownerCommanderId : null,
+            origin_coord: originCoord,
+            destination_coord: destinationCoord,
+            launched_at: new Date(),
+            expected_arrival_utc: new Date(arrivalUtc),
+            notify_attack_at: new Date(),
+            notify_attack_success: isRealPlayerDefender
+        });
+
         if (!isRealPlayerDefender) {
-            // NPC oder unbekanntes Ziel -> nichts zu tun, aber kein Fehler
+            // NPC oder unbekanntes Ziel -> keine Mail nötig, aber kein Fehler
             return res.json({ success: true, notified: false });
         }
 
@@ -396,6 +527,14 @@ app.post('/processFleet', async (req, res) => {
 
     } catch (error) {
         console.error('[Server] Fehler:', error.message);
+        // NEU: Fehlschlag in der Angriffs-Akte vermerken, damit der
+        // "Fehler melden"-Button im Client genau diesen Zeitpunkt und
+        // diese Fehlermeldung anzeigen kann, statt dass die Flotte einfach
+        // spurlos verschwindet.
+        await upsertAttackTrace(fleetId, {
+            combat_processed_at: new Date(),
+            combat_success: false
+        });
         res.status(500).json({ error: error.message });
     }
 });
@@ -813,6 +952,9 @@ async function resolveCombat(attackerPlayFabId, attackerCommander, attackerFleet
     const destCoord = attackerFleet.destinationCoord;
     const ownerInfo = await getPlanetOwnerInfo(destCoord);
 
+    // NEU: Angriffs-Akte — Kampfbeginn vermerken
+    await upsertAttackTrace(attackerFleet.fleetId, { combat_started_at: now });
+
     // FIX: Commander-IDs echter Spieler starten bei 1.000.000 (7-stellig).
     // NPCs liegen im Bereich 900.001-999.999. Die alte Bedingung
     // "< 900000" schloss dadurch versehentlich JEDEN echten Spieler aus
@@ -1128,7 +1270,18 @@ async function resolveCombat(attackerPlayFabId, attackerCommander, attackerFleet
     log.push(`Kampf: ${attackerFleet.fleetId} | ${attackerWins ? 'Angreifer siegt' : 'Verteidiger siegt'} | Verluste ${report.totalAttackerLosses}/${report.totalDefenderLosses}`);
 
     // Rückflug-Flotte (mit Beute, Erfahrung wurde bereits direkt verbucht)
-    return buildReturnFleet(attackerFleet, now, attackerAfterWarships, lootedRessources);
+    const finalReturnFleet = buildReturnFleet(attackerFleet, now, attackerAfterWarships, lootedRessources);
+
+    // NEU: Angriffs-Akte — Kampf abgeschlossen, Rückflug-Flotte erzeugt
+    await upsertAttackTrace(attackerFleet.fleetId, {
+        combat_processed_at: new Date(),
+        combat_success: true,
+        combat_report_id: report.reportId,
+        shield_held: false,
+        return_fleet_id: finalReturnFleet.fleetId
+    });
+
+    return finalReturnFleet;
 }
 
 function buildReturnFleet(fleet, now, warshipsRemaining, lootRessources) {
@@ -1197,6 +1350,7 @@ async function sendCombatMail(commander, report, isAttackerMail) {
 async function processReturn(playFabId, commander, fleet, log) {
     // Schiffe auf Heimatplanet gutschreiben
     const planetKey = `planet_${fleet.destinationCoord.replace(/:/g, '_')}`;
+    let creditSuccess = false;
     try {
         const pData = await playfabServer('/Server/GetUserData', {
             PlayFabId: playFabId, Keys: [planetKey]
@@ -1210,6 +1364,7 @@ async function processReturn(playFabId, commander, fleet, log) {
                 Data: { [planetKey]: JSON.stringify(planet) },
                 Permission: 'Private'
             });
+            creditSuccess = true;
         }
     } catch(e) {}
 
@@ -1217,6 +1372,17 @@ async function processReturn(playFabId, commander, fleet, log) {
         `Flotte ${fleet.fleetId} ist auf ${fleet.destinationCoord} gelandet.`, 1);
 
     log.push(`Rückflug gelandet: ${fleet.fleetId}`);
+
+    // NEU: Angriffs-Akte abschließen. fleet.fleetId ist hier die
+    // Rückflug-ID ("F-...-R") — die Akte ist aber unter der ursprünglichen
+    // Angriffs-fleetId (ohne "-R") gespeichert.
+    const baseFleetId = fleet.fleetId.endsWith('-R')
+        ? fleet.fleetId.slice(0, -2)
+        : fleet.fleetId;
+    await upsertAttackTrace(baseFleetId, {
+        return_processed_at: new Date(),
+        return_success: creditSuccess
+    });
 }
 
 function calculateFlightTime(from, to, engineLevel = 1, fuelFactor = 1) {
