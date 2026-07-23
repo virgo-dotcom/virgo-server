@@ -937,6 +937,7 @@ async function getPlanetOwnerInfo(coord) {
         return {
             ownerCommanderId: entry.owner,
             ownerName: entry.name,
+            planetName: entry.pname || '',
             pfid: entry.pfid || null,
             hqLevel: entry.hq || 0
         };
@@ -1003,6 +1004,7 @@ async function resolveCombat(attackerPlayFabId, attackerCommander, attackerFleet
         planetCoord: destCoord,
         planetOwnerId: ownerInfo ? ownerInfo.ownerCommanderId : -1,
         planetOwnerName: ownerInfo ? ownerInfo.ownerName : 'Unbekannt',
+        planetName: ownerInfo && ownerInfo.planetName ? ownerInfo.planetName : '',
         attackers: [],
         defenders: [],
         totalAttackerShips: 0,
