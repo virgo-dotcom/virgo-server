@@ -330,6 +330,60 @@ app.post('/saveReport', async (req, res) => {
 // Bei NPCs oder unbekannten Zielen passiert einfach nichts (kein Fehler),
 // da NPCs keinen echten Account haben.
 // -------------------------------------------------------
+// -------------------------------------------------------
+// Fehlerbericht als Mail an den Admin-Account ausliefern.
+// Läuft über den Server (kein Client-Zugriff auf fremde Accounts
+// möglich) — genau wie bei der Angriffs-Warnung.
+// -------------------------------------------------------
+const ADMIN_PLAYFAB_ID = '1405316AFCC3DEDE'; // TheVirgoDominion
+
+app.post('/reportBug', async (req, res) => {
+    const { reporterName, reporterCommanderId, reportText } = req.body;
+    if (!reportText)
+        return res.status(400).json({ success: false, error: 'Kein Berichtstext' });
+
+    try {
+        const adminData = await playfabServer('/Server/GetUserData', {
+            PlayFabId: ADMIN_PLAYFAB_ID,
+            Keys: ['commander_data']
+        });
+        if (!adminData.Data?.['commander_data'])
+            return res.status(404).json({ success: false, error: 'Admin-Account nicht gefunden' });
+
+        const adminCommander = JSON.parse(adminData.Data['commander_data'].Value);
+        if (!adminCommander.inbox) adminCommander.inbox = [];
+
+        // Auf eine vernünftige Länge begrenzen, damit commander_data nicht
+        // durch einen einzelnen sehr langen Bericht unnötig aufgebläht wird
+        const body = reportText.length > 2000 ? reportText.substring(0, 2000) + '\n[...gekürzt]' : reportText;
+
+        const mailSeq = await getNextMailSeq();
+        adminCommander.inbox.push({
+            mailId: `M-${adminCommander.commanderId}-${mailSeq}`,
+            category: 0, // System
+            subject: `Fehlerbericht von ${reporterName || 'Unbekannt'} (#${reporterCommanderId || '?'})`,
+            body: body,
+            senderName: 'Fehlerbericht-System',
+            senderId: 0,
+            isRead: false,
+            isFavorite: false,
+            timestamp: formatTimestamp(new Date()),
+            reportId: ''
+        });
+
+        await playfabServer('/Server/UpdateUserData', {
+            PlayFabId: ADMIN_PLAYFAB_ID,
+            Data: { 'commander_data': JSON.stringify(adminCommander) },
+            Permission: 'Private'
+        });
+
+        res.json({ success: true });
+    } catch (error) {
+        console.error('[Server] reportBug Fehler:', error.message);
+        res.status(500).json({ success: false, error: error.message });
+    }
+});
+
 app.post('/notifyAttack', async (req, res) => {
     const { fleetId, attackerCommanderId, attackerName, originCoord, destinationCoord, arrivalUtc } = req.body;
     if (!fleetId || !attackerName || !originCoord || !destinationCoord || !arrivalUtc)
