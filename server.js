@@ -642,7 +642,21 @@ async function serverTickHandler(req, res) {
                             if (!pData.Data?.[planetKey]) continue;
 
                             const planet = JSON.parse(pData.Data[planetKey].Value);
-                            const updatedPlanet = produceResources(planet, 300); // 5 Minuten
+
+                            // Echte verstrichene Zeit seit dem letzten Tick
+                            // verwenden (statt fest "300") — falls der Server
+                            // mal ausfällt oder ein Tick verpasst wird, wird
+                            // trotzdem korrekt nachgerechnet. Fehlt der
+                            // Zeitstempel (z.B. bei ganz neuen Planeten),
+                            // wird "jetzt" als Startpunkt angenommen (keine
+                            // rückwirkende Produktion für die Vergangenheit).
+                            const lastTick = planet.lastProductionTickUtc
+                                ? new Date(planet.lastProductionTickUtc)
+                                : now;
+                            const elapsedSeconds = Math.max(0, (now - lastTick) / 1000);
+
+                            const updatedPlanet = produceResources(planet, elapsedSeconds);
+                            updatedPlanet.lastProductionTickUtc = now.toISOString();
 
                             await playfabServer('/Server/UpdateUserData', {
                                 PlayFabId: playFabId,
@@ -732,18 +746,135 @@ app.get('/serverTick', serverTickHandler);
 // -------------------------------------------------------
 // Ressourcenproduktion
 // -------------------------------------------------------
-function produceResources(planet, elapsedSeconds) {
-    const ticks = Math.floor(elapsedSeconds / 5);
-    if (ticks <= 0) return planet;
-    const cap = (planet.buildings[0] || 1) * 100000;
-    const bld00 = planet.buildings[0] || 0;
-    if (bld00 > 0) {
-        planet.ressources[0] = Math.min((planet.ressources[0] || 0) + 25 * bld00 * ticks, cap);
-        planet.ressources[1] = Math.min((planet.ressources[1] || 0) + 50 * bld00 * ticks, cap);
-        planet.ressources[2] = Math.min((planet.ressources[2] || 0) + 200 * bld00 * ticks, cap);
-        planet.ressources[3] = Math.min((planet.ressources[3] || 0) + 100 * bld00 * ticks, cap);
-        planet.ressources[4] = Math.min((planet.ressources[4] || 0) + 1 * bld00 * ticks, 1000);
+// =========================================================
+// GEBÄUDE-WIRTSCHAFTSKONFIGURATION
+// MUSS manuell synchron mit den Unity-Assets gehalten werden
+// (BuildingDefinition.cs) — es gibt keine automatische Übertragung.
+// Nur Gebäude mit echten Werten sind eingetragen; alle anderen
+// produzieren einfach nichts (result bleibt 0).
+// =========================================================
+const BUILDING_ECONOMY = {
+    0: { // Kommandozentrale — feste Grundproduktion, wächst NICHT mit Stufe.
+         // baseStorageCapacity treibt hier die Ress05-Kapazität an (kein
+         // eigenes Gebäude für Ress05).
+        productionEarly: [[10], [20], [50], [25], [1]],
+        scalesWithLevel: false,
+        tierGrowthFactors: [],
+        tierStepCounts: [],
+        baseStorageCapacity: 10
+    },
+    1: { // Ress01-Gebäude (Energie)
+        productionEarly: [[0, 2, 4, 8, 10], [], [], [], []],
+        scalesWithLevel: true,
+        tierGrowthFactors: [1.535, 1.62, 1.7],
+        tierStepCounts: [4, 4, 7],
+        baseStorageCapacity: 1000
+    },
+    2: { // Ress02-Gebäude (Wasserstoff) — Produktionswerte noch offen,
+         // hier vorerst leer bis sie feststehen (siehe Chat-Verlauf)
+        productionEarly: [[], [], [], [], []],
+        scalesWithLevel: true,
+        tierGrowthFactors: [1.535, 1.62, 1.7],
+        tierStepCounts: [4, 4, 7],
+        baseStorageCapacity: 1000
     }
+    // 3 (Ress03), 4 (Ress04) und weitere Gebäude: noch nicht definiert
+};
+
+// Produktion PRO TICK (5 Sekunden) für ein Gebäude auf einer bestimmten
+// Stufe — Portierung von BuildingDefinition.GetProduction() aus Unity.
+function getProductionPerTick(buildingIndex, level) {
+    const config = BUILDING_ECONOMY[buildingIndex];
+    if (!config) return [0, 0, 0, 0, 0];
+
+    const effectiveLevel = config.scalesWithLevel ? level : 1;
+    const result = [0, 0, 0, 0, 0];
+
+    for (let r = 0; r < 5; r++) {
+        const early = config.productionEarly[r];
+        if (!early || early.length === 0) { result[r] = 0; continue; }
+
+        if (effectiveLevel <= early.length) {
+            result[r] = early[effectiveLevel - 1];
+            continue;
+        }
+
+        let val = early[early.length - 1];
+        let tierIdx = 0;
+        let stepsInTier = 0;
+        for (let lvl = early.length + 1; lvl <= effectiveLevel; lvl++) {
+            if (config.tierStepCounts.length > 0 &&
+                tierIdx < config.tierStepCounts.length - 1 &&
+                stepsInTier >= config.tierStepCounts[tierIdx]) {
+                tierIdx++;
+                stepsInTier = 0;
+            }
+            const factor = config.tierGrowthFactors.length > 0
+                ? config.tierGrowthFactors[Math.min(tierIdx, config.tierGrowthFactors.length - 1)]
+                : 1;
+            val *= factor;
+            stepsInTier++;
+        }
+        result[r] = val;
+    }
+
+    return result;
+}
+
+// Lagerkapazitäts-Sprungtabelle — identisch zur Unity-Logik
+// (BuildingDefinition.GetStorageCapacity): wächst IMMER ab Stufe 1->2,
+// unabhängig davon ob das Gebäude bei Stufe 0 oder 1 beginnt.
+const CAPACITY_JUMPS = { 4: 3, 9: 5, 14: 8, 19: 12 };
+function getCapacityMultiplier(level) {
+    let mult = 1;
+    for (let s = 2; s <= level; s++) {
+        if (CAPACITY_JUMPS[s]) mult *= CAPACITY_JUMPS[s];
+        else if (s === 20) mult *= 12;
+        else mult *= 2;
+    }
+    return mult;
+}
+function getStorageCapacity(buildingIndex, level) {
+    const config = BUILDING_ECONOMY[buildingIndex];
+    if (!config) return 0;
+    if (level <= 0) return config.baseStorageCapacity;
+    return config.baseStorageCapacity * getCapacityMultiplier(level);
+}
+
+// Ressourcenproduktion für einen Planeten nachrechnen — läuft jetzt mit
+// ECHTER verstrichener Zeit (nicht mehr fest "300"), damit auch bei
+// Serverausfällen/verpassten Ticks sauber nachgerechnet wird. Jede
+// Ressource hat ihre EIGENE Kapazität vom jeweils zugehörigen
+// Ressourcen-Gebäude (Ress05: von der Kommandozentrale, da kein eigenes
+// Gebäude existiert) — exakt wie im Unity-Client (PlanetProductionManager.cs).
+function produceResources(planet, elapsedSeconds) {
+    const TICK_INTERVAL_SECONDS = 5; // muss mit Unity resourceTickInterval übereinstimmen
+    const ticks = Math.floor(elapsedSeconds / TICK_INTERVAL_SECONDS);
+    if (ticks <= 0) return planet;
+    if (!planet.ressources) planet.ressources = [0, 0, 0, 0, 0];
+    if (!planet.buildings) return planet;
+
+    const caps = [0, 0, 0, 0, 0];
+    for (let r = 1; r <= 4; r++) {
+        const level = planet.buildings[r] || 0;
+        caps[r - 1] = getStorageCapacity(r, level);
+    }
+    caps[4] = getStorageCapacity(0, planet.buildings[0] || 0);
+
+    for (let i = 0; i < planet.buildings.length; i++) {
+        const level = planet.buildings[i];
+        if (!level || level <= 0) continue;
+
+        const perTick = getProductionPerTick(i, level);
+        for (let r = 0; r < 5; r++) {
+            if (perTick[r] === 0) continue;
+            planet.ressources[r] = Math.min(
+                (planet.ressources[r] || 0) + perTick[r] * ticks,
+                caps[r]
+            );
+        }
+    }
+
     return planet;
 }
 
