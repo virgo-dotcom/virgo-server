@@ -655,7 +655,7 @@ async function serverTickHandler(req, res) {
                                 : now;
                             const elapsedSeconds = Math.max(0, (now - lastTick) / 1000);
 
-                            const updatedPlanet = produceResources(planet, elapsedSeconds);
+                            const updatedPlanet = produceResources(planet, elapsedSeconds, commander);
                             updatedPlanet.lastProductionTickUtc = now.toISOString();
 
                             await playfabServer('/Server/UpdateUserData', {
@@ -847,7 +847,22 @@ function getStorageCapacity(buildingIndex, level) {
 // Ressource hat ihre EIGENE Kapazität vom jeweils zugehörigen
 // Ressourcen-Gebäude (Ress05: von der Kommandozentrale, da kein eigenes
 // Gebäude existiert) — exakt wie im Unity-Client (PlanetProductionManager.cs).
-function produceResources(planet, elapsedSeconds) {
+// Ordnet einem Building-Index (1-4) die passende Rohstoff-Forschungsstufe
+// des Commanders zu. Building-Index 0 (Kommandozentrale) und alles
+// außerhalb 1-4 -> 0 (kein Bonus — Ress05/Kommandozentrale bewusst
+// ausgenommen, siehe Absprache im Chat).
+function getResearchLevelForBuildingIndex(buildingIndex, commander) {
+    if (!commander) return 0;
+    switch (buildingIndex) {
+        case 1: return commander.ress01 || 0;
+        case 2: return commander.ress02 || 0;
+        case 3: return commander.ress03 || 0;
+        case 4: return commander.ress04 || 0;
+        default: return 0;
+    }
+}
+
+function produceResources(planet, elapsedSeconds, commander) {
     const TICK_INTERVAL_SECONDS = 5; // muss mit Unity resourceTickInterval übereinstimmen
     const ticks = Math.floor(elapsedSeconds / TICK_INTERVAL_SECONDS);
     if (ticks <= 0) return planet;
@@ -866,10 +881,16 @@ function produceResources(planet, elapsedSeconds) {
         if (!level || level <= 0) continue;
 
         const perTick = getProductionPerTick(i, level);
+
+        // Rohstoff-Forschung: +1% Ertrag pro Stufe, NUR für Ress01-04-
+        // Gebäude (Building-Index 1-4)
+        const researchLevel = getResearchLevelForBuildingIndex(i, commander);
+        const bonusMultiplier = researchLevel > 0 ? 1 + researchLevel * 0.01 : 1;
+
         for (let r = 0; r < 5; r++) {
             if (perTick[r] === 0) continue;
             planet.ressources[r] = Math.min(
-                (planet.ressources[r] || 0) + perTick[r] * ticks,
+                (planet.ressources[r] || 0) + (perTick[r] * bonusMultiplier) * ticks,
                 caps[r]
             );
         }
