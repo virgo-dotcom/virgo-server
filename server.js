@@ -777,8 +777,27 @@ const BUILDING_ECONOMY = {
         tierGrowthFactors: [1.535, 1.62, 1.7],
         tierStepCounts: [4, 4, 7],
         baseStorageCapacity: 1000
+    },
+    3: { // Ress03-Gebäude (Metalle) — Produktionswerte noch offen, aber
+         // WICHTIG: baseStorageCapacity muss schon jetzt gesetzt sein,
+         // sonst deckelt der Server die Ressource bei jedem Tick auf 0
+         // (siehe Bug-Fund im Chat: fehlender Eintrag hier hat Ress03/04
+         // bei jedem Server-Tick auf 0 zurückgesetzt)
+        productionEarly: [[], [], [], [], []],
+        scalesWithLevel: true,
+        tierGrowthFactors: [1.535, 1.62, 1.7],
+        tierStepCounts: [4, 4, 7],
+        baseStorageCapacity: 1000
+    },
+    4: { // Ress04-Gebäude (Werkzeuge) — Produktionswerte noch offen,
+         // gleicher Kapazitäts-Fix wie bei Ress03
+        productionEarly: [[], [], [], [], []],
+        scalesWithLevel: true,
+        tierGrowthFactors: [1.535, 1.62, 1.7],
+        tierStepCounts: [4, 4, 7],
+        baseStorageCapacity: 1000
     }
-    // 3 (Ress03), 4 (Ress04) und weitere Gebäude: noch nicht definiert
+    // Weitere Gebäude (Werft, Labor, ...): noch nicht definiert
 };
 
 // Produktion PRO TICK (5 Sekunden) für ein Gebäude auf einer bestimmten
