@@ -136,6 +136,27 @@ async function initDatabase() {
         `);
         await pool.query(`CREATE INDEX IF NOT EXISTS idx_announcements_created_at ON announcements (created_at DESC);`);
 
+        // -------------------------------------------------------
+        // "TheVirgoDominion"-Kanal im Chat-Fenster — läuft (genau wie
+        // "Ankündigungen") über unseren eigenen Server statt über PlayFab
+        // CloudScript. Grund: Die bestehende CloudScript-Funktion kennt
+        // vermutlich nur die ursprünglichen 5 Kanäle — neue Nachrichten im
+        // neuen Kanal wurden zwar lokal sofort angezeigt, aber nie
+        // dauerhaft gespeichert (verschwanden nach Login). Kein
+        // Erledigt-Häkchen nötig, deshalb einfacher als "announcements".
+        // -------------------------------------------------------
+        await pool.query(`
+            CREATE TABLE IF NOT EXISTS virgodom_messages (
+                id SERIAL PRIMARY KEY,
+                sender_commander_id INTEGER NOT NULL,
+                sender_name TEXT NOT NULL,
+                sender_avatar_index INTEGER NOT NULL DEFAULT 0,
+                text TEXT NOT NULL,
+                created_at TIMESTAMPTZ NOT NULL DEFAULT now()
+            );
+        `);
+        await pool.query(`CREATE INDEX IF NOT EXISTS idx_virgodom_messages_created_at ON virgodom_messages (created_at DESC);`);
+
         // Sperre gegen doppelte Flottenverarbeitung. Egal WOHER ein doppelter
         // Aufruf für dieselbe Flotte kommt (Client-Doppelklick, zwei offene
         // Tabs, ein zusätzlicher /serverTick-Trigger, der zufällig zur
@@ -484,6 +505,44 @@ app.put('/announcements/:id/done', async (req, res) => {
         res.json({ success: true, announcement: result.rows[0] });
     } catch (error) {
         console.error('[Server] announcements PUT Fehler:', error.message);
+        res.status(500).json({ success: false, error: error.message });
+    }
+});
+
+// -------------------------------------------------------
+// "TheVirgoDominion"-Kanal — GET für alle offen, POST nur für Admins.
+// Kein Häkchen/Status nötig, deshalb schlanker als "announcements".
+// -------------------------------------------------------
+app.get('/virgodom-messages', async (req, res) => {
+    try {
+        const limit = Math.min(parseInt(req.query.limit) || 100, 200);
+        const result = await pool.query(
+            'SELECT * FROM virgodom_messages ORDER BY created_at DESC LIMIT $1',
+            [limit]
+        );
+        res.json({ success: true, messages: result.rows.reverse() }); // älteste zuerst
+    } catch (error) {
+        console.error('[Server] virgodom-messages GET Fehler:', error.message);
+        res.status(500).json({ success: false, error: error.message });
+    }
+});
+
+app.post('/virgodom-messages', async (req, res) => {
+    const { senderCommanderId, senderName, senderAvatarIndex, text } = req.body;
+
+    if (!ADMIN_COMMANDER_IDS.includes(senderCommanderId))
+        return res.status(403).json({ success: false, error: 'Nur TheVirgoDominion darf hier posten.' });
+    if (!text || !text.trim())
+        return res.status(400).json({ success: false, error: 'Kein Text' });
+
+    try {
+        const result = await pool.query(
+            'INSERT INTO virgodom_messages (sender_commander_id, sender_name, sender_avatar_index, text) VALUES ($1, $2, $3, $4) RETURNING *',
+            [senderCommanderId, senderName || 'TheVirgoDominion', senderAvatarIndex || 0, text.trim()]
+        );
+        res.json({ success: true, message: result.rows[0] });
+    } catch (error) {
+        console.error('[Server] virgodom-messages POST Fehler:', error.message);
         res.status(500).json({ success: false, error: error.message });
     }
 });
