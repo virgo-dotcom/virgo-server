@@ -127,6 +127,7 @@ async function initDatabase() {
                 id SERIAL PRIMARY KEY,
                 sender_commander_id INTEGER NOT NULL,
                 sender_name TEXT NOT NULL,
+                sender_avatar_index INTEGER NOT NULL DEFAULT 0,
                 text TEXT NOT NULL,
                 is_done BOOLEAN NOT NULL DEFAULT false,
                 done_timestamp TIMESTAMPTZ,
@@ -445,7 +446,7 @@ app.get('/announcements', async (req, res) => {
 });
 
 app.post('/announcements', async (req, res) => {
-    const { senderCommanderId, senderName, text } = req.body;
+    const { senderCommanderId, senderName, senderAvatarIndex, text } = req.body;
 
     if (senderCommanderId !== ADMIN_COMMANDER_ID)
         return res.status(403).json({ success: false, error: 'Nur TheVirgoDominion darf hier posten.' });
@@ -454,8 +455,8 @@ app.post('/announcements', async (req, res) => {
 
     try {
         const result = await pool.query(
-            'INSERT INTO announcements (sender_commander_id, sender_name, text) VALUES ($1, $2, $3) RETURNING *',
-            [senderCommanderId, senderName || 'TheVirgoDominion', text.trim()]
+            'INSERT INTO announcements (sender_commander_id, sender_name, sender_avatar_index, text) VALUES ($1, $2, $3, $4) RETURNING *',
+            [senderCommanderId, senderName || 'TheVirgoDominion', senderAvatarIndex || 0, text.trim()]
         );
         res.json({ success: true, announcement: result.rows[0] });
     } catch (error) {
