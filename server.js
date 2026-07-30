@@ -448,7 +448,7 @@ app.get('/announcements', async (req, res) => {
 app.post('/announcements', async (req, res) => {
     const { senderCommanderId, senderName, senderAvatarIndex, text } = req.body;
 
-    if (senderCommanderId !== ADMIN_COMMANDER_ID)
+    if (!ADMIN_COMMANDER_IDS.includes(senderCommanderId))
         return res.status(403).json({ success: false, error: 'Nur TheVirgoDominion darf hier posten.' });
     if (!text || !text.trim())
         return res.status(400).json({ success: false, error: 'Kein Text' });
@@ -469,7 +469,7 @@ app.put('/announcements/:id/done', async (req, res) => {
     const id = parseInt(req.params.id, 10);
     const { requesterCommanderId, isDone } = req.body;
 
-    if (requesterCommanderId !== ADMIN_COMMANDER_ID)
+    if (!ADMIN_COMMANDER_IDS.includes(requesterCommanderId))
         return res.status(403).json({ success: false, error: 'Nur TheVirgoDominion darf das Häkchen ändern.' });
     if (!id) return res.status(400).json({ success: false, error: 'Ungueltige ID' });
 
@@ -507,7 +507,7 @@ app.put('/announcements/:id/done', async (req, res) => {
 // möglich) — genau wie bei der Angriffs-Warnung.
 // -------------------------------------------------------
 const ADMIN_PLAYFAB_ID = '1405316AFCC3DEDE'; // TheVirgoDominion
-const ADMIN_COMMANDER_ID = 1000000; // TheVirgoDominion — für Ankündigungen-Kanal (Häkchen nur hierfür erlaubt)
+const ADMIN_COMMANDER_IDS = [1000000]; // TheVirgoDominion — weitere Admin-Accounts hier einfach mit Komma ergänzen, z.B. [1000000, 1000007]
 
 app.post('/reportBug', async (req, res) => {
     const { reporterName, reporterCommanderId, reportText } = req.body;
