@@ -98,6 +98,43 @@ async function initDatabase() {
         // eintreffen.
         await pool.query(`CREATE SEQUENCE IF NOT EXISTS mail_id_seq;`);
 
+        // -------------------------------------------------------
+        // Entwickler-ToDo-Liste ("Devlog") — im Spiel für alle Spieler
+        // LESBAR (öffentliche Roadmap), aber nur im Admin-Modus
+        // bearbeitbar/löschbar. Läuft komplett unabhängig vom restlichen
+        // Spielgeschehen, rein zur eigenen Aufgabenverwaltung.
+        // -------------------------------------------------------
+        await pool.query(`
+            CREATE TABLE IF NOT EXISTS dev_todos (
+                id SERIAL PRIMARY KEY,
+                text TEXT NOT NULL,
+                status TEXT NOT NULL DEFAULT 'open',
+                created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+                updated_at TIMESTAMPTZ NOT NULL DEFAULT now()
+            );
+        `);
+        await pool.query(`CREATE INDEX IF NOT EXISTS idx_dev_todos_status ON dev_todos (status, created_at DESC);`);
+
+        // -------------------------------------------------------
+        // "Ankündigungen"-Kanal im Chat-Fenster — läuft über unseren
+        // eigenen Server statt über PlayFab CloudScript, weil bestehende
+        // Nachrichten nachträglich änderbar sein müssen (Erledigt-Häkchen,
+        // für alle Spieler sichtbar). Nur TheVirgoDominion (Commander-ID
+        // 1000000) darf posten und das Häkchen setzen/entfernen.
+        // -------------------------------------------------------
+        await pool.query(`
+            CREATE TABLE IF NOT EXISTS announcements (
+                id SERIAL PRIMARY KEY,
+                sender_commander_id INTEGER NOT NULL,
+                sender_name TEXT NOT NULL,
+                text TEXT NOT NULL,
+                is_done BOOLEAN NOT NULL DEFAULT false,
+                done_timestamp TIMESTAMPTZ,
+                created_at TIMESTAMPTZ NOT NULL DEFAULT now()
+            );
+        `);
+        await pool.query(`CREATE INDEX IF NOT EXISTS idx_announcements_created_at ON announcements (created_at DESC);`);
+
         // Sperre gegen doppelte Flottenverarbeitung. Egal WOHER ein doppelter
         // Aufruf für dieselbe Flotte kommt (Client-Doppelklick, zwei offene
         // Tabs, ein zusätzlicher /serverTick-Trigger, der zufällig zur
@@ -318,6 +355,139 @@ app.post('/saveReport', async (req, res) => {
 });
 
 // -------------------------------------------------------
+// Entwickler-ToDo-Liste — GET ist für alle Spieler offen (Roadmap-Ansicht),
+// POST/PUT/DELETE sind nicht extra abgesichert (kleines Solo-Projekt,
+// kein sensibler Inhalt) — der Admin-Modus-Schutz passiert rein im
+// Client (Buttons nur im Admin-Modus sichtbar/aktiv).
+// -------------------------------------------------------
+app.get('/devtodos', async (req, res) => {
+    try {
+        const result = await pool.query('SELECT * FROM dev_todos ORDER BY status ASC, created_at DESC');
+        res.json({ success: true, todos: result.rows });
+    } catch (error) {
+        console.error('[Server] devtodos GET Fehler:', error.message);
+        res.status(500).json({ success: false, error: error.message });
+    }
+});
+
+app.post('/devtodos', async (req, res) => {
+    const { text } = req.body;
+    if (!text || !text.trim())
+        return res.status(400).json({ success: false, error: 'Kein Text' });
+
+    try {
+        const result = await pool.query(
+            'INSERT INTO dev_todos (text, status) VALUES ($1, $2) RETURNING *',
+            [text.trim(), 'open']
+        );
+        res.json({ success: true, todo: result.rows[0] });
+    } catch (error) {
+        console.error('[Server] devtodos POST Fehler:', error.message);
+        res.status(500).json({ success: false, error: error.message });
+    }
+});
+
+app.put('/devtodos/:id', async (req, res) => {
+    const id = parseInt(req.params.id, 10);
+    const { text, status } = req.body;
+    if (!id) return res.status(400).json({ success: false, error: 'Ungueltige ID' });
+
+    try {
+        const existing = await pool.query('SELECT * FROM dev_todos WHERE id = $1', [id]);
+        if (existing.rows.length === 0)
+            return res.status(404).json({ success: false, error: 'Nicht gefunden' });
+
+        const newText = text !== undefined ? text.trim() : existing.rows[0].text;
+        const newStatus = status !== undefined ? status : existing.rows[0].status;
+
+        const result = await pool.query(
+            'UPDATE dev_todos SET text = $1, status = $2, updated_at = now() WHERE id = $3 RETURNING *',
+            [newText, newStatus, id]
+        );
+        res.json({ success: true, todo: result.rows[0] });
+    } catch (error) {
+        console.error('[Server] devtodos PUT Fehler:', error.message);
+        res.status(500).json({ success: false, error: error.message });
+    }
+});
+
+app.delete('/devtodos/:id', async (req, res) => {
+    const id = parseInt(req.params.id, 10);
+    if (!id) return res.status(400).json({ success: false, error: 'Ungueltige ID' });
+
+    try {
+        await pool.query('DELETE FROM dev_todos WHERE id = $1', [id]);
+        res.json({ success: true });
+    } catch (error) {
+        console.error('[Server] devtodos DELETE Fehler:', error.message);
+        res.status(500).json({ success: false, error: error.message });
+    }
+});
+
+// -------------------------------------------------------
+// "Ankündigungen"-Kanal — GET ist für alle Spieler offen, POST/PUT nur
+// für TheVirgoDominion (Commander-ID 1000000). Diese Prüfung läuft
+// serverseitig (nicht nur im Client), damit sie sich nicht einfach
+// umgehen lässt.
+// -------------------------------------------------------
+app.get('/announcements', async (req, res) => {
+    try {
+        const limit = Math.min(parseInt(req.query.limit) || 100, 200);
+        const result = await pool.query(
+            'SELECT * FROM announcements ORDER BY created_at DESC LIMIT $1',
+            [limit]
+        );
+        res.json({ success: true, announcements: result.rows.reverse() }); // älteste zuerst
+    } catch (error) {
+        console.error('[Server] announcements GET Fehler:', error.message);
+        res.status(500).json({ success: false, error: error.message });
+    }
+});
+
+app.post('/announcements', async (req, res) => {
+    const { senderCommanderId, senderName, text } = req.body;
+
+    if (senderCommanderId !== ADMIN_COMMANDER_ID)
+        return res.status(403).json({ success: false, error: 'Nur TheVirgoDominion darf hier posten.' });
+    if (!text || !text.trim())
+        return res.status(400).json({ success: false, error: 'Kein Text' });
+
+    try {
+        const result = await pool.query(
+            'INSERT INTO announcements (sender_commander_id, sender_name, text) VALUES ($1, $2, $3) RETURNING *',
+            [senderCommanderId, senderName || 'TheVirgoDominion', text.trim()]
+        );
+        res.json({ success: true, announcement: result.rows[0] });
+    } catch (error) {
+        console.error('[Server] announcements POST Fehler:', error.message);
+        res.status(500).json({ success: false, error: error.message });
+    }
+});
+
+app.put('/announcements/:id/done', async (req, res) => {
+    const id = parseInt(req.params.id, 10);
+    const { requesterCommanderId, isDone } = req.body;
+
+    if (requesterCommanderId !== ADMIN_COMMANDER_ID)
+        return res.status(403).json({ success: false, error: 'Nur TheVirgoDominion darf das Häkchen ändern.' });
+    if (!id) return res.status(400).json({ success: false, error: 'Ungueltige ID' });
+
+    try {
+        const doneTimestamp = isDone ? new Date() : null;
+        const result = await pool.query(
+            'UPDATE announcements SET is_done = $1, done_timestamp = $2 WHERE id = $3 RETURNING *',
+            [!!isDone, doneTimestamp, id]
+        );
+        if (result.rows.length === 0)
+            return res.status(404).json({ success: false, error: 'Nicht gefunden' });
+        res.json({ success: true, announcement: result.rows[0] });
+    } catch (error) {
+        console.error('[Server] announcements PUT Fehler:', error.message);
+        res.status(500).json({ success: false, error: error.message });
+    }
+});
+
+// -------------------------------------------------------
 // Angriffs-Warnung an den Verteidiger schicken — wird vom ANGREIFER-Client
 // direkt nach dem Losschicken einer Attack-Flotte aufgerufen.
 //
@@ -336,6 +506,7 @@ app.post('/saveReport', async (req, res) => {
 // möglich) — genau wie bei der Angriffs-Warnung.
 // -------------------------------------------------------
 const ADMIN_PLAYFAB_ID = '1405316AFCC3DEDE'; // TheVirgoDominion
+const ADMIN_COMMANDER_ID = 1000000; // TheVirgoDominion — für Ankündigungen-Kanal (Häkchen nur hierfür erlaubt)
 
 app.post('/reportBug', async (req, res) => {
     const { reporterName, reporterCommanderId, reportText } = req.body;
