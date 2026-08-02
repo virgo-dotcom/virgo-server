@@ -136,6 +136,13 @@ async function initDatabase() {
         `);
         await pool.query(`CREATE INDEX IF NOT EXISTS idx_announcements_created_at ON announcements (created_at DESC);`);
 
+        // Absicherung: falls "announcements" schon VOR der Einführung von
+        // sender_avatar_index angelegt wurde, trägt CREATE TABLE IF NOT
+        // EXISTS die neue Spalte NICHT automatisch nach (die Anweisung
+        // wird bei bereits existierender Tabelle komplett übersprungen).
+        // ALTER TABLE ... ADD COLUMN IF NOT EXISTS holt das gezielt nach.
+        await pool.query(`ALTER TABLE announcements ADD COLUMN IF NOT EXISTS sender_avatar_index INTEGER NOT NULL DEFAULT 0;`);
+
         // -------------------------------------------------------
         // "TheVirgoDominion"-Kanal im Chat-Fenster — läuft (genau wie
         // "Ankündigungen") über unseren eigenen Server statt über PlayFab
