@@ -41,7 +41,7 @@ app.use(express.json());
 // -------------------------------------------------------
 app.use((req, res, next) => {
     res.header('Access-Control-Allow-Origin', '*');
-    res.header('Access-Control-Allow-Methods', 'GET,POST,OPTIONS');
+    res.header('Access-Control-Allow-Methods', 'GET,POST,PUT,DELETE,OPTIONS');
     res.header('Access-Control-Allow-Headers', 'Content-Type');
     if (req.method === 'OPTIONS') return res.sendStatus(204);
     next();
@@ -163,6 +163,106 @@ async function initDatabase() {
             );
         `);
         await pool.query(`CREATE INDEX IF NOT EXISTS idx_virgodom_messages_created_at ON virgodom_messages (created_at DESC);`);
+
+        // =========================================================
+        // ALLIANZEN & BEZIEHUNGEN (RelationshipManager-Kern)
+        // Läuft komplett über unseren eigenen Server statt PlayFab —
+        // mehrere Accounts verändern hier gemeinsam denselben Zustand
+        // (Beitritt, Unterschrift, Kriegserklärung), das lässt sich in
+        // PlayFabs Datenmodell nicht sauber/durchsuchbar abbilden.
+        // Siehe Konzeptplan "AllianceWindow_RelationshipManager".
+        // =========================================================
+        await pool.query(`
+            CREATE TABLE IF NOT EXISTS alliances (
+                id SERIAL PRIMARY KEY,
+                name TEXT NOT NULL,
+                tag TEXT NOT NULL UNIQUE,
+                logo_id INTEGER NOT NULL DEFAULT 0,
+                description TEXT NOT NULL DEFAULT '',
+                placeholder_01 TEXT NOT NULL DEFAULT '',
+                placeholder_02 TEXT NOT NULL DEFAULT '',
+                placeholder_03 TEXT NOT NULL DEFAULT '',
+                founder_commander_id INTEGER NOT NULL,
+                points INTEGER NOT NULL DEFAULT 0,
+                created_at TIMESTAMPTZ NOT NULL DEFAULT now()
+            );
+        `);
+        await pool.query(`CREATE INDEX IF NOT EXISTS idx_alliances_name ON alliances (name);`);
+        await pool.query(`CREATE INDEX IF NOT EXISTS idx_alliances_tag ON alliances (tag);`);
+
+        await pool.query(`
+            CREATE TABLE IF NOT EXISTS alliance_members (
+                id SERIAL PRIMARY KEY,
+                alliance_id INTEGER NOT NULL REFERENCES alliances(id) ON DELETE CASCADE,
+                commander_id INTEGER NOT NULL,
+                commander_name TEXT NOT NULL,
+                role TEXT NOT NULL DEFAULT 'member',
+                joined_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+                UNIQUE(commander_id)
+            );
+        `);
+        await pool.query(`CREATE INDEX IF NOT EXISTS idx_alliance_members_alliance ON alliance_members (alliance_id);`);
+
+        await pool.query(`
+            CREATE TABLE IF NOT EXISTS alliance_charters (
+                id SERIAL PRIMARY KEY,
+                founder_commander_id INTEGER NOT NULL,
+                founder_name TEXT NOT NULL,
+                name TEXT NOT NULL,
+                tag TEXT NOT NULL,
+                logo_id INTEGER NOT NULL DEFAULT 0,
+                description TEXT NOT NULL DEFAULT '',
+                placeholder_01 TEXT NOT NULL DEFAULT '',
+                placeholder_02 TEXT NOT NULL DEFAULT '',
+                placeholder_03 TEXT NOT NULL DEFAULT '',
+                required_signatures INTEGER NOT NULL DEFAULT 1,
+                status TEXT NOT NULL DEFAULT 'pending',
+                resulting_alliance_id INTEGER,
+                created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+                expires_at TIMESTAMPTZ NOT NULL DEFAULT (now() + interval '7 days')
+            );
+        `);
+        await pool.query(`CREATE INDEX IF NOT EXISTS idx_alliance_charters_status ON alliance_charters (status, created_at DESC);`);
+
+        await pool.query(`
+            CREATE TABLE IF NOT EXISTS alliance_charter_signatures (
+                id SERIAL PRIMARY KEY,
+                charter_id INTEGER NOT NULL REFERENCES alliance_charters(id) ON DELETE CASCADE,
+                signer_commander_id INTEGER NOT NULL,
+                signer_name TEXT NOT NULL,
+                signed_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+                UNIQUE(charter_id, signer_commander_id)
+            );
+        `);
+
+        await pool.query(`
+            CREATE TABLE IF NOT EXISTS player_relationships (
+                id SERIAL PRIMARY KEY,
+                commander_id_a INTEGER NOT NULL,
+                commander_id_b INTEGER NOT NULL,
+                status TEXT NOT NULL DEFAULT 'neutral',
+                requested_by INTEGER,
+                established_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+                expires_at TIMESTAMPTZ,
+                peace_cooldown_until TIMESTAMPTZ,
+                UNIQUE(commander_id_a, commander_id_b)
+            );
+        `);
+        await pool.query(`CREATE INDEX IF NOT EXISTS idx_player_relationships_a ON player_relationships (commander_id_a);`);
+        await pool.query(`CREATE INDEX IF NOT EXISTS idx_player_relationships_b ON player_relationships (commander_id_b);`);
+
+        await pool.query(`
+            CREATE TABLE IF NOT EXISTS alliance_relationships (
+                id SERIAL PRIMARY KEY,
+                alliance_id_a INTEGER NOT NULL,
+                alliance_id_b INTEGER NOT NULL,
+                status TEXT NOT NULL DEFAULT 'neutral',
+                established_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+                UNIQUE(alliance_id_a, alliance_id_b)
+            );
+        `);
+        await pool.query(`CREATE INDEX IF NOT EXISTS idx_alliance_relationships_a ON alliance_relationships (alliance_id_a);`);
+        await pool.query(`CREATE INDEX IF NOT EXISTS idx_alliance_relationships_b ON alliance_relationships (alliance_id_b);`);
 
         // Sperre gegen doppelte Flottenverarbeitung. Egal WOHER ein doppelter
         // Aufruf für dieselbe Flotte kommt (Client-Doppelklick, zwei offene
@@ -550,6 +650,488 @@ app.post('/virgodom-messages', async (req, res) => {
         res.json({ success: true, message: result.rows[0] });
     } catch (error) {
         console.error('[Server] virgodom-messages POST Fehler:', error.message);
+        res.status(500).json({ success: false, error: error.message });
+    }
+});
+
+// =========================================================
+// ALLIANZEN
+// =========================================================
+
+// Hilfsfunktion: liefert [kleinereId, groessereId] — feste Konvention,
+// damit eine Beziehung zwischen A und B nie versehentlich als ZWEI
+// getrennte Zeilen (A->B und B->A) gespeichert wird.
+function orderIds(x, y) {
+    return x < y ? [x, y] : [y, x];
+}
+
+async function getAllianceIdForCommander(commanderId) {
+    const result = await pool.query('SELECT alliance_id FROM alliance_members WHERE commander_id = $1', [commanderId]);
+    return result.rows.length > 0 ? result.rows[0].alliance_id : null;
+}
+
+// Durchsuchbare Liste ALLER Allianzen — ?search=... filtert auf Name/Tag
+app.get('/alliances', async (req, res) => {
+    try {
+        const search = (req.query.search || '').trim();
+        let result;
+        if (search) {
+            result = await pool.query(
+                `SELECT a.*, (SELECT COUNT(*) FROM alliance_members m WHERE m.alliance_id = a.id) AS member_count
+                 FROM alliances a
+                 WHERE a.name ILIKE $1 OR a.tag ILIKE $1
+                 ORDER BY a.points DESC LIMIT 100`,
+                [`%${search}%`]
+            );
+        } else {
+            result = await pool.query(
+                `SELECT a.*, (SELECT COUNT(*) FROM alliance_members m WHERE m.alliance_id = a.id) AS member_count
+                 FROM alliances a ORDER BY a.points DESC LIMIT 100`
+            );
+        }
+        res.json({ success: true, alliances: result.rows });
+    } catch (error) {
+        console.error('[Server] alliances GET Fehler:', error.message);
+        res.status(500).json({ success: false, error: error.message });
+    }
+});
+
+app.get('/alliances/:id', async (req, res) => {
+    const id = parseInt(req.params.id, 10);
+    if (!id) return res.status(400).json({ success: false, error: 'Ungueltige ID' });
+
+    try {
+        const result = await pool.query(
+            `SELECT a.*, (SELECT COUNT(*) FROM alliance_members m WHERE m.alliance_id = a.id) AS member_count
+             FROM alliances a WHERE a.id = $1`,
+            [id]
+        );
+        if (result.rows.length === 0)
+            return res.status(404).json({ success: false, error: 'Allianz nicht gefunden' });
+        res.json({ success: true, alliance: result.rows[0] });
+    } catch (error) {
+        console.error('[Server] alliances/:id GET Fehler:', error.message);
+        res.status(500).json({ success: false, error: error.message });
+    }
+});
+
+app.get('/alliances/:id/members', async (req, res) => {
+    const id = parseInt(req.params.id, 10);
+    if (!id) return res.status(400).json({ success: false, error: 'Ungueltige ID' });
+
+    try {
+        const result = await pool.query(
+            'SELECT * FROM alliance_members WHERE alliance_id = $1 ORDER BY role ASC, joined_at ASC',
+            [id]
+        );
+        res.json({ success: true, members: result.rows });
+    } catch (error) {
+        console.error('[Server] alliances/:id/members GET Fehler:', error.message);
+        res.status(500).json({ success: false, error: error.message });
+    }
+});
+
+// Direkter Beitritt (Alpha-Vereinfachung, keine Bewerbung/Einladung nötig)
+app.post('/alliances/:id/join', async (req, res) => {
+    const id = parseInt(req.params.id, 10);
+    const { commanderId, commanderName } = req.body;
+    if (!id || !commanderId) return res.status(400).json({ success: false, error: 'Fehlende Parameter' });
+
+    try {
+        const existing = await getAllianceIdForCommander(commanderId);
+        if (existing)
+            return res.status(400).json({ success: false, error: 'Du bist bereits Mitglied einer Allianz. Erst austreten.' });
+
+        const allianceCheck = await pool.query('SELECT id FROM alliances WHERE id = $1', [id]);
+        if (allianceCheck.rows.length === 0)
+            return res.status(404).json({ success: false, error: 'Allianz nicht gefunden' });
+
+        await pool.query(
+            'INSERT INTO alliance_members (alliance_id, commander_id, commander_name, role) VALUES ($1, $2, $3, $4)',
+            [id, commanderId, commanderName || 'Unbekannt', 'member']
+        );
+        res.json({ success: true });
+    } catch (error) {
+        console.error('[Server] alliances/:id/join Fehler:', error.message);
+        res.status(500).json({ success: false, error: error.message });
+    }
+});
+
+app.post('/alliances/:id/leave', async (req, res) => {
+    const id = parseInt(req.params.id, 10);
+    const { commanderId } = req.body;
+    if (!id || !commanderId) return res.status(400).json({ success: false, error: 'Fehlende Parameter' });
+
+    try {
+        await pool.query('DELETE FROM alliance_members WHERE alliance_id = $1 AND commander_id = $2', [id, commanderId]);
+        res.json({ success: true });
+    } catch (error) {
+        console.error('[Server] alliances/:id/leave Fehler:', error.message);
+        res.status(500).json({ success: false, error: error.message });
+    }
+});
+
+// -------------------------------------------------------
+// Satzung/Gründung
+// -------------------------------------------------------
+app.post('/alliances/charter', async (req, res) => {
+    const { founderCommanderId, founderName, name, tag, logoId, description,
+            placeholder01, placeholder02, placeholder03 } = req.body;
+
+    if (!founderCommanderId || !name || !tag)
+        return res.status(400).json({ success: false, error: 'Fehlende Pflichtfelder' });
+    if (name.length > 30) return res.status(400).json({ success: false, error: 'Name zu lang (max. 30 Zeichen)' });
+    if (tag.length > 6) return res.status(400).json({ success: false, error: 'Tag zu lang (max. 6 Zeichen)' });
+    if ((description || '').length > 1000) return res.status(400).json({ success: false, error: 'Beschreibung zu lang (max. 1000 Zeichen)' });
+
+    try {
+        const existing = await getAllianceIdForCommander(founderCommanderId);
+        if (existing)
+            return res.status(400).json({ success: false, error: 'Du bist bereits Mitglied einer Allianz.' });
+
+        const tagTaken = await pool.query('SELECT id FROM alliances WHERE tag = $1', [tag]);
+        if (tagTaken.rows.length > 0)
+            return res.status(400).json({ success: false, error: 'Dieses Allianz-Tag ist bereits vergeben.' });
+
+        // Alpha: 1 Unterschrift reicht (später konfigurierbar auf 10)
+        const requiredSignatures = 1;
+
+        const result = await pool.query(
+            `INSERT INTO alliance_charters
+                (founder_commander_id, founder_name, name, tag, logo_id, description,
+                 placeholder_01, placeholder_02, placeholder_03, required_signatures)
+             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10) RETURNING *`,
+            [founderCommanderId, founderName || 'Unbekannt', name.trim(), tag.trim().toUpperCase(),
+             logoId || 0, description || '', placeholder01 || '', placeholder02 || '', placeholder03 || '',
+             requiredSignatures]
+        );
+        res.json({ success: true, charter: result.rows[0] });
+    } catch (error) {
+        console.error('[Server] alliances/charter POST Fehler:', error.message);
+        res.status(500).json({ success: false, error: error.message });
+    }
+});
+
+// Entwurf ansehen — wird auch fuers Teilen im Chat gebraucht (Klick auf
+// "Satzung ansehen" in einer Chat-Nachricht ruft das hier auf)
+app.get('/alliances/charter/:id', async (req, res) => {
+    const id = parseInt(req.params.id, 10);
+    if (!id) return res.status(400).json({ success: false, error: 'Ungueltige ID' });
+
+    try {
+        const charterResult = await pool.query('SELECT * FROM alliance_charters WHERE id = $1', [id]);
+        if (charterResult.rows.length === 0)
+            return res.status(404).json({ success: false, error: 'Satzung nicht gefunden' });
+
+        const sigResult = await pool.query(
+            'SELECT * FROM alliance_charter_signatures WHERE charter_id = $1 ORDER BY signed_at ASC',
+            [id]
+        );
+        res.json({ success: true, charter: charterResult.rows[0], signatures: sigResult.rows });
+    } catch (error) {
+        console.error('[Server] alliances/charter/:id GET Fehler:', error.message);
+        res.status(500).json({ success: false, error: error.message });
+    }
+});
+
+app.post('/alliances/charter/:id/sign', async (req, res) => {
+    const id = parseInt(req.params.id, 10);
+    const { commanderId, commanderName } = req.body;
+    if (!id || !commanderId) return res.status(400).json({ success: false, error: 'Fehlende Parameter' });
+
+    try {
+        const charterResult = await pool.query('SELECT * FROM alliance_charters WHERE id = $1', [id]);
+        if (charterResult.rows.length === 0)
+            return res.status(404).json({ success: false, error: 'Satzung nicht gefunden' });
+        const charter = charterResult.rows[0];
+
+        if (charter.status !== 'pending')
+            return res.status(400).json({ success: false, error: 'Diese Satzung ist nicht mehr offen.' });
+        if (new Date(charter.expires_at) < new Date())
+            return res.status(400).json({ success: false, error: 'Diese Satzung ist abgelaufen.' });
+
+        const existingAlliance = await getAllianceIdForCommander(commanderId);
+        if (existingAlliance)
+            return res.status(400).json({ success: false, error: 'Du bist bereits Mitglied einer Allianz. Erst austreten.' });
+
+        // Unterschrift eintragen (UNIQUE-Constraint verhindert doppelte Unterschrift automatisch)
+        try {
+            await pool.query(
+                'INSERT INTO alliance_charter_signatures (charter_id, signer_commander_id, signer_name) VALUES ($1, $2, $3)',
+                [id, commanderId, commanderName || 'Unbekannt']
+            );
+        } catch (dupeError) {
+            return res.status(400).json({ success: false, error: 'Du hast bereits unterschrieben.' });
+        }
+
+        const sigCountResult = await pool.query('SELECT COUNT(*) AS cnt FROM alliance_charter_signatures WHERE charter_id = $1', [id]);
+        const sigCount = parseInt(sigCountResult.rows[0].cnt, 10);
+
+        if (sigCount < charter.required_signatures) {
+            return res.json({ success: true, finalized: false, signatureCount: sigCount, required: charter.required_signatures });
+        }
+
+        // Genug Unterschriften -> Allianz jetzt wirklich erzeugen
+        const allianceResult = await pool.query(
+            `INSERT INTO alliances (name, tag, logo_id, description, placeholder_01, placeholder_02, placeholder_03, founder_commander_id)
+             VALUES ($1, $2, $3, $4, $5, $6, $7, $8) RETURNING *`,
+            [charter.name, charter.tag, charter.logo_id, charter.description,
+             charter.placeholder_01, charter.placeholder_02, charter.placeholder_03, charter.founder_commander_id]
+        );
+        const newAlliance = allianceResult.rows[0];
+
+        // Gruender als Mitglied eintragen
+        await pool.query(
+            'INSERT INTO alliance_members (alliance_id, commander_id, commander_name, role) VALUES ($1, $2, $3, $4)',
+            [newAlliance.id, charter.founder_commander_id, charter.founder_name, 'founder']
+        );
+
+        // Alle Unterzeichner als Mitglieder eintragen
+        const signatures = await pool.query('SELECT * FROM alliance_charter_signatures WHERE charter_id = $1', [id]);
+        for (const sig of signatures.rows) {
+            await pool.query(
+                'INSERT INTO alliance_members (alliance_id, commander_id, commander_name, role) VALUES ($1, $2, $3, $4) ON CONFLICT (commander_id) DO NOTHING',
+                [newAlliance.id, sig.signer_commander_id, sig.signer_name, 'member']
+            );
+        }
+
+        await pool.query(
+            "UPDATE alliance_charters SET status = 'finalized', resulting_alliance_id = $1 WHERE id = $2",
+            [newAlliance.id, id]
+        );
+
+        res.json({ success: true, finalized: true, alliance: newAlliance });
+    } catch (error) {
+        console.error('[Server] alliances/charter/:id/sign Fehler:', error.message);
+        res.status(500).json({ success: false, error: error.message });
+    }
+});
+
+// =========================================================
+// SPIELER-BEZIEHUNGEN (RelationshipManager-Kern)
+// =========================================================
+
+app.get('/relationships/:commanderId', async (req, res) => {
+    const commanderId = parseInt(req.params.commanderId, 10);
+    if (!commanderId) return res.status(400).json({ success: false, error: 'Ungueltige ID' });
+
+    try {
+        const result = await pool.query(
+            'SELECT * FROM player_relationships WHERE commander_id_a = $1 OR commander_id_b = $1 ORDER BY established_at DESC',
+            [commanderId]
+        );
+        res.json({ success: true, relationships: result.rows });
+    } catch (error) {
+        console.error('[Server] relationships GET Fehler:', error.message);
+        res.status(500).json({ success: false, error: error.message });
+    }
+});
+
+app.post('/relationships/friend-request', async (req, res) => {
+    const { commanderId, targetCommanderId } = req.body;
+    if (!commanderId || !targetCommanderId)
+        return res.status(400).json({ success: false, error: 'Fehlende Parameter' });
+    if (commanderId === targetCommanderId)
+        return res.status(400).json({ success: false, error: 'Nicht mit sich selbst befreundbar.' });
+
+    const [a, b] = orderIds(commanderId, targetCommanderId);
+
+    try {
+        const result = await pool.query(
+            `INSERT INTO player_relationships (commander_id_a, commander_id_b, status, requested_by)
+             VALUES ($1, $2, 'friend_request_pending', $3)
+             ON CONFLICT (commander_id_a, commander_id_b)
+             DO UPDATE SET status = 'friend_request_pending', requested_by = $3
+             WHERE player_relationships.status = 'neutral'
+             RETURNING *`,
+            [a, b, commanderId]
+        );
+        if (result.rows.length === 0)
+            return res.status(400).json({ success: false, error: 'Beziehung ist nicht neutral, Anfrage nicht möglich.' });
+        res.json({ success: true, relationship: result.rows[0] });
+    } catch (error) {
+        console.error('[Server] friend-request Fehler:', error.message);
+        res.status(500).json({ success: false, error: error.message });
+    }
+});
+
+app.post('/relationships/friend-request/:id/accept', async (req, res) => {
+    const id = parseInt(req.params.id, 10);
+    const { commanderId } = req.body;
+    if (!id || !commanderId) return res.status(400).json({ success: false, error: 'Fehlende Parameter' });
+
+    try {
+        const result = await pool.query(
+            `UPDATE player_relationships SET status = 'friend', established_at = now(),
+                expires_at = now() + interval '30 days'
+             WHERE id = $1 AND status = 'friend_request_pending' AND requested_by != $2
+             RETURNING *`,
+            [id, commanderId]
+        );
+        if (result.rows.length === 0)
+            return res.status(400).json({ success: false, error: 'Anfrage nicht gefunden oder nicht annehmbar.' });
+        res.json({ success: true, relationship: result.rows[0] });
+    } catch (error) {
+        console.error('[Server] friend-request/accept Fehler:', error.message);
+        res.status(500).json({ success: false, error: error.message });
+    }
+});
+
+app.post('/relationships/friend-request/:id/decline', async (req, res) => {
+    const id = parseInt(req.params.id, 10);
+    if (!id) return res.status(400).json({ success: false, error: 'Ungueltige ID' });
+
+    try {
+        await pool.query("UPDATE player_relationships SET status = 'neutral' WHERE id = $1 AND status = 'friend_request_pending'", [id]);
+        res.json({ success: true });
+    } catch (error) {
+        console.error('[Server] friend-request/decline Fehler:', error.message);
+        res.status(500).json({ success: false, error: error.message });
+    }
+});
+
+// Freundschaft jederzeit einseitig kündbar -> sofort zurück zu neutral
+app.post('/relationships/end-friendship', async (req, res) => {
+    const { commanderId, targetCommanderId } = req.body;
+    if (!commanderId || !targetCommanderId) return res.status(400).json({ success: false, error: 'Fehlende Parameter' });
+    const [a, b] = orderIds(commanderId, targetCommanderId);
+
+    try {
+        await pool.query(
+            "UPDATE player_relationships SET status = 'neutral' WHERE commander_id_a = $1 AND commander_id_b = $2 AND status = 'friend'",
+            [a, b]
+        );
+        res.json({ success: true });
+    } catch (error) {
+        console.error('[Server] end-friendship Fehler:', error.message);
+        res.status(500).json({ success: false, error: error.message });
+    }
+});
+
+const MAX_SIMULTANEOUS_WARS = 3;
+
+app.post('/relationships/declare-war', async (req, res) => {
+    const { commanderId, targetCommanderId } = req.body;
+    if (!commanderId || !targetCommanderId) return res.status(400).json({ success: false, error: 'Fehlende Parameter' });
+    if (commanderId === targetCommanderId) return res.status(400).json({ success: false, error: 'Krieg gegen sich selbst nicht möglich.' });
+
+    const [a, b] = orderIds(commanderId, targetCommanderId);
+
+    try {
+        const warCountResult = await pool.query(
+            "SELECT COUNT(*) AS cnt FROM player_relationships WHERE (commander_id_a = $1 OR commander_id_b = $1) AND status = 'war'",
+            [commanderId]
+        );
+        if (parseInt(warCountResult.rows[0].cnt, 10) >= MAX_SIMULTANEOUS_WARS)
+            return res.status(400).json({ success: false, error: `Maximal ${MAX_SIMULTANEOUS_WARS} gleichzeitige Kriege erlaubt.` });
+
+        const existing = await pool.query(
+            'SELECT * FROM player_relationships WHERE commander_id_a = $1 AND commander_id_b = $2',
+            [a, b]
+        );
+        if (existing.rows.length > 0) {
+            const rel = existing.rows[0];
+            if (rel.status === 'friend')
+                return res.status(400).json({ success: false, error: 'Erst Freundschaft kündigen, bevor Krieg erklärt werden kann.' });
+            if (rel.status === 'war')
+                return res.status(400).json({ success: false, error: 'Bereits im Krieg.' });
+            if (rel.peace_cooldown_until && new Date(rel.peace_cooldown_until) > new Date())
+                return res.status(400).json({ success: false, error: 'Friedens-Cooldown noch aktiv, kein erneuter Krieg möglich.' });
+        }
+
+        const result = await pool.query(
+            `INSERT INTO player_relationships (commander_id_a, commander_id_b, status, requested_by, established_at)
+             VALUES ($1, $2, 'war', $3, now())
+             ON CONFLICT (commander_id_a, commander_id_b)
+             DO UPDATE SET status = 'war', requested_by = $3, established_at = now(), expires_at = NULL
+             RETURNING *`,
+            [a, b, commanderId]
+        );
+        res.json({ success: true, relationship: result.rows[0] });
+    } catch (error) {
+        console.error('[Server] declare-war Fehler:', error.message);
+        res.status(500).json({ success: false, error: error.message });
+    }
+});
+
+// Alpha-Vereinfachung: sofortiger, einseitig auslösbarer Frieden (kein
+// Tribut-System, keine Zustimmung der Gegenseite noetig) — spaeter
+// ausbaubar zu einem echten Angebot/Annahme-Fluss.
+app.post('/relationships/declare-peace', async (req, res) => {
+    const { commanderId, targetCommanderId } = req.body;
+    if (!commanderId || !targetCommanderId) return res.status(400).json({ success: false, error: 'Fehlende Parameter' });
+    const [a, b] = orderIds(commanderId, targetCommanderId);
+
+    try {
+        const result = await pool.query(
+            `UPDATE player_relationships
+             SET status = 'neutral', peace_cooldown_until = now() + interval '24 hours', expires_at = NULL
+             WHERE commander_id_a = $1 AND commander_id_b = $2 AND status = 'war'
+             RETURNING *`,
+            [a, b]
+        );
+        if (result.rows.length === 0)
+            return res.status(400).json({ success: false, error: 'Kein aktiver Krieg zwischen diesen Commandern.' });
+        res.json({ success: true, relationship: result.rows[0] });
+    } catch (error) {
+        console.error('[Server] declare-peace Fehler:', error.message);
+        res.status(500).json({ success: false, error: error.message });
+    }
+});
+
+// =========================================================
+// ALLIANZ-BEZIEHUNGEN (Krieg zwischen zwei Allianzen)
+// =========================================================
+app.get('/alliance-relationships/:allianceId', async (req, res) => {
+    const allianceId = parseInt(req.params.allianceId, 10);
+    if (!allianceId) return res.status(400).json({ success: false, error: 'Ungueltige ID' });
+
+    try {
+        const result = await pool.query(
+            'SELECT * FROM alliance_relationships WHERE alliance_id_a = $1 OR alliance_id_b = $1',
+            [allianceId]
+        );
+        res.json({ success: true, relationships: result.rows });
+    } catch (error) {
+        console.error('[Server] alliance-relationships GET Fehler:', error.message);
+        res.status(500).json({ success: false, error: error.message });
+    }
+});
+
+app.post('/alliance-relationships/declare-war', async (req, res) => {
+    const { allianceId, targetAllianceId } = req.body;
+    if (!allianceId || !targetAllianceId) return res.status(400).json({ success: false, error: 'Fehlende Parameter' });
+    const [a, b] = orderIds(allianceId, targetAllianceId);
+
+    try {
+        const result = await pool.query(
+            `INSERT INTO alliance_relationships (alliance_id_a, alliance_id_b, status)
+             VALUES ($1, $2, 'war')
+             ON CONFLICT (alliance_id_a, alliance_id_b) DO UPDATE SET status = 'war', established_at = now()
+             RETURNING *`,
+            [a, b]
+        );
+        res.json({ success: true, relationship: result.rows[0] });
+    } catch (error) {
+        console.error('[Server] alliance-relationships/declare-war Fehler:', error.message);
+        res.status(500).json({ success: false, error: error.message });
+    }
+});
+
+app.post('/alliance-relationships/declare-peace', async (req, res) => {
+    const { allianceId, targetAllianceId } = req.body;
+    if (!allianceId || !targetAllianceId) return res.status(400).json({ success: false, error: 'Fehlende Parameter' });
+    const [a, b] = orderIds(allianceId, targetAllianceId);
+
+    try {
+        const result = await pool.query(
+            `UPDATE alliance_relationships SET status = 'neutral', established_at = now()
+             WHERE alliance_id_a = $1 AND alliance_id_b = $2 RETURNING *`,
+            [a, b]
+        );
+        res.json({ success: true, relationship: result.rows[0] || null });
+    } catch (error) {
+        console.error('[Server] alliance-relationships/declare-peace Fehler:', error.message);
         res.status(500).json({ success: false, error: error.message });
     }
 });
