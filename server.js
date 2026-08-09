@@ -175,6 +175,7 @@ async function initDatabase() {
         await pool.query(`
             CREATE TABLE IF NOT EXISTS alliances (
                 id SERIAL PRIMARY KEY,
+                display_id TEXT UNIQUE,
                 name TEXT NOT NULL,
                 tag TEXT NOT NULL UNIQUE,
                 logo_id INTEGER NOT NULL DEFAULT 0,
@@ -187,8 +188,17 @@ async function initDatabase() {
                 created_at TIMESTAMPTZ NOT NULL DEFAULT now()
             );
         `);
+        // Absicherung falls die Tabelle schon vor display_id existierte
+        // (gleiches Muster wie bei sender_avatar_index vorhin)
+        await pool.query(`ALTER TABLE alliances ADD COLUMN IF NOT EXISTS display_id TEXT;`);
+        await pool.query(`CREATE UNIQUE INDEX IF NOT EXISTS idx_alliances_display_id ON alliances (display_id) WHERE display_id IS NOT NULL;`);
         await pool.query(`CREATE INDEX IF NOT EXISTS idx_alliances_name ON alliances (name);`);
         await pool.query(`CREATE INDEX IF NOT EXISTS idx_alliances_tag ON alliances (tag);`);
+
+        // Global fortlaufende Nummer für den Allianz-ID-Bestandteil
+        // (Datum + Galaxie + diese Zahl) — atomar, wie bei
+        // combat_report_seq/mail_id_seq bereits etabliert.
+        await pool.query(`CREATE SEQUENCE IF NOT EXISTS alliance_id_seq;`);
 
         await pool.query(`
             CREATE TABLE IF NOT EXISTS alliance_members (
@@ -196,11 +206,13 @@ async function initDatabase() {
                 alliance_id INTEGER NOT NULL REFERENCES alliances(id) ON DELETE CASCADE,
                 commander_id INTEGER NOT NULL,
                 commander_name TEXT NOT NULL,
+                commander_coord TEXT,
                 role TEXT NOT NULL DEFAULT 'member',
                 joined_at TIMESTAMPTZ NOT NULL DEFAULT now(),
                 UNIQUE(commander_id)
             );
         `);
+        await pool.query(`ALTER TABLE alliance_members ADD COLUMN IF NOT EXISTS commander_coord TEXT;`);
         await pool.query(`CREATE INDEX IF NOT EXISTS idx_alliance_members_alliance ON alliance_members (alliance_id);`);
 
         await pool.query(`
@@ -208,6 +220,8 @@ async function initDatabase() {
                 id SERIAL PRIMARY KEY,
                 founder_commander_id INTEGER NOT NULL,
                 founder_name TEXT NOT NULL,
+                founder_coord TEXT,
+                founder_galaxy_id INTEGER NOT NULL DEFAULT 1,
                 name TEXT NOT NULL,
                 tag TEXT NOT NULL,
                 logo_id INTEGER NOT NULL DEFAULT 0,
@@ -222,6 +236,8 @@ async function initDatabase() {
                 expires_at TIMESTAMPTZ NOT NULL DEFAULT (now() + interval '7 days')
             );
         `);
+        await pool.query(`ALTER TABLE alliance_charters ADD COLUMN IF NOT EXISTS founder_coord TEXT;`);
+        await pool.query(`ALTER TABLE alliance_charters ADD COLUMN IF NOT EXISTS founder_galaxy_id INTEGER NOT NULL DEFAULT 1;`);
         await pool.query(`CREATE INDEX IF NOT EXISTS idx_alliance_charters_status ON alliance_charters (status, created_at DESC);`);
 
         await pool.query(`
@@ -230,10 +246,12 @@ async function initDatabase() {
                 charter_id INTEGER NOT NULL REFERENCES alliance_charters(id) ON DELETE CASCADE,
                 signer_commander_id INTEGER NOT NULL,
                 signer_name TEXT NOT NULL,
+                signer_coord TEXT,
                 signed_at TIMESTAMPTZ NOT NULL DEFAULT now(),
                 UNIQUE(charter_id, signer_commander_id)
             );
         `);
+        await pool.query(`ALTER TABLE alliance_charter_signatures ADD COLUMN IF NOT EXISTS signer_coord TEXT;`);
 
         await pool.query(`
             CREATE TABLE IF NOT EXISTS player_relationships (
@@ -670,6 +688,70 @@ async function getAllianceIdForCommander(commanderId) {
     return result.rows.length > 0 ? result.rows[0].alliance_id : null;
 }
 
+// -------------------------------------------------------
+// Allianz-Anzeige-ID erzeugen: JJMMTT + Galaxie (2-stellig) +
+// fortlaufende Nummer (3-stellig, atomar aus Postgres-Sequenz).
+// Beispiel: 26.08.2026, Galaxie 1, 1. Allianz des Tages -> "26080901001"
+// Einmal vergeben, NIE mehr änderbar (siehe Konzeptplan).
+// -------------------------------------------------------
+async function generateAllianceDisplayId(galaxyId) {
+    const now = new Date();
+    const p = getBerlinParts(now);
+    const yy = p.year.slice(-2);
+    const seqResult = await pool.query("SELECT nextval('alliance_id_seq') AS seq");
+    const seq = String(seqResult.rows[0].seq).padStart(3, '0');
+    const galaxyPadded = String(galaxyId || 1).padStart(2, '0');
+    return `${yy}${p.month}${p.day}${galaxyPadded}${seq}`;
+}
+
+// -------------------------------------------------------
+// Mail an einen Spieler schicken, identifiziert nur über commanderId +
+// eine seiner Planeten-Koordinaten (Allianzen kennen keine PlayFabId,
+// nur commanderId — der Umweg über die öffentlichen Systemdaten, wie
+// beim Kampfbericht/notifyAttack, macht das trotzdem möglich).
+// -------------------------------------------------------
+async function sendAllianceMail(commanderId, coord, subject, body) {
+    if (!coord) {
+        console.warn(`[Server] sendAllianceMail: keine Koordinate für Commander ${commanderId}, Mail übersprungen.`);
+        return;
+    }
+    try {
+        const ownerInfo = await getPlanetOwnerInfo(coord);
+        if (!ownerInfo || !ownerInfo.pfid) return;
+
+        const data = await playfabServer('/Server/GetUserData', {
+            PlayFabId: ownerInfo.pfid,
+            Keys: ['commander_data']
+        });
+        if (!data.Data?.['commander_data']) return;
+
+        const commander = JSON.parse(data.Data['commander_data'].Value);
+        if (!commander.inbox) commander.inbox = [];
+
+        const mailSeq = await getNextMailSeq();
+        commander.inbox.push({
+            mailId: `M-${commander.commanderId}-${mailSeq}`,
+            category: 0, // System
+            subject,
+            body,
+            senderName: 'Allianz-System', // LOCALIZE
+            senderId: 0,
+            isRead: false,
+            isFavorite: false,
+            timestamp: formatTimestamp(new Date()),
+            reportId: ''
+        });
+
+        await playfabServer('/Server/UpdateUserData', {
+            PlayFabId: ownerInfo.pfid,
+            Data: { 'commander_data': JSON.stringify(commander) },
+            Permission: 'Private'
+        });
+    } catch (e) {
+        console.error(`[Server] sendAllianceMail Fehler (Commander ${commanderId}):`, e.message);
+    }
+}
+
 // Durchsuchbare Liste ALLER Allianzen — ?search=... filtert auf Name/Tag
 app.get('/alliances', async (req, res) => {
     try {
@@ -734,7 +816,7 @@ app.get('/alliances/:id/members', async (req, res) => {
 // Direkter Beitritt (Alpha-Vereinfachung, keine Bewerbung/Einladung nötig)
 app.post('/alliances/:id/join', async (req, res) => {
     const id = parseInt(req.params.id, 10);
-    const { commanderId, commanderName } = req.body;
+    const { commanderId, commanderName, commanderCoord } = req.body;
     if (!id || !commanderId) return res.status(400).json({ success: false, error: 'Fehlende Parameter' });
 
     try {
@@ -742,14 +824,20 @@ app.post('/alliances/:id/join', async (req, res) => {
         if (existing)
             return res.status(400).json({ success: false, error: 'Du bist bereits Mitglied einer Allianz. Erst austreten.' });
 
-        const allianceCheck = await pool.query('SELECT id FROM alliances WHERE id = $1', [id]);
+        const allianceCheck = await pool.query('SELECT * FROM alliances WHERE id = $1', [id]);
         if (allianceCheck.rows.length === 0)
             return res.status(404).json({ success: false, error: 'Allianz nicht gefunden' });
+        const alliance = allianceCheck.rows[0];
 
         await pool.query(
-            'INSERT INTO alliance_members (alliance_id, commander_id, commander_name, role) VALUES ($1, $2, $3, $4)',
-            [id, commanderId, commanderName || 'Unbekannt', 'member']
+            'INSERT INTO alliance_members (alliance_id, commander_id, commander_name, commander_coord, role) VALUES ($1, $2, $3, $4, $5)',
+            [id, commanderId, commanderName || 'Unbekannt', commanderCoord || null, 'member']
         );
+
+        await sendAllianceMail(commanderId, commanderCoord,
+            'Allianz beigetreten', // LOCALIZE
+            `Du bist der Allianz "${alliance.name}" [${alliance.tag}] beigetreten.`); // LOCALIZE
+
         res.json({ success: true });
     } catch (error) {
         console.error('[Server] alliances/:id/join Fehler:', error.message);
@@ -763,10 +851,161 @@ app.post('/alliances/:id/leave', async (req, res) => {
     if (!id || !commanderId) return res.status(400).json({ success: false, error: 'Fehlende Parameter' });
 
     try {
+        // Koordinate + Allianzname VOR dem Löschen holen (danach weg)
+        const memberResult = await pool.query(
+            'SELECT commander_coord FROM alliance_members WHERE alliance_id = $1 AND commander_id = $2',
+            [id, commanderId]
+        );
+        const allianceResult = await pool.query('SELECT name, tag FROM alliances WHERE id = $1', [id]);
+
         await pool.query('DELETE FROM alliance_members WHERE alliance_id = $1 AND commander_id = $2', [id, commanderId]);
+
+        if (memberResult.rows.length > 0 && allianceResult.rows.length > 0) {
+            const coord = memberResult.rows[0].commander_coord;
+            const alliance = allianceResult.rows[0];
+            await sendAllianceMail(commanderId, coord,
+                'Allianz verlassen', // LOCALIZE
+                `Du hast die Allianz "${alliance.name}" [${alliance.tag}] verlassen.`); // LOCALIZE
+        }
+
         res.json({ success: true });
     } catch (error) {
         console.error('[Server] alliances/:id/leave Fehler:', error.message);
+        res.status(500).json({ success: false, error: error.message });
+    }
+});
+
+// =========================================================
+// ADMIN-CHEATS für Allianzen — nur für ADMIN_COMMANDER_IDS, per
+// display_id (der unveränderlichen "26080901001"-artigen ID) statt der
+// internen Datenbank-ID adressiert, damit die Cheatcodes exakt die ID
+// nutzen können, die auch im Spiel sichtbar ist.
+// =========================================================
+async function getAllianceByDisplayId(displayId) {
+    const result = await pool.query('SELECT * FROM alliances WHERE display_id = $1', [displayId]);
+    return result.rows.length > 0 ? result.rows[0] : null;
+}
+
+app.put('/alliances/admin/:displayId/rename', async (req, res) => {
+    const { requesterCommanderId, newName } = req.body;
+    if (!ADMIN_COMMANDER_IDS.includes(requesterCommanderId))
+        return res.status(403).json({ success: false, error: 'Nur Admin-Accounts dürfen das.' });
+    if (!newName || newName.length < 6 || newName.length > 30)
+        return res.status(400).json({ success: false, error: 'Name muss 6-30 Zeichen haben' });
+
+    try {
+        const alliance = await getAllianceByDisplayId(req.params.displayId);
+        if (!alliance) return res.status(404).json({ success: false, error: 'Allianz nicht gefunden' });
+
+        await pool.query('UPDATE alliances SET name = $1 WHERE id = $2', [newName.trim(), alliance.id]);
+        res.json({ success: true });
+    } catch (error) {
+        console.error('[Server] admin/rename Fehler:', error.message);
+        res.status(500).json({ success: false, error: error.message });
+    }
+});
+
+app.put('/alliances/admin/:displayId/retag', async (req, res) => {
+    const { requesterCommanderId, newTag } = req.body;
+    if (!ADMIN_COMMANDER_IDS.includes(requesterCommanderId))
+        return res.status(403).json({ success: false, error: 'Nur Admin-Accounts dürfen das.' });
+    if (!newTag || newTag.length < 3 || newTag.length > 6)
+        return res.status(400).json({ success: false, error: 'Tag muss 3-6 Zeichen haben' });
+
+    try {
+        const alliance = await getAllianceByDisplayId(req.params.displayId);
+        if (!alliance) return res.status(404).json({ success: false, error: 'Allianz nicht gefunden' });
+
+        const tagTaken = await pool.query('SELECT id FROM alliances WHERE tag = $1 AND id != $2', [newTag.trim().toUpperCase(), alliance.id]);
+        if (tagTaken.rows.length > 0)
+            return res.status(400).json({ success: false, error: 'Dieses Tag ist bereits vergeben.' });
+
+        await pool.query('UPDATE alliances SET tag = $1 WHERE id = $2', [newTag.trim().toUpperCase(), alliance.id]);
+        res.json({ success: true });
+    } catch (error) {
+        console.error('[Server] admin/retag Fehler:', error.message);
+        res.status(500).json({ success: false, error: error.message });
+    }
+});
+
+app.put('/alliances/admin/:displayId/redescribe', async (req, res) => {
+    const { requesterCommanderId, newDescription } = req.body;
+    if (!ADMIN_COMMANDER_IDS.includes(requesterCommanderId))
+        return res.status(403).json({ success: false, error: 'Nur Admin-Accounts dürfen das.' });
+    if ((newDescription || '').length > 1000)
+        return res.status(400).json({ success: false, error: 'Beschreibung zu lang (max. 1000 Zeichen)' });
+
+    try {
+        const alliance = await getAllianceByDisplayId(req.params.displayId);
+        if (!alliance) return res.status(404).json({ success: false, error: 'Allianz nicht gefunden' });
+
+        await pool.query('UPDATE alliances SET description = $1 WHERE id = $2', [newDescription || '', alliance.id]);
+        res.json({ success: true });
+    } catch (error) {
+        console.error('[Server] admin/redescribe Fehler:', error.message);
+        res.status(500).json({ success: false, error: error.message });
+    }
+});
+
+// Alle Mitglieder außer dem Gründer entfernen — jeder Entfernte bekommt
+// dieselbe "Allianz verlassen"-Mail wie beim normalen Austritt.
+app.post('/alliances/admin/:displayId/kick-everyone', async (req, res) => {
+    const { requesterCommanderId } = req.body;
+    if (!ADMIN_COMMANDER_IDS.includes(requesterCommanderId))
+        return res.status(403).json({ success: false, error: 'Nur Admin-Accounts dürfen das.' });
+
+    try {
+        const alliance = await getAllianceByDisplayId(req.params.displayId);
+        if (!alliance) return res.status(404).json({ success: false, error: 'Allianz nicht gefunden' });
+
+        const membersToKick = await pool.query(
+            "SELECT * FROM alliance_members WHERE alliance_id = $1 AND role != 'founder'",
+            [alliance.id]
+        );
+
+        await pool.query("DELETE FROM alliance_members WHERE alliance_id = $1 AND role != 'founder'", [alliance.id]);
+
+        for (const member of membersToKick.rows) {
+            await sendAllianceMail(member.commander_id, member.commander_coord,
+                'Allianz verlassen', // LOCALIZE
+                `Du wurdest aus der Allianz "${alliance.name}" [${alliance.tag}] entfernt.`); // LOCALIZE
+        }
+
+        res.json({ success: true, kickedCount: membersToKick.rows.length });
+    } catch (error) {
+        console.error('[Server] admin/kick-everyone Fehler:', error.message);
+        res.status(500).json({ success: false, error: error.message });
+    }
+});
+
+// Allianz komplett auflösen — Gründer bekommt eine Mail, alle
+// Mitgliedschaften werden per ON DELETE CASCADE automatisch mit entfernt.
+app.delete('/alliances/admin/:displayId', async (req, res) => {
+    const { requesterCommanderId } = req.body;
+    if (!ADMIN_COMMANDER_IDS.includes(requesterCommanderId))
+        return res.status(403).json({ success: false, error: 'Nur Admin-Accounts dürfen das.' });
+
+    try {
+        const alliance = await getAllianceByDisplayId(req.params.displayId);
+        if (!alliance) return res.status(404).json({ success: false, error: 'Allianz nicht gefunden' });
+
+        const founderResult = await pool.query(
+            "SELECT * FROM alliance_members WHERE alliance_id = $1 AND role = 'founder'",
+            [alliance.id]
+        );
+
+        await pool.query('DELETE FROM alliances WHERE id = $1', [alliance.id]); // CASCADE entfernt Mitgliedschaften mit
+
+        if (founderResult.rows.length > 0) {
+            const founder = founderResult.rows[0];
+            await sendAllianceMail(founder.commander_id, founder.commander_coord,
+                'Allianz aufgelöst', // LOCALIZE
+                `Die Allianz mit der ID ${req.params.displayId} wurde heute aufgelöst.`); // LOCALIZE
+        }
+
+        res.json({ success: true });
+    } catch (error) {
+        console.error('[Server] admin/delete Fehler:', error.message);
         res.status(500).json({ success: false, error: error.message });
     }
 });
@@ -775,13 +1014,13 @@ app.post('/alliances/:id/leave', async (req, res) => {
 // Satzung/Gründung
 // -------------------------------------------------------
 app.post('/alliances/charter', async (req, res) => {
-    const { founderCommanderId, founderName, name, tag, logoId, description,
+    const { founderCommanderId, founderName, founderCoord, founderGalaxyId, name, tag, logoId, description,
             placeholder01, placeholder02, placeholder03 } = req.body;
 
     if (!founderCommanderId || !name || !tag)
         return res.status(400).json({ success: false, error: 'Fehlende Pflichtfelder' });
-    if (name.length > 30) return res.status(400).json({ success: false, error: 'Name zu lang (max. 30 Zeichen)' });
-    if (tag.length > 6) return res.status(400).json({ success: false, error: 'Tag zu lang (max. 6 Zeichen)' });
+    if (name.length < 6 || name.length > 30) return res.status(400).json({ success: false, error: 'Name muss 6-30 Zeichen haben' });
+    if (tag.length < 3 || tag.length > 6) return res.status(400).json({ success: false, error: 'Tag muss 3-6 Zeichen haben' });
     if ((description || '').length > 1000) return res.status(400).json({ success: false, error: 'Beschreibung zu lang (max. 1000 Zeichen)' });
     if ((logoId || 0) === 0 && !ADMIN_COMMANDER_IDS.includes(founderCommanderId))
         return res.status(403).json({ success: false, error: 'Dieses Logo ist Admin-Accounts vorbehalten.' });
@@ -800,10 +1039,11 @@ app.post('/alliances/charter', async (req, res) => {
 
         const result = await pool.query(
             `INSERT INTO alliance_charters
-                (founder_commander_id, founder_name, name, tag, logo_id, description,
+                (founder_commander_id, founder_name, founder_coord, founder_galaxy_id, name, tag, logo_id, description,
                  placeholder_01, placeholder_02, placeholder_03, required_signatures)
-             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10) RETURNING *`,
-            [founderCommanderId, founderName || 'Unbekannt', name.trim(), tag.trim().toUpperCase(),
+             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12) RETURNING *`,
+            [founderCommanderId, founderName || 'Unbekannt', founderCoord || null, founderGalaxyId || 1,
+             name.trim(), tag.trim().toUpperCase(),
              logoId || 0, description || '', placeholder01 || '', placeholder02 || '', placeholder03 || '',
              requiredSignatures]
         );
@@ -838,7 +1078,7 @@ app.get('/alliances/charter/:id', async (req, res) => {
 
 app.post('/alliances/charter/:id/sign', async (req, res) => {
     const id = parseInt(req.params.id, 10);
-    const { commanderId, commanderName } = req.body;
+    const { commanderId, commanderName, commanderCoord } = req.body;
     if (!id || !commanderId) return res.status(400).json({ success: false, error: 'Fehlende Parameter' });
 
     try {
@@ -859,8 +1099,8 @@ app.post('/alliances/charter/:id/sign', async (req, res) => {
         // Unterschrift eintragen (UNIQUE-Constraint verhindert doppelte Unterschrift automatisch)
         try {
             await pool.query(
-                'INSERT INTO alliance_charter_signatures (charter_id, signer_commander_id, signer_name) VALUES ($1, $2, $3)',
-                [id, commanderId, commanderName || 'Unbekannt']
+                'INSERT INTO alliance_charter_signatures (charter_id, signer_commander_id, signer_name, signer_coord) VALUES ($1, $2, $3, $4)',
+                [id, commanderId, commanderName || 'Unbekannt', commanderCoord || null]
             );
         } catch (dupeError) {
             return res.status(400).json({ success: false, error: 'Du hast bereits unterschrieben.' });
@@ -873,28 +1113,39 @@ app.post('/alliances/charter/:id/sign', async (req, res) => {
             return res.json({ success: true, finalized: false, signatureCount: sigCount, required: charter.required_signatures });
         }
 
-        // Genug Unterschriften -> Allianz jetzt wirklich erzeugen
+        // Genug Unterschriften -> Allianz jetzt wirklich erzeugen, inkl.
+        // unveränderlicher display_id (Datum + Galaxie + fortlaufende Nummer)
+        const displayId = await generateAllianceDisplayId(charter.founder_galaxy_id);
+
         const allianceResult = await pool.query(
-            `INSERT INTO alliances (name, tag, logo_id, description, placeholder_01, placeholder_02, placeholder_03, founder_commander_id)
-             VALUES ($1, $2, $3, $4, $5, $6, $7, $8) RETURNING *`,
-            [charter.name, charter.tag, charter.logo_id, charter.description,
+            `INSERT INTO alliances (display_id, name, tag, logo_id, description, placeholder_01, placeholder_02, placeholder_03, founder_commander_id)
+             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9) RETURNING *`,
+            [displayId, charter.name, charter.tag, charter.logo_id, charter.description,
              charter.placeholder_01, charter.placeholder_02, charter.placeholder_03, charter.founder_commander_id]
         );
         const newAlliance = allianceResult.rows[0];
 
         // Gruender als Mitglied eintragen
         await pool.query(
-            'INSERT INTO alliance_members (alliance_id, commander_id, commander_name, role) VALUES ($1, $2, $3, $4)',
-            [newAlliance.id, charter.founder_commander_id, charter.founder_name, 'founder']
+            'INSERT INTO alliance_members (alliance_id, commander_id, commander_name, commander_coord, role) VALUES ($1, $2, $3, $4, $5)',
+            [newAlliance.id, charter.founder_commander_id, charter.founder_name, charter.founder_coord, 'founder']
         );
 
         // Alle Unterzeichner als Mitglieder eintragen
         const signatures = await pool.query('SELECT * FROM alliance_charter_signatures WHERE charter_id = $1', [id]);
         for (const sig of signatures.rows) {
             await pool.query(
-                'INSERT INTO alliance_members (alliance_id, commander_id, commander_name, role) VALUES ($1, $2, $3, $4) ON CONFLICT (commander_id) DO NOTHING',
-                [newAlliance.id, sig.signer_commander_id, sig.signer_name, 'member']
+                'INSERT INTO alliance_members (alliance_id, commander_id, commander_name, commander_coord, role) VALUES ($1, $2, $3, $4, $5) ON CONFLICT (commander_id) DO NOTHING',
+                [newAlliance.id, sig.signer_commander_id, sig.signer_name, sig.signer_coord, 'member']
             );
+        }
+
+        // Gründungs-Mail an ALLE Beteiligten (Gründer + Unterzeichner)
+        const foundedSubject = 'Allianz gegründet!'; // LOCALIZE
+        const foundedBody = `Die Allianz "${newAlliance.name}" [${newAlliance.tag}] (ID ${displayId}) wurde erfolgreich gegründet!`; // LOCALIZE
+        await sendAllianceMail(charter.founder_commander_id, charter.founder_coord, foundedSubject, foundedBody);
+        for (const sig of signatures.rows) {
+            await sendAllianceMail(sig.signer_commander_id, sig.signer_coord, foundedSubject, foundedBody);
         }
 
         await pool.query(
