@@ -783,6 +783,8 @@ app.post('/alliances/charter', async (req, res) => {
     if (name.length > 30) return res.status(400).json({ success: false, error: 'Name zu lang (max. 30 Zeichen)' });
     if (tag.length > 6) return res.status(400).json({ success: false, error: 'Tag zu lang (max. 6 Zeichen)' });
     if ((description || '').length > 1000) return res.status(400).json({ success: false, error: 'Beschreibung zu lang (max. 1000 Zeichen)' });
+    if ((logoId || 0) === 0 && !ADMIN_COMMANDER_IDS.includes(founderCommanderId))
+        return res.status(403).json({ success: false, error: 'Dieses Logo ist Admin-Accounts vorbehalten.' });
 
     try {
         const existing = await getAllianceIdForCommander(founderCommanderId);
