@@ -293,6 +293,7 @@ async function initDatabase() {
             CREATE TABLE IF NOT EXISTS commander_highscore (
                 commander_id INTEGER PRIMARY KEY,
                 commander_name TEXT NOT NULL,
+                avatar_index INTEGER NOT NULL DEFAULT 0,
                 total_points INTEGER NOT NULL DEFAULT 0,
                 fleet_points INTEGER NOT NULL DEFAULT 0,
                 infrastructure_points INTEGER NOT NULL DEFAULT 0,
@@ -300,6 +301,7 @@ async function initDatabase() {
                 updated_at TIMESTAMPTZ NOT NULL DEFAULT now()
             );
         `);
+        await pool.query(`ALTER TABLE commander_highscore ADD COLUMN IF NOT EXISTS avatar_index INTEGER NOT NULL DEFAULT 0;`);
         await pool.query(`CREATE INDEX IF NOT EXISTS idx_commander_highscore_points ON commander_highscore (total_points DESC);`);
 
         // Sperre gegen doppelte Flottenverarbeitung. Egal WOHER ein doppelter
@@ -1981,23 +1983,78 @@ async function updateCommanderHighscore(commander, planets) {
         const totalPoints = fleetPoints + infraPoints + researchPoints;
 
         await pool.query(
-            `INSERT INTO commander_highscore (commander_id, commander_name, total_points, fleet_points, infrastructure_points, research_points, updated_at)
-             VALUES ($1, $2, $3, $4, $5, $6, now())
+            `INSERT INTO commander_highscore (commander_id, commander_name, avatar_index, total_points, fleet_points, infrastructure_points, research_points, updated_at)
+             VALUES ($1, $2, $3, $4, $5, $6, $7, now())
              ON CONFLICT (commander_id) DO UPDATE SET
-                commander_name = $2, total_points = $3, fleet_points = $4,
-                infrastructure_points = $5, research_points = $6, updated_at = now()`,
-            [commander.commanderId, commander.visibleName || 'Unbekannt', totalPoints, fleetPoints, infraPoints, researchPoints]
+                commander_name = $2, avatar_index = $3, total_points = $4, fleet_points = $5,
+                infrastructure_points = $6, research_points = $7, updated_at = now()`,
+            [commander.commanderId, commander.visibleName || 'Unbekannt', commander.avatarIndex || 0,
+             totalPoints, fleetPoints, infraPoints, researchPoints]
         );
     } catch (e) {
         console.error(`[Server] updateCommanderHighscore Fehler (${commander.commanderId}):`, e.message);
     }
 }
 
+// -------------------------------------------------------
+// Selbst-Reparatur für verwaiste Planeten — behebt genau das Szenario
+// vom 11.08.: öffentliche Daten zeigen einen Planeten als "mir gehörend",
+// aber er fehlt in der privaten colonies-Liste (Race-Condition-Folge).
+// Sicherheit: Der Server prüft ZWINGEND anhand der ÖFFENTLICHEN
+// Systemdaten, ob der Anfragende wirklich der eingetragene Besitzer ist —
+// niemand kann sich damit fremde Planeten "reparieren".
+// -------------------------------------------------------
+app.post('/planets/repair-ownership', async (req, res) => {
+    const { commanderId, coord } = req.body;
+    if (!commanderId || !coord)
+        return res.status(400).json({ success: false, error: 'Fehlende Parameter' });
+
+    try {
+        const ownerInfo = await getPlanetOwnerInfo(coord);
+        if (!ownerInfo || !ownerInfo.pfid)
+            return res.status(404).json({ success: false, error: 'Planet nicht gefunden oder unbesiedelt.' });
+
+        if (ownerInfo.ownerCommanderId !== commanderId)
+            return res.status(403).json({ success: false, error: 'Dieser Planet gehört laut öffentlichen Daten nicht dir — keine Reparatur möglich.' });
+
+        const data = await playfabServer('/Server/GetUserData', {
+            PlayFabId: ownerInfo.pfid,
+            Keys: ['commander_data']
+        });
+        if (!data.Data?.['commander_data'])
+            return res.status(404).json({ success: false, error: 'Commander-Daten nicht gefunden.' });
+
+        const commander = JSON.parse(data.Data['commander_data'].Value);
+        if (!commander.colonies) commander.colonies = [];
+
+        if (commander.colonies.includes(coord)) {
+            return res.json({ success: true, repaired: false, message: 'War bereits korrekt eingetragen, keine Reparatur nötig.' });
+        }
+
+        commander.colonies.push(coord);
+
+        await playfabServer('/Server/UpdateUserData', {
+            PlayFabId: ownerInfo.pfid,
+            Data: { 'commander_data': JSON.stringify(commander) },
+            Permission: 'Private'
+        });
+
+        res.json({ success: true, repaired: true, message: `Planet ${coord} wurde wieder in deine Kolonie-Liste eingetragen.` });
+    } catch (error) {
+        console.error('[Server] planets/repair-ownership Fehler:', error.message);
+        res.status(500).json({ success: false, error: error.message });
+    }
+});
+
 app.get('/highscore/commanders', async (req, res) => {
     try {
         const limit = Math.min(parseInt(req.query.limit) || 100, 500);
         const result = await pool.query(
-            'SELECT * FROM commander_highscore ORDER BY total_points DESC LIMIT $1',
+            `SELECT h.*, a.tag AS alliance_tag, a.name AS alliance_name, a.id AS alliance_id
+             FROM commander_highscore h
+             LEFT JOIN alliance_members m ON m.commander_id = h.commander_id
+             LEFT JOIN alliances a ON a.id = m.alliance_id
+             ORDER BY h.total_points DESC LIMIT $1`,
             [limit]
         );
         res.json({ success: true, highscore: result.rows });
