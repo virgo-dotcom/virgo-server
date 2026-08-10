@@ -282,6 +282,26 @@ async function initDatabase() {
         await pool.query(`CREATE INDEX IF NOT EXISTS idx_alliance_relationships_a ON alliance_relationships (alliance_id_a);`);
         await pool.query(`CREATE INDEX IF NOT EXISTS idx_alliance_relationships_b ON alliance_relationships (alliance_id_b);`);
 
+        // -------------------------------------------------------
+        // Commander-Highscore — wird bei jedem /serverTick (alle 5 Min)
+        // für ALLE aktiven Spieler neu berechnet. Läuft über unseren
+        // eigenen Server (nicht PlayFab), damit's eine echte, für ALLE
+        // Spieler durchsuchbare/sortierbare Liste ist, nicht nur die
+        // eigene, lokal berechnete Punktzahl.
+        // -------------------------------------------------------
+        await pool.query(`
+            CREATE TABLE IF NOT EXISTS commander_highscore (
+                commander_id INTEGER PRIMARY KEY,
+                commander_name TEXT NOT NULL,
+                total_points INTEGER NOT NULL DEFAULT 0,
+                fleet_points INTEGER NOT NULL DEFAULT 0,
+                infrastructure_points INTEGER NOT NULL DEFAULT 0,
+                research_points INTEGER NOT NULL DEFAULT 0,
+                updated_at TIMESTAMPTZ NOT NULL DEFAULT now()
+            );
+        `);
+        await pool.query(`CREATE INDEX IF NOT EXISTS idx_commander_highscore_points ON commander_highscore (total_points DESC);`);
+
         // Sperre gegen doppelte Flottenverarbeitung. Egal WOHER ein doppelter
         // Aufruf für dieselbe Flotte kommt (Client-Doppelklick, zwei offene
         // Tabs, ein zusätzlicher /serverTick-Trigger, der zufällig zur
@@ -1702,6 +1722,7 @@ async function serverTickHandler(req, res) {
 
                 const commander = JSON.parse(userData.Data['commander_data'].Value);
                 let changed = false;
+                const commanderPlanetsForHighscore = []; // NEU: für die Punkte-Berechnung unten gesammelt
 
                 // Ressourcen produzieren
                 if (commander.colonies?.length > 0) {
@@ -1736,6 +1757,8 @@ async function serverTickHandler(req, res) {
                                 Data: { [planetKey]: JSON.stringify(updatedPlanet) },
                                 Permission: 'Private'
                             });
+
+                            commanderPlanetsForHighscore.push(updatedPlanet);
                         } catch(e) {}
                     }
                 }
@@ -1791,6 +1814,12 @@ async function serverTickHandler(req, res) {
                     changed = true;
                     log.push(`Forschung fertig: ${playFabId}`);
                 }
+
+                // Highscore aktualisieren — läuft IMMER, unabhängig von
+                // "changed" (auch wenn sich diesen Tick nichts an
+                // Ressourcen/Flotten geändert hat, soll die Punktzahl
+                // trotzdem aktuell in der Liste stehen)
+                await updateCommanderHighscore(commander, commanderPlanetsForHighscore);
 
                 if (changed) {
                     await playfabServer('/Server/UpdateUserData', {
@@ -1872,6 +1901,111 @@ const BUILDING_ECONOMY = {
     }
     // Weitere Gebäude (Werft, Labor, ...): noch nicht definiert
 };
+
+// Produktion PRO TICK (5 Sekunden) für ein Gebäude auf einer bestimmten
+// Stufe — Portierung von BuildingDefinition.GetProduction() aus Unity.
+// =========================================================
+// COMMANDER-HIGHSCORE — Punkte-Formeln, 1:1 portiert aus
+// CommanderWindowController.cs (RefreshScore/CalculateFleetScore/
+// CalculateInfrastructureScore/CalculateResearchScore). MUSS synchron
+// gehalten werden, falls sich die Formel im Client mal ändert.
+// =========================================================
+const HS_WARSHIP_POINTS = [1, 10, 100, 1000, 10000, 100000, 1000000, 10000000, 100000000, 1000000000];
+const HS_SHIP_POINTS    = [1, 10, 100, 1000, 10000, 100000];
+
+function hsCalcFleetScore(planets) {
+    let score = 0;
+    for (const planet of planets) {
+        if (!planet) continue;
+        const warships = planet.warships || [];
+        const ships = planet.ships || [];
+        for (let i = 0; i < warships.length && i < HS_WARSHIP_POINTS.length; i++)
+            score += (warships[i] || 0) * HS_WARSHIP_POINTS[i];
+        for (let i = 0; i < ships.length && i < HS_SHIP_POINTS.length; i++)
+            score += (ships[i] || 0) * HS_SHIP_POINTS[i];
+    }
+    return score;
+}
+
+function hsCalcPlanetDevelopment(planet) {
+    if (!planet || !planet.buildings) return 0;
+    let points = 0;
+    for (let i = 0; i < planet.buildings.length; i++) {
+        const level = planet.buildings[i] || 0;
+        let perLevel;
+        if (i === 0) perLevel = 50;
+        else if (i === 5 || i === 6) perLevel = 100;
+        else perLevel = 10;
+        points += level * perLevel;
+    }
+    return points;
+}
+
+function hsCalcInfrastructureScore(planets) {
+    let score = 0;
+    for (const planet of planets) score += hsCalcPlanetDevelopment(planet);
+    return score;
+}
+
+function hsCalcResearchPoints(level) {
+    if (!level || level <= 0) return 0;
+    let total = 0;
+    let pointsPerLevel = 10;
+    for (let i = 1; i <= level; i++) {
+        total += pointsPerLevel;
+        pointsPerLevel *= 1.1;
+    }
+    return Math.round(total);
+}
+
+function hsCalcResearchScore(commander) {
+    const levels = [
+        commander.weapon01, commander.weapon02, commander.weapon03,
+        commander.shield01, commander.shield02, commander.shield03,
+        commander.engine01, commander.engine02, commander.engine03, commander.engine04,
+        commander.ress01, commander.ress02, commander.ress03, commander.ress04, commander.ress05,
+        commander.recycling, commander.reparatur,
+        commander.terraforming, commander.verwaltung, commander.architektur,
+        commander.ingenieurwesen, commander.wirtschaftslehre
+    ];
+    let score = 0;
+    for (const lvl of levels) score += hsCalcResearchPoints(lvl);
+    return score;
+}
+
+async function updateCommanderHighscore(commander, planets) {
+    try {
+        const fleetPoints = hsCalcFleetScore(planets);
+        const infraPoints = hsCalcInfrastructureScore(planets);
+        const researchPoints = hsCalcResearchScore(commander);
+        const totalPoints = fleetPoints + infraPoints + researchPoints;
+
+        await pool.query(
+            `INSERT INTO commander_highscore (commander_id, commander_name, total_points, fleet_points, infrastructure_points, research_points, updated_at)
+             VALUES ($1, $2, $3, $4, $5, $6, now())
+             ON CONFLICT (commander_id) DO UPDATE SET
+                commander_name = $2, total_points = $3, fleet_points = $4,
+                infrastructure_points = $5, research_points = $6, updated_at = now()`,
+            [commander.commanderId, commander.visibleName || 'Unbekannt', totalPoints, fleetPoints, infraPoints, researchPoints]
+        );
+    } catch (e) {
+        console.error(`[Server] updateCommanderHighscore Fehler (${commander.commanderId}):`, e.message);
+    }
+}
+
+app.get('/highscore/commanders', async (req, res) => {
+    try {
+        const limit = Math.min(parseInt(req.query.limit) || 100, 500);
+        const result = await pool.query(
+            'SELECT * FROM commander_highscore ORDER BY total_points DESC LIMIT $1',
+            [limit]
+        );
+        res.json({ success: true, highscore: result.rows });
+    } catch (error) {
+        console.error('[Server] highscore/commanders GET Fehler:', error.message);
+        res.status(500).json({ success: false, error: error.message });
+    }
+});
 
 // Produktion PRO TICK (5 Sekunden) für ein Gebäude auf einer bestimmten
 // Stufe — Portierung von BuildingDefinition.GetProduction() aus Unity.
