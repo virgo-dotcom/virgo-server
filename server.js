@@ -294,6 +294,7 @@ async function initDatabase() {
                 commander_id INTEGER PRIMARY KEY,
                 commander_name TEXT NOT NULL,
                 avatar_index INTEGER NOT NULL DEFAULT 0,
+                playfab_id TEXT,
                 total_points INTEGER NOT NULL DEFAULT 0,
                 fleet_points INTEGER NOT NULL DEFAULT 0,
                 infrastructure_points INTEGER NOT NULL DEFAULT 0,
@@ -302,6 +303,7 @@ async function initDatabase() {
             );
         `);
         await pool.query(`ALTER TABLE commander_highscore ADD COLUMN IF NOT EXISTS avatar_index INTEGER NOT NULL DEFAULT 0;`);
+        await pool.query(`ALTER TABLE commander_highscore ADD COLUMN IF NOT EXISTS playfab_id TEXT;`);
         await pool.query(`CREATE INDEX IF NOT EXISTS idx_commander_highscore_points ON commander_highscore (total_points DESC);`);
 
         // Sperre gegen doppelte Flottenverarbeitung. Egal WOHER ein doppelter
@@ -1821,7 +1823,7 @@ async function serverTickHandler(req, res) {
                 // "changed" (auch wenn sich diesen Tick nichts an
                 // Ressourcen/Flotten geändert hat, soll die Punktzahl
                 // trotzdem aktuell in der Liste stehen)
-                await updateCommanderHighscore(commander, commanderPlanetsForHighscore);
+                await updateCommanderHighscore(commander, commanderPlanetsForHighscore, playFabId);
 
                 if (changed) {
                     await playfabServer('/Server/UpdateUserData', {
@@ -1975,7 +1977,7 @@ function hsCalcResearchScore(commander) {
     return score;
 }
 
-async function updateCommanderHighscore(commander, planets) {
+async function updateCommanderHighscore(commander, planets, playFabId) {
     try {
         const fleetPoints = hsCalcFleetScore(planets);
         const infraPoints = hsCalcInfrastructureScore(planets);
@@ -1983,12 +1985,12 @@ async function updateCommanderHighscore(commander, planets) {
         const totalPoints = fleetPoints + infraPoints + researchPoints;
 
         await pool.query(
-            `INSERT INTO commander_highscore (commander_id, commander_name, avatar_index, total_points, fleet_points, infrastructure_points, research_points, updated_at)
-             VALUES ($1, $2, $3, $4, $5, $6, $7, now())
+            `INSERT INTO commander_highscore (commander_id, commander_name, avatar_index, playfab_id, total_points, fleet_points, infrastructure_points, research_points, updated_at)
+             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, now())
              ON CONFLICT (commander_id) DO UPDATE SET
-                commander_name = $2, avatar_index = $3, total_points = $4, fleet_points = $5,
-                infrastructure_points = $6, research_points = $7, updated_at = now()`,
-            [commander.commanderId, commander.visibleName || 'Unbekannt', commander.avatarIndex || 0,
+                commander_name = $2, avatar_index = $3, playfab_id = $4, total_points = $5, fleet_points = $6,
+                infrastructure_points = $7, research_points = $8, updated_at = now()`,
+            [commander.commanderId, commander.visibleName || 'Unbekannt', commander.avatarIndex || 0, playFabId || null,
              totalPoints, fleetPoints, infraPoints, researchPoints]
         );
     } catch (e) {
@@ -2042,6 +2044,70 @@ app.post('/planets/repair-ownership', async (req, res) => {
         res.json({ success: true, repaired: true, message: `Planet ${coord} wurde wieder in deine Kolonie-Liste eingetragen.` });
     } catch (error) {
         console.error('[Server] planets/repair-ownership Fehler:', error.message);
+        res.status(500).json({ success: false, error: error.message });
+    }
+});
+
+// -------------------------------------------------------
+// Prüft, ob "requesterId" Einblick in die Kolonie-Liste von "targetId"
+// bekommen darf — persönliche Freundschaft ODER gemeinsame Allianz ODER
+// verbündete Allianzen (Allianz-Freundschaft ist aktuell noch nicht
+// setzbar, aber die Prüfung ist schon vorbereitet für später).
+// -------------------------------------------------------
+async function isAuthorizedToViewColonies(requesterId, targetId) {
+    if (requesterId === targetId) return true; // eigene Akte immer einsehbar
+
+    const relResult = await pool.query(
+        `SELECT status FROM player_relationships
+         WHERE (commander_id_a = $1 AND commander_id_b = $2) OR (commander_id_a = $2 AND commander_id_b = $1)`,
+        [requesterId, targetId]
+    );
+    if (relResult.rows.length > 0 && relResult.rows[0].status === 'friend') return true;
+
+    const requesterAlliance = await getAllianceIdForCommander(requesterId);
+    const targetAlliance = await getAllianceIdForCommander(targetId);
+    if (!requesterAlliance || !targetAlliance) return false;
+
+    if (requesterAlliance === targetAlliance) return true; // gleiche Allianz
+
+    const [a, b] = orderIds(requesterAlliance, targetAlliance);
+    const allyResult = await pool.query(
+        'SELECT status FROM alliance_relationships WHERE alliance_id_a = $1 AND alliance_id_b = $2',
+        [a, b]
+    );
+    return allyResult.rows.length > 0 && allyResult.rows[0].status === 'ally';
+}
+
+app.get('/commander/:commanderId/colonies', async (req, res) => {
+    const targetId = parseInt(req.params.commanderId, 10);
+    const requesterId = parseInt(req.query.requesterId, 10);
+    if (!targetId || !requesterId)
+        return res.status(400).json({ success: false, error: 'Fehlende Parameter' });
+
+    try {
+        const authorized = await isAuthorizedToViewColonies(requesterId, targetId);
+        if (!authorized)
+            return res.status(403).json({ success: false, error: 'Dir ist kein Einblick in die Akte dieses Commanders gestattet.' });
+
+        const pfidResult = await pool.query('SELECT playfab_id FROM commander_highscore WHERE commander_id = $1', [targetId]);
+        if (pfidResult.rows.length === 0 || !pfidResult.rows[0].playfab_id)
+            return res.status(404).json({ success: false, error: 'Commander nicht gefunden.' });
+
+        const data = await playfabServer('/Server/GetUserData', {
+            PlayFabId: pfidResult.rows[0].playfab_id,
+            Keys: ['commander_data']
+        });
+        if (!data.Data?.['commander_data'])
+            return res.status(404).json({ success: false, error: 'Commander-Daten nicht gefunden.' });
+
+        const commander = JSON.parse(data.Data['commander_data'].Value);
+        res.json({
+            success: true,
+            colonies: commander.colonies || [],
+            mainPlanetCoord: commander.mainPlanetCoord || ''
+        });
+    } catch (error) {
+        console.error('[Server] commander/colonies GET Fehler:', error.message);
         res.status(500).json({ success: false, error: error.message });
     }
 });
