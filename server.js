@@ -306,6 +306,47 @@ async function initDatabase() {
         await pool.query(`ALTER TABLE commander_highscore ADD COLUMN IF NOT EXISTS playfab_id TEXT;`);
         await pool.query(`CREATE INDEX IF NOT EXISTS idx_commander_highscore_points ON commander_highscore (total_points DESC);`);
 
+        // -------------------------------------------------------
+        // Rechtstexte (AGB/Datenschutz/Impressum/Jugendschutz) — über
+        // den eigenen Server ausgeliefert statt über PlayFab Title Data,
+        // weil PlayFab-Client-Aufrufe grundsätzlich einen eingeloggten
+        // Spieler voraussetzen. Ein Spieler soll "Rechtliches" aber schon
+        // VOR Login/Registrierung lesen können (Tab03 im neuen
+        // Login-Fenster) — der eigene Server ist dafür schon offen
+        // erreichbar (CORS *, kein Auth nötig), genau wie /announcements.
+        // -------------------------------------------------------
+        await pool.query(`
+            CREATE TABLE IF NOT EXISTS legal_texts (
+                key TEXT PRIMARY KEY,
+                content TEXT NOT NULL DEFAULT '',
+                updated_at TIMESTAMPTZ NOT NULL DEFAULT now()
+            );
+        `);
+
+        // -------------------------------------------------------
+        // Support-Kontaktformular (Tab04 im Login-Fenster) — landet
+        // NICHT als Ingame-Mail beim Admin (anders als /reportBug),
+        // sondern in einer eigenen Tabelle. Grund: Support-Anfragen
+        // können auch von noch nicht eingeloggten/neuen Spielern kommen
+        // (z.B. "Ich komme mit der Registrierung nicht klar"), für die
+        // es noch gar keinen Commander/keine Inbox gibt. sender_commander_id
+        // ist deshalb bewusst NULLABLE.
+        // -------------------------------------------------------
+        await pool.query(`
+            CREATE TABLE IF NOT EXISTS support_messages (
+                id SERIAL PRIMARY KEY,
+                sender_commander_id INTEGER,
+                sender_name TEXT,
+                sender_email TEXT,
+                message TEXT NOT NULL,
+                is_read BOOLEAN NOT NULL DEFAULT false,
+                created_at TIMESTAMPTZ NOT NULL DEFAULT now()
+            );
+        `);
+        await pool.query(`CREATE INDEX IF NOT EXISTS idx_support_messages_created_at ON support_messages (created_at DESC);`);
+
+        console.log('[DB] legal_texts + support_messages bereit.');
+
         // Sperre gegen doppelte Flottenverarbeitung. Egal WOHER ein doppelter
         // Aufruf für dieselbe Flotte kommt (Client-Doppelklick, zwei offene
         // Tabs, ein zusätzlicher /serverTick-Trigger, der zufällig zur
@@ -1477,6 +1518,96 @@ app.post('/reportBug', async (req, res) => {
         res.json({ success: true });
     } catch (error) {
         console.error('[Server] reportBug Fehler:', error.message);
+        res.status(500).json({ success: false, error: error.message });
+    }
+});
+
+// -------------------------------------------------------
+// Rechtstexte — GET ist komplett offen (auch ohne Login lesbar,
+// absichtlich, siehe Kommentar bei der Tabellen-Erstellung). PUT ist
+// nur für Admin-Accounts, adressiert über den Text-Key (z.B. "agb",
+// "datenschutz", "impressum", "jugendschutz").
+//
+// Rückgabeform bewusst als einfaches Objekt { key: content, ... } statt
+// als Zeilen-Array — im Client so am einfachsten per Key abzufragen,
+// ohne erst eine Liste durchsuchen zu müssen.
+// -------------------------------------------------------
+app.get('/legal-texts', async (req, res) => {
+    try {
+        const result = await pool.query('SELECT key, content, updated_at FROM legal_texts');
+        const texts = {};
+        for (const row of result.rows) texts[row.key] = row.content;
+        res.json({ success: true, texts });
+    } catch (error) {
+        console.error('[Server] legal-texts GET Fehler:', error.message);
+        res.status(500).json({ success: false, error: error.message });
+    }
+});
+
+app.put('/legal-texts/:key', async (req, res) => {
+    const { requesterCommanderId, content } = req.body;
+    const key = req.params.key;
+
+    if (!ADMIN_COMMANDER_IDS.includes(requesterCommanderId))
+        return res.status(403).json({ success: false, error: 'Nur Admin-Accounts dürfen Rechtstexte ändern.' });
+    if (!key || typeof content !== 'string')
+        return res.status(400).json({ success: false, error: 'Fehlende Parameter' });
+
+    try {
+        const result = await pool.query(
+            `INSERT INTO legal_texts (key, content, updated_at)
+             VALUES ($1, $2, now())
+             ON CONFLICT (key) DO UPDATE SET content = $2, updated_at = now()
+             RETURNING *`,
+            [key, content]
+        );
+        res.json({ success: true, text: result.rows[0] });
+    } catch (error) {
+        console.error('[Server] legal-texts PUT Fehler:', error.message);
+        res.status(500).json({ success: false, error: error.message });
+    }
+});
+
+// -------------------------------------------------------
+// Support-Kontaktformular — POST ist offen (auch für nicht eingeloggte
+// Spieler, siehe Kommentar bei der Tabellen-Erstellung). GET (Liste
+// einsehen) ist nur für Admin-Accounts.
+// -------------------------------------------------------
+app.post('/supportMessage', async (req, res) => {
+    const { senderCommanderId, senderName, senderEmail, message } = req.body;
+
+    if (!message || !message.trim())
+        return res.status(400).json({ success: false, error: 'Nachricht darf nicht leer sein.' });
+    if (message.length > 2000)
+        return res.status(400).json({ success: false, error: 'Nachricht zu lang (max. 2000 Zeichen).' });
+
+    try {
+        const result = await pool.query(
+            `INSERT INTO support_messages (sender_commander_id, sender_name, sender_email, message)
+             VALUES ($1, $2, $3, $4) RETURNING *`,
+            [senderCommanderId || null, senderName || null, senderEmail || null, message.trim()]
+        );
+        res.json({ success: true, supportMessage: result.rows[0] });
+    } catch (error) {
+        console.error('[Server] supportMessage POST Fehler:', error.message);
+        res.status(500).json({ success: false, error: error.message });
+    }
+});
+
+app.get('/supportMessages', async (req, res) => {
+    const requesterCommanderId = parseInt(req.query.requesterCommanderId, 10);
+    if (!ADMIN_COMMANDER_IDS.includes(requesterCommanderId))
+        return res.status(403).json({ success: false, error: 'Nur Admin-Accounts dürfen Support-Nachrichten einsehen.' });
+
+    try {
+        const limit = Math.min(parseInt(req.query.limit) || 100, 300);
+        const result = await pool.query(
+            'SELECT * FROM support_messages ORDER BY is_read ASC, created_at DESC LIMIT $1',
+            [limit]
+        );
+        res.json({ success: true, messages: result.rows });
+    } catch (error) {
+        console.error('[Server] supportMessages GET Fehler:', error.message);
         res.status(500).json({ success: false, error: error.message });
     }
 });
