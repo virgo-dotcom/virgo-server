@@ -307,21 +307,32 @@ async function initDatabase() {
         await pool.query(`CREATE INDEX IF NOT EXISTS idx_commander_highscore_points ON commander_highscore (total_points DESC);`);
 
         // -------------------------------------------------------
-        // Rechtstexte (AGB/Datenschutz/Impressum/Jugendschutz) — über
-        // den eigenen Server ausgeliefert statt über PlayFab Title Data,
-        // weil PlayFab-Client-Aufrufe grundsätzlich einen eingeloggten
-        // Spieler voraussetzen. Ein Spieler soll "Rechtliches" aber schon
-        // VOR Login/Registrierung lesen können (Tab03 im neuen
-        // Login-Fenster) — der eigene Server ist dafür schon offen
-        // erreichbar (CORS *, kein Auth nötig), genau wie /announcements.
+        // Rechtstexte (aktuell: spielregeln/agb/datenschutz) — über den
+        // eigenen Server ausgeliefert statt über PlayFab Title Data, weil
+        // PlayFab-Client-Aufrufe grundsätzlich einen eingeloggten Spieler
+        // voraussetzen. Ein Spieler soll "Rechtliches" aber schon VOR
+        // Login/Registrierung lesen können (Tab03 im Login-Fenster) —
+        // der eigene Server ist dafür schon offen erreichbar (CORS *,
+        // kein Auth nötig), genau wie /announcements.
+        //
+        // NEU: version-Spalte. Jedes Mal, wenn sich der content eines
+        // Keys über PUT wirklich ändert, wird version automatisch um 1
+        // erhöht (siehe PUT /legal-texts/:key). Der Client vergleicht
+        // diese Version mit der Version, der ein Spieler zuletzt
+        // zugestimmt hat (gespeichert in PlayFab, siehe SessionManager.cs
+        // GetAcceptedLegalVersions/SaveAcceptedLegalVersions) — weicht
+        // sie ab, muss erneut zugestimmt werden, ganz ohne dass der
+        // Server selbst irgendetwas über "Zustimmung" wissen müsste.
         // -------------------------------------------------------
         await pool.query(`
             CREATE TABLE IF NOT EXISTS legal_texts (
                 key TEXT PRIMARY KEY,
                 content TEXT NOT NULL DEFAULT '',
+                version INTEGER NOT NULL DEFAULT 1,
                 updated_at TIMESTAMPTZ NOT NULL DEFAULT now()
             );
         `);
+        await pool.query(`ALTER TABLE legal_texts ADD COLUMN IF NOT EXISTS version INTEGER NOT NULL DEFAULT 1;`);
 
         // -------------------------------------------------------
         // Support-Kontaktformular (Tab04 im Login-Fenster) — landet
@@ -1525,18 +1536,22 @@ app.post('/reportBug', async (req, res) => {
 // -------------------------------------------------------
 // Rechtstexte — GET ist komplett offen (auch ohne Login lesbar,
 // absichtlich, siehe Kommentar bei der Tabellen-Erstellung). PUT ist
-// nur für Admin-Accounts, adressiert über den Text-Key (z.B. "agb",
-// "datenschutz", "impressum", "jugendschutz").
+// nur für Admin-Accounts, adressiert über den Text-Key (aktuell:
+// "spielregeln", "agb", "datenschutz").
 //
-// Rückgabeform bewusst als einfaches Objekt { key: content, ... } statt
-// als Zeilen-Array — im Client so am einfachsten per Key abzufragen,
-// ohne erst eine Liste durchsuchen zu müssen.
+// Rückgabeform bewusst als Objekt { key: {content, version}, ... }
+// statt als Zeilen-Array — im Client so am einfachsten per Key
+// abzufragen, ohne erst eine Liste durchsuchen zu müssen. Fehlt ein Key
+// komplett (noch nie über PUT angelegt), taucht er hier einfach nicht
+// auf — der Client zeigt dann seinen eigenen Platzhaltertext.
 // -------------------------------------------------------
 app.get('/legal-texts', async (req, res) => {
     try {
-        const result = await pool.query('SELECT key, content, updated_at FROM legal_texts');
+        const result = await pool.query('SELECT key, content, version, updated_at FROM legal_texts');
         const texts = {};
-        for (const row of result.rows) texts[row.key] = row.content;
+        for (const row of result.rows) {
+            texts[row.key] = { content: row.content, version: row.version };
+        }
         res.json({ success: true, texts });
     } catch (error) {
         console.error('[Server] legal-texts GET Fehler:', error.message);
@@ -1554,10 +1569,19 @@ app.put('/legal-texts/:key', async (req, res) => {
         return res.status(400).json({ success: false, error: 'Fehlende Parameter' });
 
     try {
+        // WICHTIG: version wird NUR erhöht, wenn sich der Inhalt wirklich
+        // ändert (IS DISTINCT FROM) — ein Admin, der denselben Text
+        // versehentlich zweimal speichert, zwingt dadurch nicht alle
+        // Spieler zu einer unnötigen erneuten Zustimmung.
         const result = await pool.query(
-            `INSERT INTO legal_texts (key, content, updated_at)
-             VALUES ($1, $2, now())
-             ON CONFLICT (key) DO UPDATE SET content = $2, updated_at = now()
+            `INSERT INTO legal_texts (key, content, version, updated_at)
+             VALUES ($1, $2, 1, now())
+             ON CONFLICT (key) DO UPDATE SET
+                content = $2,
+                version = CASE WHEN legal_texts.content IS DISTINCT FROM $2
+                               THEN legal_texts.version + 1
+                               ELSE legal_texts.version END,
+                updated_at = now()
              RETURNING *`,
             [key, content]
         );
