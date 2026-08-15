@@ -2162,9 +2162,21 @@ async function updateCommanderHighscore(commander, planets, playFabId) {
 // niemand kann sich damit fremde Planeten "reparieren".
 // -------------------------------------------------------
 app.post('/planets/repair-ownership', async (req, res) => {
-    const { commanderId, coord } = req.body;
-    if (!commanderId || !coord)
+    const { commanderId, coord: rawCoord } = req.body;
+    if (!commanderId || !rawCoord)
         return res.status(400).json({ success: false, error: 'Fehlende Parameter' });
+
+    // WICHTIG: Koordinate normalisieren (führende Nullen etc. entfernen),
+    // BEVOR sie irgendwo gespeichert wird — sonst kann z.B. "1:1:1:05"
+    // wörtlich in commander.colonies landen, obwohl der Rest des Spiels
+    // Koordinaten immer aus reinen Ganzzahlen baut (nie mit führender
+    // Null). Das ist eine zweite Absicherung zusätzlich zur Prüfung im
+    // Unity-Client (PlanetRepairTool.cs) — falls dieser Endpunkt jemals
+    // von woanders aus aufgerufen wird.
+    const coordParts = rawCoord.split(':').map(p => parseInt(p, 10));
+    if (coordParts.length !== 4 || coordParts.some(n => isNaN(n) || n < 0))
+        return res.status(400).json({ success: false, error: 'Ungültiges Koordinatenformat.' });
+    const coord = coordParts.join(':');
 
     try {
         const ownerInfo = await getPlanetOwnerInfo(coord);
