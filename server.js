@@ -2297,6 +2297,39 @@ app.get('/highscore/commanders', async (req, res) => {
     }
 });
 
+// NEU: Einzelner Commander per ID — für das Chat-Kontextmenü ("Profil
+// ansehen" bei einem Spielernamen). Bewusst vom Server geholt statt aus
+// lokalen Chat-Nachrichtendaten zusammengebaut, weil Client-Daten
+// manipulierbar/veraltet sein können — Punkte/Allianz-Zugehörigkeit
+// müssen aus der verlässlichen Quelle kommen. Gleiche JOIN-Logik wie
+// /highscore/commanders oben, nur auf einen einzelnen Commander gefiltert.
+app.get('/highscore/commanders/:commanderId', async (req, res) => {
+    try {
+        const commanderId = parseInt(req.params.commanderId);
+        if (!commanderId) {
+            return res.status(400).json({ success: false, error: 'Ungültige commanderId' });
+        }
+
+        const result = await pool.query(
+            `SELECT h.*, a.tag AS alliance_tag, a.name AS alliance_name, a.id AS alliance_id
+             FROM commander_highscore h
+             LEFT JOIN alliance_members m ON m.commander_id = h.commander_id
+             LEFT JOIN alliances a ON a.id = m.alliance_id
+             WHERE h.commander_id = $1`,
+            [commanderId]
+        );
+
+        if (result.rows.length === 0) {
+            return res.status(404).json({ success: false, error: 'Commander nicht gefunden' });
+        }
+
+        res.json({ success: true, commander: result.rows[0] });
+    } catch (error) {
+        console.error('[Server] highscore/commanders/:id GET Fehler:', error.message);
+        res.status(500).json({ success: false, error: error.message });
+    }
+});
+
 // Produktion PRO TICK (5 Sekunden) für ein Gebäude auf einer bestimmten
 // Stufe — Portierung von BuildingDefinition.GetProduction() aus Unity.
 function getProductionPerTick(buildingIndex, level) {
