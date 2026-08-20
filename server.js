@@ -583,7 +583,20 @@ app.post('/saveReport', async (req, res) => {
 // kein sensibler Inhalt) — der Admin-Modus-Schutz passiert rein im
 // Client (Buttons nur im Admin-Modus sichtbar/aktiv).
 // -------------------------------------------------------
+// NEU (21.08.): War komplett ungeschützt — jeder, der die URL kannte,
+// konnte eure internen Dev-Notizen lesen UND SCHREIBEN. Gleicher Schutz
+// wie /admin/reports weiter unten (bereits vorhandene ADMIN_KEY-
+// Umgebungsvariable, keine neue nötig).
+function checkAdminKey(req, res) {
+    if (!process.env.ADMIN_KEY || req.query.key !== process.env.ADMIN_KEY) {
+        res.status(403).json({ success: false, error: 'Nicht autorisiert' });
+        return false;
+    }
+    return true;
+}
+
 app.get('/devtodos', async (req, res) => {
+    if (!checkAdminKey(req, res)) return;
     try {
         const result = await pool.query('SELECT * FROM dev_todos ORDER BY status ASC, created_at DESC');
         res.json({ success: true, todos: result.rows });
@@ -594,6 +607,7 @@ app.get('/devtodos', async (req, res) => {
 });
 
 app.post('/devtodos', async (req, res) => {
+    if (!checkAdminKey(req, res)) return;
     const { text } = req.body;
     if (!text || !text.trim())
         return res.status(400).json({ success: false, error: 'Kein Text' });
@@ -611,6 +625,7 @@ app.post('/devtodos', async (req, res) => {
 });
 
 app.put('/devtodos/:id', async (req, res) => {
+    if (!checkAdminKey(req, res)) return;
     const id = parseInt(req.params.id, 10);
     const { text, status } = req.body;
     if (!id) return res.status(400).json({ success: false, error: 'Ungueltige ID' });
@@ -635,6 +650,7 @@ app.put('/devtodos/:id', async (req, res) => {
 });
 
 app.delete('/devtodos/:id', async (req, res) => {
+    if (!checkAdminKey(req, res)) return;
     const id = parseInt(req.params.id, 10);
     if (!id) return res.status(400).json({ success: false, error: 'Ungueltige ID' });
 
@@ -1331,7 +1347,20 @@ app.post('/alliances/charter/:id/sign', async (req, res) => {
 
 app.get('/relationships/:commanderId', async (req, res) => {
     const commanderId = parseInt(req.params.commanderId, 10);
+    const requesterId = parseInt(req.query.requesterId, 10);
     if (!commanderId) return res.status(400).json({ success: false, error: 'Ungueltige ID' });
+
+    // FIX (21.08.): War komplett ungeschützt — JEDER konnte die komplette
+    // Beziehungsliste (wer mit wem befreundet/im Krieg ist) JEDES
+    // beliebigen Commanders abrufen, ohne jede Prüfung. Gleiches
+    // Schutzniveau wie /commander/:id/colonies jetzt: eigene Liste immer
+    // einsehbar, sonst nur bei Freundschaft/gleicher oder verbündeter Allianz.
+    if (!requesterId)
+        return res.status(400).json({ success: false, error: 'Fehlender requesterId-Parameter' });
+
+    const authorized = await isAuthorizedToViewCommanderData(requesterId, commanderId);
+    if (!authorized)
+        return res.status(403).json({ success: false, error: 'Dir ist kein Einblick in die Beziehungen dieses Commanders gestattet.' });
 
     try {
         const result = await pool.query(
@@ -2371,7 +2400,11 @@ app.post('/planets/repair-ownership', async (req, res) => {
 // verbündete Allianzen (Allianz-Freundschaft ist aktuell noch nicht
 // setzbar, aber die Prüfung ist schon vorbereitet für später).
 // -------------------------------------------------------
-async function isAuthorizedToViewColonies(requesterId, targetId) {
+// UMBENANNT (21.08.): hieß vorher isAuthorizedToViewColonies — wird jetzt
+// auch für /relationships/:commanderId genutzt, daher generischer Name.
+// Gleiche Logik wie zuvor: eigene Daten immer einsehbar, sonst nur bei
+// Freundschaft, gleicher Allianz oder verbündeten Allianzen.
+async function isAuthorizedToViewCommanderData(requesterId, targetId) {
     if (requesterId === targetId) return true; // eigene Akte immer einsehbar
 
     const relResult = await pool.query(
@@ -2402,7 +2435,7 @@ app.get('/commander/:commanderId/colonies', async (req, res) => {
         return res.status(400).json({ success: false, error: 'Fehlende Parameter' });
 
     try {
-        const authorized = await isAuthorizedToViewColonies(requesterId, targetId);
+        const authorized = await isAuthorizedToViewCommanderData(requesterId, targetId);
         if (!authorized)
             return res.status(403).json({ success: false, error: 'Dir ist kein Einblick in die Akte dieses Commanders gestattet.' });
 
