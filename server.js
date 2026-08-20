@@ -939,14 +939,103 @@ app.post('/alliances/:id/leave', async (req, res) => {
         if (memberResult.rows.length > 0 && allianceResult.rows.length > 0) {
             const coord = memberResult.rows[0].commander_coord;
             const alliance = allianceResult.rows[0];
-            await sendAllianceMail(commanderId, coord,
-                'Allianz verlassen', // LOCALIZE
-                `Du hast die Allianz "${alliance.name}" [${alliance.tag}] verlassen.`); // LOCALIZE
+
+            // FIX (21.08.): Vorher blieb die Allianz-Zeile (mit Name/Tag)
+            // für immer verwaist in der Datenbank stehen, auch wenn das
+            // letzte Mitglied ging — Name/Tag blieben dadurch dauerhaft
+            // blockiert, obwohl die Allianz aus Spielersicht "aufgelöst"
+            // war. Jetzt: prüfen, ob nach dem Austritt noch Mitglieder
+            // übrig sind — falls nicht, die Allianz selbst mit löschen
+            // (CASCADE entfernt evtl. Restdaten mit, ist an dieser Stelle
+            // aber ohnehin schon leer).
+            const remainingResult = await pool.query(
+                'SELECT COUNT(*) AS cnt FROM alliance_members WHERE alliance_id = $1',
+                [id]
+            );
+            const remaining = parseInt(remainingResult.rows[0].cnt, 10);
+
+            if (remaining === 0) {
+                await pool.query('DELETE FROM alliances WHERE id = $1', [id]);
+                await sendAllianceMail(commanderId, coord,
+                    'Allianz aufgelöst', // LOCALIZE
+                    `Die Allianz "${alliance.name}" [${alliance.tag}] wurde aufgelöst, da du als letztes Mitglied ausgetreten bist. Name und Tag sind wieder frei verfügbar.`); // LOCALIZE
+            } else {
+                await sendAllianceMail(commanderId, coord,
+                    'Allianz verlassen', // LOCALIZE
+                    `Du hast die Allianz "${alliance.name}" [${alliance.tag}] verlassen.`); // LOCALIZE
+            }
         }
 
         res.json({ success: true });
     } catch (error) {
         console.error('[Server] alliances/:id/leave Fehler:', error.message);
+        res.status(500).json({ success: false, error: error.message });
+    }
+});
+
+// NEU (21.08.): Gründer/Anführer dürfen die EIGENE Allianz bearbeiten —
+// vorher konnte das nur ein Admin-Account über die /admin/-Endpunkte
+// weiter unten. Prüft die Rolle in alliance_members, nicht
+// ADMIN_COMMANDER_IDS. Alle Felder optional — nur mitschicken, was
+// geändert werden soll.
+app.put('/alliances/:id/edit', async (req, res) => {
+    const id = parseInt(req.params.id, 10);
+    const { commanderId, name, tag, logoId, description } = req.body;
+    if (!id || !commanderId) return res.status(400).json({ success: false, error: 'Fehlende Parameter' });
+
+    try {
+        const memberResult = await pool.query(
+            'SELECT role FROM alliance_members WHERE alliance_id = $1 AND commander_id = $2',
+            [id, commanderId]
+        );
+        if (memberResult.rows.length === 0)
+            return res.status(403).json({ success: false, error: 'Du bist kein Mitglied dieser Allianz.' });
+        if (memberResult.rows[0].role !== 'founder')
+            return res.status(403).json({ success: false, error: 'Nur der Gründer darf die Allianz bearbeiten.' });
+
+        const updates = [];
+        const values = [];
+        let idx = 1;
+
+        if (name !== undefined) {
+            const trimmed = (name || '').trim();
+            if (trimmed.length < 6 || trimmed.length > 30)
+                return res.status(400).json({ success: false, error: 'Name muss 6-30 Zeichen haben' });
+            updates.push(`name = $${idx++}`); values.push(trimmed);
+        }
+        if (tag !== undefined) {
+            const trimmedTag = (tag || '').trim().toUpperCase();
+            if (trimmedTag.length < 3 || trimmedTag.length > 6)
+                return res.status(400).json({ success: false, error: 'Tag muss 3-6 Zeichen haben' });
+            const tagTaken = await pool.query('SELECT id FROM alliances WHERE tag = $1 AND id != $2', [trimmedTag, id]);
+            if (tagTaken.rows.length > 0)
+                return res.status(400).json({ success: false, error: 'Dieses Allianz-Tag ist bereits vergeben.' });
+            updates.push(`tag = $${idx++}`); values.push(trimmedTag);
+        }
+        if (logoId !== undefined) {
+            // Gleiche Regel wie bei der Gründung: Logo 0 bleibt Admin-Accounts vorbehalten.
+            if (logoId === 0 && !ADMIN_COMMANDER_IDS.includes(commanderId))
+                return res.status(403).json({ success: false, error: 'Dieses Logo ist Admin-Accounts vorbehalten.' });
+            updates.push(`logo_id = $${idx++}`); values.push(logoId);
+        }
+        if (description !== undefined) {
+            if ((description || '').length > 1000)
+                return res.status(400).json({ success: false, error: 'Beschreibung zu lang (max. 1000 Zeichen)' });
+            updates.push(`description = $${idx++}`); values.push(description || '');
+        }
+
+        if (updates.length === 0)
+            return res.status(400).json({ success: false, error: 'Keine Änderungen übergeben.' });
+
+        values.push(id);
+        const result = await pool.query(
+            `UPDATE alliances SET ${updates.join(', ')} WHERE id = $${idx} RETURNING *`,
+            values
+        );
+
+        res.json({ success: true, alliance: result.rows[0] });
+    } catch (error) {
+        console.error('[Server] alliances/:id/edit PUT Fehler:', error.message);
         res.status(500).json({ success: false, error: error.message });
     }
 });
@@ -1854,6 +1943,61 @@ app.post('/processFleet', async (req, res) => {
 // erreichbar ist. OHNE einen automatischen, regelmäßigen Aufruf verarbeitet
 // NIEMAND Flotten, deren Besitzer bei Ankunft offline ist — das war die
 // eigentliche Ursache hinter den "Zombie-Flotten".
+// -------------------------------------------------------
+// NEU (21.08.): Allianz-Punkte aggregieren — läuft am Ende jedes
+// serverTick, NACHDEM alle Commander-Highscores in dieser Runde
+// aktualisiert wurden. Eine einzige SQL-Aggregation statt einer
+// JS-Schleife: Summe der total_points aller Mitglieder pro Allianz.
+//
+// FIX für den Bug "alle Allianzen werden in der Highscore ineinander
+// angezeigt": Die alliances.points-Spalte existierte zwar schon
+// (GET /alliances sortiert danach), wurde aber nirgends tatsächlich
+// berechnet — alle Allianzen hatten denselben Standardwert, die
+// Sortierung war dadurch bedeutungslos.
+// -------------------------------------------------------
+async function updateAllianceHighscore(log) {
+    try {
+        const result = await pool.query(`
+            UPDATE alliances a
+            SET points = COALESCE(sub.total, 0)
+            FROM (
+                SELECT m.alliance_id, SUM(h.total_points) AS total
+                FROM alliance_members m
+                JOIN commander_highscore h ON h.commander_id = m.commander_id
+                GROUP BY m.alliance_id
+            ) sub
+            WHERE a.id = sub.alliance_id
+            RETURNING a.id
+        `);
+        log.push(`Allianz-Highscore aktualisiert: ${result.rows.length} Allianzen`);
+    } catch (e) {
+        log.push(`Allianz-Highscore Fehler: ${e.message}`);
+    }
+}
+
+// -------------------------------------------------------
+// NEU (21.08.): Abgelaufene Freundschaften zurück auf 'neutral' setzen.
+// expires_at wird schon seit Längerem beim Annehmen einer
+// Freundschaftsanfrage gesetzt (+30 Tage), wurde aber nirgends geprüft —
+// Freundschaften liefen dadurch faktisch für immer. Läuft bei jedem
+// serverTick mit (alle 5 Minuten), Ablauf ist also spätestens 5 Minuten
+// nach dem tatsächlichen Ablaufzeitpunkt wirksam.
+// -------------------------------------------------------
+async function expireOldFriendships(log) {
+    try {
+        const result = await pool.query(`
+            UPDATE player_relationships
+            SET status = 'neutral', expires_at = NULL
+            WHERE status = 'friend' AND expires_at IS NOT NULL AND expires_at < now()
+            RETURNING commander_id_a, commander_id_b
+        `);
+        if (result.rows.length > 0)
+            log.push(`Freundschaften abgelaufen: ${result.rows.length}`);
+    } catch (e) {
+        log.push(`Freundschafts-Ablauf Fehler: ${e.message}`);
+    }
+}
+
 async function serverTickHandler(req, res) {
     const log = [];
     const now = new Date();
@@ -1997,6 +2141,12 @@ async function serverTickHandler(req, res) {
     } catch(e) {
         log.push(`Tick Fehler: ${e.message}`);
     }
+
+    // NEU: Allianz-Punkte + Freundschafts-Ablauf — laufen NACH der
+    // Spieler-Schleife oben, damit die Allianz-Aggregation die in DIESEM
+    // Tick frisch berechneten commander_highscore-Werte mitnimmt.
+    await updateAllianceHighscore(log);
+    await expireOldFriendships(log);
 
     res.json({ success: true, log, timestamp: now.toISOString() });
 }
