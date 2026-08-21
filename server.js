@@ -281,6 +281,12 @@ async function initDatabase() {
         `);
         await pool.query(`CREATE INDEX IF NOT EXISTS idx_alliance_relationships_a ON alliance_relationships (alliance_id_a);`);
         await pool.query(`CREATE INDEX IF NOT EXISTS idx_alliance_relationships_b ON alliance_relationships (alliance_id_b);`);
+        // NEU (21.08., Phase 3): requested_by für den Anfrage-Fluss bei
+        // 'ally'/'nap' (brauchen beidseitige Zustimmung, anders als 'war'),
+        // expires_at schon jetzt mit angelegt (Phase 4: Ablaufzeit für
+        // Bündnisse), gleiches Muster wie bei display_id vorhin.
+        await pool.query(`ALTER TABLE alliance_relationships ADD COLUMN IF NOT EXISTS requested_by INTEGER;`);
+        await pool.query(`ALTER TABLE alliance_relationships ADD COLUMN IF NOT EXISTS expires_at TIMESTAMPTZ;`);
 
         // -------------------------------------------------------
         // Commander-Highscore — wird bei jedem /serverTick (alle 5 Min)
@@ -1579,6 +1585,105 @@ app.post('/alliance-relationships/declare-peace', async (req, res) => {
         res.json({ success: true, relationship: result.rows[0] || null });
     } catch (error) {
         console.error('[Server] alliance-relationships/declare-peace Fehler:', error.message);
+        res.status(500).json({ success: false, error: error.message });
+    }
+});
+
+// -------------------------------------------------------
+// NEU (21.08., Phase 3): 'ally' (Verbündet) und 'nap' (Nicht-Angriffs-
+// Pakt) — anders als 'war' brauchen beide eine Zustimmung der jeweils
+// ANDEREN Seite, sonst könnte eine Allianz der anderen einfach eine
+// Verpflichtung aufzwingen. Zwei generische Endpunkte statt vier fast
+// identischer (propose-ally/accept-ally/propose-nap/accept-nap), gleiches
+// Grundprinzip wie bei den Spieler-Freundschaftsanfragen
+// (friend_request_pending -> friend).
+//
+// Ablauf: propose -> Status "{type}_pending", requested_by = Antragsteller.
+// respond(accept=true) -> Status wird zu "{type}", expires_at = +30 Tage
+// (Ablauf wird erst in Phase 4 tatsächlich GEPRÜFT, Feld wird aber schon
+// jetzt gesetzt, gleiches Vorgehen wie seinerzeit bei Spieler-Freundschaften).
+// respond(accept=false) -> zurück auf "neutral".
+//
+// Nur der GRÜNDER der anfragenden/antwortenden Allianz darf das auslösen
+// (gleiche Rollen-Prüfung wie bei PUT /alliances/:id/edit).
+// -------------------------------------------------------
+async function isAllianceFounder(commanderId, allianceId) {
+    const result = await pool.query(
+        'SELECT role FROM alliance_members WHERE alliance_id = $1 AND commander_id = $2',
+        [allianceId, commanderId]
+    );
+    return result.rows.length > 0 && result.rows[0].role === 'founder';
+}
+
+app.post('/alliance-relationships/propose', async (req, res) => {
+    const { allianceId, targetAllianceId, requesterCommanderId, type } = req.body;
+    if (!allianceId || !targetAllianceId || !requesterCommanderId || !type)
+        return res.status(400).json({ success: false, error: 'Fehlende Parameter' });
+    if (type !== 'ally' && type !== 'nap')
+        return res.status(400).json({ success: false, error: "type muss 'ally' oder 'nap' sein" });
+    if (allianceId === targetAllianceId)
+        return res.status(400).json({ success: false, error: 'Nicht mit der eigenen Allianz möglich' });
+
+    try {
+        if (!(await isAllianceFounder(requesterCommanderId, allianceId)))
+            return res.status(403).json({ success: false, error: 'Nur der Gründer darf Bündnisse vorschlagen.' });
+
+        const [a, b] = orderIds(allianceId, targetAllianceId);
+        const result = await pool.query(
+            `INSERT INTO alliance_relationships (alliance_id_a, alliance_id_b, status, requested_by, established_at, expires_at)
+             VALUES ($1, $2, $3, $4, now(), NULL)
+             ON CONFLICT (alliance_id_a, alliance_id_b)
+             DO UPDATE SET status = $3, requested_by = $4, established_at = now(), expires_at = NULL
+             RETURNING *`,
+            [a, b, `${type}_pending`, allianceId]
+        );
+        res.json({ success: true, relationship: result.rows[0] });
+    } catch (error) {
+        console.error('[Server] alliance-relationships/propose Fehler:', error.message);
+        res.status(500).json({ success: false, error: error.message });
+    }
+});
+
+app.post('/alliance-relationships/respond', async (req, res) => {
+    const { allianceId, targetAllianceId, requesterCommanderId, accept } = req.body;
+    if (!allianceId || !targetAllianceId || !requesterCommanderId || accept === undefined)
+        return res.status(400).json({ success: false, error: 'Fehlende Parameter' });
+
+    try {
+        if (!(await isAllianceFounder(requesterCommanderId, allianceId)))
+            return res.status(403).json({ success: false, error: 'Nur der Gründer darf antworten.' });
+
+        const [a, b] = orderIds(allianceId, targetAllianceId);
+        const existing = await pool.query(
+            'SELECT * FROM alliance_relationships WHERE alliance_id_a = $1 AND alliance_id_b = $2',
+            [a, b]
+        );
+        if (existing.rows.length === 0 || !existing.rows[0].status.endsWith('_pending'))
+            return res.status(400).json({ success: false, error: 'Keine offene Anfrage gefunden.' });
+        if (existing.rows[0].requested_by === allianceId)
+            return res.status(400).json({ success: false, error: 'Eigene Anfrage kann nicht selbst beantwortet werden.' });
+
+        const type = existing.rows[0].status.replace('_pending', '');
+
+        if (accept) {
+            const result = await pool.query(
+                `UPDATE alliance_relationships
+                 SET status = $3, established_at = now(), expires_at = now() + interval '30 days'
+                 WHERE alliance_id_a = $1 AND alliance_id_b = $2 RETURNING *`,
+                [a, b, type]
+            );
+            res.json({ success: true, relationship: result.rows[0] });
+        } else {
+            const result = await pool.query(
+                `UPDATE alliance_relationships
+                 SET status = 'neutral', requested_by = NULL, established_at = now(), expires_at = NULL
+                 WHERE alliance_id_a = $1 AND alliance_id_b = $2 RETURNING *`,
+                [a, b]
+            );
+            res.json({ success: true, relationship: result.rows[0] });
+        }
+    } catch (error) {
+        console.error('[Server] alliance-relationships/respond Fehler:', error.message);
         res.status(500).json({ success: false, error: error.message });
     }
 });
