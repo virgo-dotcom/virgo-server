@@ -288,6 +288,28 @@ async function initDatabase() {
         await pool.query(`ALTER TABLE alliance_relationships ADD COLUMN IF NOT EXISTS requested_by INTEGER;`);
         await pool.query(`ALTER TABLE alliance_relationships ADD COLUMN IF NOT EXISTS expires_at TIMESTAMPTZ;`);
 
+        // NEU (22.08.): Bewerbungssystem — echte Zustimmungspflicht statt
+        // direktem Beitritt. UNIQUE(alliance_id, commander_id) verhindert
+        // doppelte Bewerbungen bei derselben Allianz (erneutes Bewerben
+        // aktualisiert stattdessen die bestehende Zeile, siehe Endpunkt).
+        // commander_coord wird gebraucht, damit sendAllianceMail() den
+        // Empfänger überhaupt finden kann (siehe Datei-Kommentar dort).
+        await pool.query(`
+            CREATE TABLE IF NOT EXISTS alliance_applications (
+                id SERIAL PRIMARY KEY,
+                alliance_id INTEGER NOT NULL,
+                commander_id INTEGER NOT NULL,
+                commander_name TEXT NOT NULL,
+                commander_coord TEXT,
+                message TEXT NOT NULL DEFAULT '',
+                created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+                expires_at TIMESTAMPTZ NOT NULL DEFAULT (now() + interval '24 hours'),
+                UNIQUE(alliance_id, commander_id)
+            );
+        `);
+        await pool.query(`CREATE INDEX IF NOT EXISTS idx_alliance_applications_alliance ON alliance_applications (alliance_id);`);
+        await pool.query(`CREATE INDEX IF NOT EXISTS idx_alliance_applications_commander ON alliance_applications (commander_id);`);
+
         // -------------------------------------------------------
         // Commander-Highscore — wird bei jedem /serverTick (alle 5 Min)
         // für ALLE aktiven Spieler neu berechnet. Läuft über unseren
@@ -939,6 +961,180 @@ app.post('/alliances/:id/join', async (req, res) => {
         res.json({ success: true });
     } catch (error) {
         console.error('[Server] alliances/:id/join Fehler:', error.message);
+        res.status(500).json({ success: false, error: error.message });
+    }
+});
+
+// =========================================================
+// NEU (22.08.): Bewerbungssystem — echte Zustimmungspflicht statt
+// direktem Beitritt. Ablauf:
+// 1) apply: Bewerbung mit Nachricht (max 200 Zeichen), 24h gültig.
+// 2) Gründer sieht Liste über GET /alliances/:id/applications.
+// 3) accept -> Beitritt + Mail "angenommen".
+//    reject -> KEIN Beitritt + Mail "abgelehnt".
+//    Ablauf ohne Reaktion (serverTick, siehe expireOldApplications) ->
+//    stilles Löschen, KEINE Mail (bewusster Unterschied zwischen
+//    Ignorieren und aktivem Ablehnen — siehe Chat vom 22.08.).
+// GET /commander/:id/applications zeigt EIGENE offene Bewerbungen (für
+// den Countdown-Timer anstelle des "Bewerben"-Buttons in der Highscore-
+// Liste), selbst-only geschützt wie /relationships und /colonies.
+// =========================================================
+
+app.post('/alliances/:id/apply', async (req, res) => {
+    const id = parseInt(req.params.id, 10);
+    const { commanderId, commanderName, commanderCoord, message } = req.body;
+    if (!id || !commanderId) return res.status(400).json({ success: false, error: 'Fehlende Parameter' });
+
+    const trimmedMessage = (message || '').trim().slice(0, 200); // Server-seitige Begrenzung, unabhängig vom Client
+
+    try {
+        const existingAlliance = await getAllianceIdForCommander(commanderId);
+        if (existingAlliance)
+            return res.status(400).json({ success: false, error: 'Du bist bereits Mitglied einer Allianz.' });
+
+        const allianceCheck = await pool.query('SELECT id FROM alliances WHERE id = $1', [id]);
+        if (allianceCheck.rows.length === 0)
+            return res.status(404).json({ success: false, error: 'Allianz nicht gefunden' });
+
+        const result = await pool.query(
+            `INSERT INTO alliance_applications (alliance_id, commander_id, commander_name, commander_coord, message, created_at, expires_at)
+             VALUES ($1, $2, $3, $4, $5, now(), now() + interval '24 hours')
+             ON CONFLICT (alliance_id, commander_id)
+             DO UPDATE SET commander_name = $3, commander_coord = $4, message = $5, created_at = now(), expires_at = now() + interval '24 hours'
+             RETURNING *`,
+            [id, commanderId, commanderName || 'Unbekannt', commanderCoord || null, trimmedMessage]
+        );
+        res.json({ success: true, application: result.rows[0] });
+    } catch (error) {
+        console.error('[Server] alliances/:id/apply Fehler:', error.message);
+        res.status(500).json({ success: false, error: error.message });
+    }
+});
+
+app.get('/alliances/:id/applications', async (req, res) => {
+    const id = parseInt(req.params.id, 10);
+    const requesterCommanderId = parseInt(req.query.requesterCommanderId, 10);
+    if (!id) return res.status(400).json({ success: false, error: 'Ungueltige ID' });
+    if (!requesterCommanderId) return res.status(400).json({ success: false, error: 'Fehlender requesterCommanderId-Parameter' });
+
+    try {
+        if (!(await isAllianceFounder(requesterCommanderId, id)))
+            return res.status(403).json({ success: false, error: 'Nur der Gründer darf Bewerbungen einsehen.' });
+
+        const result = await pool.query(
+            'SELECT * FROM alliance_applications WHERE alliance_id = $1 ORDER BY created_at ASC',
+            [id]
+        );
+        res.json({ success: true, applications: result.rows });
+    } catch (error) {
+        console.error('[Server] alliances/:id/applications GET Fehler:', error.message);
+        res.status(500).json({ success: false, error: error.message });
+    }
+});
+
+// Eigene offene Bewerbungen (über ALLE Allianzen hinweg) — für den
+// Countdown-Timer in der Highscore-Liste. Selbst-only, wie bei
+// /relationships und /commander/:id/colonies.
+app.get('/commander/:id/applications', async (req, res) => {
+    const commanderId = parseInt(req.params.id, 10);
+    const requesterId = parseInt(req.query.requesterId, 10);
+    if (!commanderId) return res.status(400).json({ success: false, error: 'Ungueltige ID' });
+    if (requesterId !== commanderId)
+        return res.status(403).json({ success: false, error: 'Nur eigene Bewerbungen einsehbar.' });
+
+    try {
+        const result = await pool.query(
+            'SELECT * FROM alliance_applications WHERE commander_id = $1',
+            [commanderId]
+        );
+        res.json({ success: true, applications: result.rows });
+    } catch (error) {
+        console.error('[Server] commander/:id/applications GET Fehler:', error.message);
+        res.status(500).json({ success: false, error: error.message });
+    }
+});
+
+app.post('/alliances/:id/applications/:appId/accept', async (req, res) => {
+    const id = parseInt(req.params.id, 10);
+    const appId = parseInt(req.params.appId, 10);
+    const { requesterCommanderId } = req.body;
+    if (!id || !appId || !requesterCommanderId)
+        return res.status(400).json({ success: false, error: 'Fehlende Parameter' });
+
+    try {
+        if (!(await isAllianceFounder(requesterCommanderId, id)))
+            return res.status(403).json({ success: false, error: 'Nur der Gründer darf annehmen.' });
+
+        const appResult = await pool.query(
+            'SELECT * FROM alliance_applications WHERE id = $1 AND alliance_id = $2',
+            [appId, id]
+        );
+        if (appResult.rows.length === 0)
+            return res.status(404).json({ success: false, error: 'Bewerbung nicht gefunden (evtl. abgelaufen).' });
+        const application = appResult.rows[0];
+
+        // Bewerber könnte zwischenzeitlich einer ANDEREN Allianz
+        // beigetreten sein — dann Bewerbung nur aufräumen, nicht annehmen.
+        const existingAlliance = await getAllianceIdForCommander(application.commander_id);
+        if (existingAlliance) {
+            await pool.query('DELETE FROM alliance_applications WHERE id = $1', [appId]);
+            return res.status(400).json({ success: false, error: 'Bewerber ist inzwischen einer anderen Allianz beigetreten.' });
+        }
+
+        const allianceResult = await pool.query('SELECT name, tag FROM alliances WHERE id = $1', [id]);
+        const alliance = allianceResult.rows[0];
+
+        await pool.query(
+            'INSERT INTO alliance_members (alliance_id, commander_id, commander_name, commander_coord, role) VALUES ($1, $2, $3, $4, $5)',
+            [id, application.commander_id, application.commander_name, application.commander_coord, 'member']
+        );
+        await pool.query('DELETE FROM alliance_applications WHERE id = $1', [appId]);
+
+        await sendAllianceMail(application.commander_id, application.commander_coord,
+            'Bewerbung angenommen', // LOCALIZE
+            `Deine Bewerbung bei der Allianz "${alliance.name}" [${alliance.tag}] wurde angenommen! Willkommen an Bord.`); // LOCALIZE
+
+        res.json({ success: true });
+    } catch (error) {
+        console.error('[Server] applications/accept Fehler:', error.message);
+        res.status(500).json({ success: false, error: error.message });
+    }
+});
+
+app.post('/alliances/:id/applications/:appId/reject', async (req, res) => {
+    const id = parseInt(req.params.id, 10);
+    const appId = parseInt(req.params.appId, 10);
+    const { requesterCommanderId } = req.body;
+    if (!id || !appId || !requesterCommanderId)
+        return res.status(400).json({ success: false, error: 'Fehlende Parameter' });
+
+    try {
+        if (!(await isAllianceFounder(requesterCommanderId, id)))
+            return res.status(403).json({ success: false, error: 'Nur der Gründer darf ablehnen.' });
+
+        const appResult = await pool.query(
+            'SELECT * FROM alliance_applications WHERE id = $1 AND alliance_id = $2',
+            [appId, id]
+        );
+        if (appResult.rows.length === 0)
+            return res.status(404).json({ success: false, error: 'Bewerbung nicht gefunden (evtl. abgelaufen).' });
+        const application = appResult.rows[0];
+
+        const allianceResult = await pool.query('SELECT name, tag FROM alliances WHERE id = $1', [id]);
+        const alliance = allianceResult.rows[0];
+
+        await pool.query('DELETE FROM alliance_applications WHERE id = $1', [appId]);
+
+        // BEWUSSTER Unterschied zu einem stillen Ablauf (siehe
+        // expireOldApplications im serverTick) — aktive Ablehnung
+        // bekommt eine Mail, Ignorieren nicht.
+        await sendAllianceMail(application.commander_id, application.commander_coord,
+            'Bewerbung abgelehnt', // LOCALIZE
+            `Deine Bewerbung bei der Allianz "${alliance.name}" [${alliance.tag}] wurde leider abgelehnt.`); // LOCALIZE
+
+        res.json({ success: true });
+    } catch (error) {
+        console.error('[Server] applications/reject Fehler:', error.message);
         res.status(500).json({ success: false, error: error.message });
     }
 });
@@ -2132,6 +2328,26 @@ async function expireOldFriendships(log) {
     }
 }
 
+// -------------------------------------------------------
+// NEU (22.08.): Abgelaufene Allianz-Bewerbungen (24h ohne Reaktion)
+// STILL löschen — BEWUSST KEINE MAIL, siehe Chat vom 22.08.: Ignorieren
+// soll sich zwischenmenschlich anders anfühlen als aktives Ablehnen
+// (das eine Mail bekommt, siehe /applications/:appId/reject).
+// -------------------------------------------------------
+async function expireOldApplications(log) {
+    try {
+        const result = await pool.query(`
+            DELETE FROM alliance_applications
+            WHERE expires_at < now()
+            RETURNING id
+        `);
+        if (result.rows.length > 0)
+            log.push(`Bewerbungen abgelaufen (still): ${result.rows.length}`);
+    } catch (e) {
+        log.push(`Bewerbungs-Ablauf Fehler: ${e.message}`);
+    }
+}
+
 async function serverTickHandler(req, res) {
     const log = [];
     const now = new Date();
@@ -2281,6 +2497,7 @@ async function serverTickHandler(req, res) {
     // Tick frisch berechneten commander_highscore-Werte mitnimmt.
     await updateAllianceHighscore(log);
     await expireOldFriendships(log);
+    await expireOldApplications(log);
 
     res.json({ success: true, log, timestamp: now.toISOString() });
 }
