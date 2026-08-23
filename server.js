@@ -310,6 +310,56 @@ async function initDatabase() {
         await pool.query(`CREATE INDEX IF NOT EXISTS idx_alliance_applications_alliance ON alliance_applications (alliance_id);`);
         await pool.query(`CREATE INDEX IF NOT EXISTS idx_alliance_applications_commander ON alliance_applications (commander_id);`);
 
+        // NEU (22.08., Phase R1): Frei konfigurierbare Ränge pro Allianz —
+        // ersetzt das feste role-Feld ('founder'/'member') langfristig.
+        // rank_order: 0 = höchste Autorität, höher = weniger Rechte. Wird
+        // NICHT für Rechte-Prüfungen genutzt (das machen die einzelnen
+        // can_*-Spalten) — dient nur der SORTIERUNG in der Mitgliederliste.
+        //
+        // is_founder_rank: GENAU EIN Rang pro Allianz trägt das. Hat IMMER
+        // alle Rechte, unabhängig von den can_*-Spalten (verhindert, dass
+        // sich ein Gründer versehentlich selbst aussperrt). Name/Tag/Logo
+        // ändern + Allianz auflösen bleiben zusätzlich FEST an diesen einen
+        // Rang gebunden (nicht über can_*-Spalten delegierbar), das wird in
+        // Phase R2 direkt gegen is_founder_rank geprüft, nicht gegen can_*.
+        //
+        // is_default_rank: GENAU EIN Rang pro Allianz — wird neuen
+        // Mitgliedern automatisch zugewiesen (Beitritt/Bewerbung
+        // angenommen). Bewusst ein eigenes Flag statt "Name == Mitglied"
+        // zu prüfen, weil ALLE Rangnamen frei umbenennbar sein sollen
+        // (auch "Mitglied" selbst) — ein Namens-Abgleich wäre nach einer
+        // Umbenennung kaputt, das Flag bleibt stabil.
+        await pool.query(`
+            CREATE TABLE IF NOT EXISTS alliance_ranks (
+                id SERIAL PRIMARY KEY,
+                alliance_id INTEGER NOT NULL,
+                name TEXT NOT NULL,
+                rank_order INTEGER NOT NULL DEFAULT 100,
+                is_founder_rank BOOLEAN NOT NULL DEFAULT false,
+                is_default_rank BOOLEAN NOT NULL DEFAULT false,
+                can_manage_applications  BOOLEAN NOT NULL DEFAULT false,
+                can_manage_relationships BOOLEAN NOT NULL DEFAULT false,
+                can_edit_alliance_info   BOOLEAN NOT NULL DEFAULT false,
+                can_kick_members         BOOLEAN NOT NULL DEFAULT false,
+                can_promote_members      BOOLEAN NOT NULL DEFAULT false,
+                created_at TIMESTAMPTZ NOT NULL DEFAULT now()
+            );
+        `);
+        await pool.query(`CREATE INDEX IF NOT EXISTS idx_alliance_ranks_alliance ON alliance_ranks (alliance_id);`);
+
+        // rank_id auf alliance_members — NULLABLE für Übergangszeit
+        // (bestehende Mitglieder aus VOR diesem Update haben noch
+        // keinen Rang, werden beim nächsten eigenen Login/Refresh über
+        // das alte 'role'-Feld nachträglich zugeordnet, siehe Phase R2).
+        await pool.query(`ALTER TABLE alliance_members ADD COLUMN IF NOT EXISTS rank_id INTEGER;`);
+
+        // NEU (22.08., Phase R2): Einmalige Migration — bestehende
+        // Allianzen (gegründet VOR Phase R1) haben noch keine Ränge und
+        // keinen rank_id bei ihren Mitgliedern. Läuft bei jedem Server-
+        // Start, aber idempotent: findet beim zweiten Mal nichts mehr zu
+        // tun (WHERE rank_id IS NULL greift dann ins Leere).
+        await backfillAllianceRanks();
+
         // -------------------------------------------------------
         // Commander-Highscore — wird bei jedem /serverTick (alle 5 Min)
         // für ALLE aktiven Spieler neu berechnet. Läuft über unseren
@@ -922,8 +972,23 @@ app.get('/alliances/:id/members', async (req, res) => {
     if (!id) return res.status(400).json({ success: false, error: 'Ungueltige ID' });
 
     try {
+        // ERWEITERT (22.08., Phase R4): Rang-Info + Rechte (für Dropdown/
+        // "nur nach unten"-Prüfung im Client) + Punkte (für die Sortierung,
+        // wie ursprünglich geplant: erst Rang, dann Punkte) + zuletzt aktiv
+        // (Wiederverwendung von commander_highscore.updated_at, kein neuer
+        // Tracking-Code nötig) — alles in EINEM Aufruf statt mehrerer.
         const result = await pool.query(
-            'SELECT * FROM alliance_members WHERE alliance_id = $1 ORDER BY role ASC, joined_at ASC',
+            `SELECT m.*,
+                    r.name AS rank_name, r.rank_order, r.is_founder_rank, r.is_default_rank,
+                    r.can_manage_applications, r.can_manage_relationships, r.can_edit_alliance_info,
+                    r.can_kick_members, r.can_promote_members,
+                    COALESCE(h.total_points, 0) AS total_points,
+                    h.updated_at AS last_active_at
+             FROM alliance_members m
+             LEFT JOIN alliance_ranks r ON r.id = m.rank_id
+             LEFT JOIN commander_highscore h ON h.commander_id = m.commander_id
+             WHERE m.alliance_id = $1
+             ORDER BY COALESCE(r.rank_order, 999) ASC, COALESCE(h.total_points, 0) DESC`,
             [id]
         );
         res.json({ success: true, members: result.rows });
@@ -949,9 +1014,10 @@ app.post('/alliances/:id/join', async (req, res) => {
             return res.status(404).json({ success: false, error: 'Allianz nicht gefunden' });
         const alliance = allianceCheck.rows[0];
 
+        const defaultRankId = await getDefaultRankId(id);
         await pool.query(
-            'INSERT INTO alliance_members (alliance_id, commander_id, commander_name, commander_coord, role) VALUES ($1, $2, $3, $4, $5)',
-            [id, commanderId, commanderName || 'Unbekannt', commanderCoord || null, 'member']
+            'INSERT INTO alliance_members (alliance_id, commander_id, commander_name, commander_coord, role, rank_id) VALUES ($1, $2, $3, $4, $5, $6)',
+            [id, commanderId, commanderName || 'Unbekannt', commanderCoord || null, 'member', defaultRankId]
         );
 
         await sendAllianceMail(commanderId, commanderCoord,
@@ -1018,8 +1084,8 @@ app.get('/alliances/:id/applications', async (req, res) => {
     if (!requesterCommanderId) return res.status(400).json({ success: false, error: 'Fehlender requesterCommanderId-Parameter' });
 
     try {
-        if (!(await isAllianceFounder(requesterCommanderId, id)))
-            return res.status(403).json({ success: false, error: 'Nur der Gründer darf Bewerbungen einsehen.' });
+        if (!(await allianceHasPermission(requesterCommanderId, id, 'can_manage_applications')))
+            return res.status(403).json({ success: false, error: 'Keine Berechtigung, Bewerbungen einzusehen.' });
 
         const result = await pool.query(
             'SELECT * FROM alliance_applications WHERE alliance_id = $1 ORDER BY created_at ASC',
@@ -1062,8 +1128,8 @@ app.post('/alliances/:id/applications/:appId/accept', async (req, res) => {
         return res.status(400).json({ success: false, error: 'Fehlende Parameter' });
 
     try {
-        if (!(await isAllianceFounder(requesterCommanderId, id)))
-            return res.status(403).json({ success: false, error: 'Nur der Gründer darf annehmen.' });
+        if (!(await allianceHasPermission(requesterCommanderId, id, 'can_manage_applications')))
+            return res.status(403).json({ success: false, error: 'Keine Berechtigung, Bewerbungen anzunehmen.' });
 
         const appResult = await pool.query(
             'SELECT * FROM alliance_applications WHERE id = $1 AND alliance_id = $2',
@@ -1084,9 +1150,10 @@ app.post('/alliances/:id/applications/:appId/accept', async (req, res) => {
         const allianceResult = await pool.query('SELECT name, tag FROM alliances WHERE id = $1', [id]);
         const alliance = allianceResult.rows[0];
 
+        const defaultRankId = await getDefaultRankId(id);
         await pool.query(
-            'INSERT INTO alliance_members (alliance_id, commander_id, commander_name, commander_coord, role) VALUES ($1, $2, $3, $4, $5)',
-            [id, application.commander_id, application.commander_name, application.commander_coord, 'member']
+            'INSERT INTO alliance_members (alliance_id, commander_id, commander_name, commander_coord, role, rank_id) VALUES ($1, $2, $3, $4, $5, $6)',
+            [id, application.commander_id, application.commander_name, application.commander_coord, 'member', defaultRankId]
         );
         await pool.query('DELETE FROM alliance_applications WHERE id = $1', [appId]);
 
@@ -1109,8 +1176,8 @@ app.post('/alliances/:id/applications/:appId/reject', async (req, res) => {
         return res.status(400).json({ success: false, error: 'Fehlende Parameter' });
 
     try {
-        if (!(await isAllianceFounder(requesterCommanderId, id)))
-            return res.status(403).json({ success: false, error: 'Nur der Gründer darf ablehnen.' });
+        if (!(await allianceHasPermission(requesterCommanderId, id, 'can_manage_applications')))
+            return res.status(403).json({ success: false, error: 'Keine Berechtigung, Bewerbungen abzulehnen.' });
 
         const appResult = await pool.query(
             'SELECT * FROM alliance_applications WHERE id = $1 AND alliance_id = $2',
@@ -1202,14 +1269,19 @@ app.put('/alliances/:id/edit', async (req, res) => {
     if (!id || !commanderId) return res.status(400).json({ success: false, error: 'Fehlende Parameter' });
 
     try {
-        const memberResult = await pool.query(
-            'SELECT role FROM alliance_members WHERE alliance_id = $1 AND commander_id = $2',
-            [id, commanderId]
-        );
-        if (memberResult.rows.length === 0)
-            return res.status(403).json({ success: false, error: 'Du bist kein Mitglied dieser Allianz.' });
-        if (memberResult.rows[0].role !== 'founder')
-            return res.status(403).json({ success: false, error: 'Nur der Gründer darf die Allianz bearbeiten.' });
+        // UMGESTELLT (Phase R2): Name/Tag/Logo bleiben FEST an den
+        // Gründer-Rang gebunden (bewusst NICHT über can_edit_alliance_info
+        // delegierbar — Umbenennen/Rebranding ist eine strukturelle
+        // Entscheidung). Die Beschreibung dagegen IST delegierbar, für
+        // Offiziere/Ministerien mit dem passenden Recht.
+        const wantsStructuralChange = name !== undefined || tag !== undefined || logoId !== undefined;
+        const wantsDescriptionChange = description !== undefined;
+
+        if (wantsStructuralChange && !(await isAllianceFounder(commanderId, id)))
+            return res.status(403).json({ success: false, error: 'Nur der Gründer darf Name/Tag/Logo ändern.' });
+
+        if (wantsDescriptionChange && !(await allianceHasPermission(commanderId, id, 'can_edit_alliance_info')))
+            return res.status(403).json({ success: false, error: 'Keine Berechtigung, die Beschreibung zu bearbeiten.' });
 
         const updates = [];
         const values = [];
@@ -1254,6 +1326,256 @@ app.put('/alliances/:id/edit', async (req, res) => {
         res.json({ success: true, alliance: result.rows[0] });
     } catch (error) {
         console.error('[Server] alliances/:id/edit PUT Fehler:', error.message);
+        res.status(500).json({ success: false, error: error.message });
+    }
+});
+
+// =========================================================
+// NEU (22.08., Phase R3): Rang-Verwaltung + Mitglieder-Aktionen
+// (Befördern/Kicken). Rang-CRUD ist bewusst GRÜNDER-ONLY (nicht über
+// can_*-Spalten delegierbar) — sonst könnte sich ein Offizier mit
+// can_promote_members selbst über eine neu erstellte Rang-Definition
+// mehr Rechte verschaffen, als der Gründer ihm zugedacht hat.
+// =========================================================
+
+// Rang-Liste — für ALLE Mitglieder einsehbar (nicht nur Gründer/
+// Offiziere), z.B. für das Dropdown bei der Mitgliederliste und um
+// überhaupt zu sehen, welche Ministerien es gibt.
+app.get('/alliances/:id/ranks', async (req, res) => {
+    const id = parseInt(req.params.id, 10);
+    const requesterCommanderId = parseInt(req.query.requesterCommanderId, 10);
+    if (!id) return res.status(400).json({ success: false, error: 'Ungueltige ID' });
+    if (!requesterCommanderId) return res.status(400).json({ success: false, error: 'Fehlender requesterCommanderId-Parameter' });
+
+    try {
+        const memberCheck = await pool.query(
+            'SELECT 1 FROM alliance_members WHERE alliance_id = $1 AND commander_id = $2',
+            [id, requesterCommanderId]
+        );
+        if (memberCheck.rows.length === 0)
+            return res.status(403).json({ success: false, error: 'Nur Mitglieder dürfen die Ränge einsehen.' });
+
+        const result = await pool.query(
+            'SELECT * FROM alliance_ranks WHERE alliance_id = $1 ORDER BY rank_order ASC',
+            [id]
+        );
+        res.json({ success: true, ranks: result.rows });
+    } catch (error) {
+        console.error('[Server] alliances/:id/ranks GET Fehler:', error.message);
+        res.status(500).json({ success: false, error: error.message });
+    }
+});
+
+app.post('/alliances/:id/ranks', async (req, res) => {
+    const id = parseInt(req.params.id, 10);
+    const { requesterCommanderId, name, rankOrder,
+        canManageApplications, canManageRelationships, canEditAllianceInfo, canKickMembers, canPromoteMembers } = req.body;
+    if (!id || !requesterCommanderId || !name)
+        return res.status(400).json({ success: false, error: 'Fehlende Parameter' });
+
+    try {
+        if (!(await isAllianceFounder(requesterCommanderId, id)))
+            return res.status(403).json({ success: false, error: 'Nur der Gründer darf neue Ränge erstellen.' });
+
+        const trimmedName = name.trim();
+        if (trimmedName.length < 1 || trimmedName.length > 30)
+            return res.status(400).json({ success: false, error: 'Rangname muss 1-30 Zeichen haben.' });
+
+        const result = await pool.query(
+            `INSERT INTO alliance_ranks
+                (alliance_id, name, rank_order, is_founder_rank, is_default_rank,
+                 can_manage_applications, can_manage_relationships, can_edit_alliance_info, can_kick_members, can_promote_members)
+             VALUES ($1, $2, $3, false, false, $4, $5, $6, $7, $8)
+             RETURNING *`,
+            [id, trimmedName, rankOrder || 50,
+             !!canManageApplications, !!canManageRelationships, !!canEditAllianceInfo, !!canKickMembers, !!canPromoteMembers]
+        );
+        res.json({ success: true, rank: result.rows[0] });
+    } catch (error) {
+        console.error('[Server] alliances/:id/ranks POST Fehler:', error.message);
+        res.status(500).json({ success: false, error: error.message });
+    }
+});
+
+app.put('/alliances/:id/ranks/:rankId', async (req, res) => {
+    const id = parseInt(req.params.id, 10);
+    const rankId = parseInt(req.params.rankId, 10);
+    const { requesterCommanderId, name, rankOrder, isDefaultRank,
+        canManageApplications, canManageRelationships, canEditAllianceInfo, canKickMembers, canPromoteMembers } = req.body;
+    if (!id || !rankId || !requesterCommanderId)
+        return res.status(400).json({ success: false, error: 'Fehlende Parameter' });
+
+    try {
+        if (!(await isAllianceFounder(requesterCommanderId, id)))
+            return res.status(403).json({ success: false, error: 'Nur der Gründer darf Ränge bearbeiten.' });
+
+        const rankCheck = await pool.query('SELECT * FROM alliance_ranks WHERE id = $1 AND alliance_id = $2', [rankId, id]);
+        if (rankCheck.rows.length === 0)
+            return res.status(404).json({ success: false, error: 'Rang nicht gefunden.' });
+
+        // is_founder_rank selbst bleibt IMMER gesperrt — der Gründer-Rang
+        // darf umbenannt werden (Name ist frei wählbar, siehe Plan), aber
+        // niemals auf einen anderen Rang "übertragen" werden. Das ist eine
+        // bewusste Einschränkung, kein Versehen — Gründerstatus-Transfer
+        // wäre ein eigenes, deutlich größeres Feature.
+
+        const updates = [];
+        const values = [];
+        let idx = 1;
+
+        if (name !== undefined) {
+            const trimmed = (name || '').trim();
+            if (trimmed.length < 1 || trimmed.length > 30)
+                return res.status(400).json({ success: false, error: 'Rangname muss 1-30 Zeichen haben.' });
+            updates.push(`name = $${idx++}`); values.push(trimmed);
+        }
+        if (rankOrder !== undefined) { updates.push(`rank_order = $${idx++}`); values.push(rankOrder); }
+        if (canManageApplications  !== undefined) { updates.push(`can_manage_applications = $${idx++}`);  values.push(!!canManageApplications); }
+        if (canManageRelationships !== undefined) { updates.push(`can_manage_relationships = $${idx++}`); values.push(!!canManageRelationships); }
+        if (canEditAllianceInfo    !== undefined) { updates.push(`can_edit_alliance_info = $${idx++}`);   values.push(!!canEditAllianceInfo); }
+        if (canKickMembers         !== undefined) { updates.push(`can_kick_members = $${idx++}`);         values.push(!!canKickMembers); }
+        if (canPromoteMembers      !== undefined) { updates.push(`can_promote_members = $${idx++}`);      values.push(!!canPromoteMembers); }
+
+        if (isDefaultRank === true) {
+            // Nur EIN Standard-Rang pro Allianz möglich — alten zuerst
+            // zurücksetzen, dann neuen setzen.
+            await pool.query('UPDATE alliance_ranks SET is_default_rank = false WHERE alliance_id = $1', [id]);
+            updates.push(`is_default_rank = $${idx++}`); values.push(true);
+        }
+
+        if (updates.length === 0)
+            return res.status(400).json({ success: false, error: 'Keine Änderungen übergeben.' });
+
+        values.push(rankId);
+        const result = await pool.query(
+            `UPDATE alliance_ranks SET ${updates.join(', ')} WHERE id = $${idx} RETURNING *`,
+            values
+        );
+        res.json({ success: true, rank: result.rows[0] });
+    } catch (error) {
+        console.error('[Server] alliances/:id/ranks PUT Fehler:', error.message);
+        res.status(500).json({ success: false, error: error.message });
+    }
+});
+
+app.delete('/alliances/:id/ranks/:rankId', async (req, res) => {
+    const id = parseInt(req.params.id, 10);
+    const rankId = parseInt(req.params.rankId, 10);
+    const { requesterCommanderId } = req.body;
+    if (!id || !rankId) return res.status(400).json({ success: false, error: 'Ungueltige ID' });
+    if (!requesterCommanderId) return res.status(400).json({ success: false, error: 'Fehlender requesterCommanderId-Parameter' });
+
+    try {
+        if (!(await isAllianceFounder(requesterCommanderId, id)))
+            return res.status(403).json({ success: false, error: 'Nur der Gründer darf Ränge löschen.' });
+
+        const rankCheck = await pool.query('SELECT * FROM alliance_ranks WHERE id = $1 AND alliance_id = $2', [rankId, id]);
+        if (rankCheck.rows.length === 0)
+            return res.status(404).json({ success: false, error: 'Rang nicht gefunden.' });
+        const rank = rankCheck.rows[0];
+
+        if (rank.is_founder_rank)
+            return res.status(400).json({ success: false, error: 'Der Gründer-Rang kann nicht gelöscht werden.' });
+        if (rank.is_default_rank)
+            return res.status(400).json({ success: false, error: 'Der Standard-Rang kann nicht gelöscht werden (erst einen anderen Rang als Standard festlegen).' });
+
+        // Mitglieder mit diesem Rang auf den Standard-Rang zurückstufen,
+        // BEVOR der Rang selbst gelöscht wird — sonst blieben sie mit
+        // einem toten rank_id-Verweis zurück.
+        const defaultRankId = await getDefaultRankId(id);
+        await pool.query('UPDATE alliance_members SET rank_id = $1 WHERE alliance_id = $2 AND rank_id = $3', [defaultRankId, id, rankId]);
+        await pool.query('DELETE FROM alliance_ranks WHERE id = $1', [rankId]);
+
+        res.json({ success: true });
+    } catch (error) {
+        console.error('[Server] alliances/:id/ranks DELETE Fehler:', error.message);
+        res.status(500).json({ success: false, error: error.message });
+    }
+});
+
+// -------------------------------------------------------
+// Mitglied befördern/degradieren — "nur nach unten": der Anfragende
+// darf nur Mitglieder mit einer NIEDRIGEREN Autorität bearbeiten
+// (höherer rank_order-Wert) als er selbst, und darf niemanden auf
+// einen Rang befördern, der seinem eigenen gleichkommt oder ihn
+// übersteigt. Gründer (is_founder_rank) umgeht diese Prüfung komplett.
+// -------------------------------------------------------
+app.post('/alliances/:id/members/:commanderId/promote', async (req, res) => {
+    const id = parseInt(req.params.id, 10);
+    const targetCommanderId = parseInt(req.params.commanderId, 10);
+    const { requesterCommanderId, newRankId } = req.body;
+    if (!id || !targetCommanderId || !requesterCommanderId || !newRankId)
+        return res.status(400).json({ success: false, error: 'Fehlende Parameter' });
+
+    try {
+        if (!(await allianceHasPermission(requesterCommanderId, id, 'can_promote_members')))
+            return res.status(403).json({ success: false, error: 'Keine Berechtigung, Mitglieder zu befördern.' });
+
+        const requesterInfo = await getMemberRankInfo(requesterCommanderId, id);
+        const targetInfo = await getMemberRankInfo(targetCommanderId, id);
+        if (!requesterInfo || !targetInfo)
+            return res.status(404).json({ success: false, error: 'Mitglied nicht gefunden.' });
+
+        if (!requesterInfo.is_founder_rank && targetInfo.rank_order <= requesterInfo.rank_order)
+            return res.status(403).json({ success: false, error: 'Du kannst nur Mitglieder unterhalb deines eigenen Rangs bearbeiten.' });
+
+        const newRankResult = await pool.query('SELECT * FROM alliance_ranks WHERE id = $1 AND alliance_id = $2', [newRankId, id]);
+        if (newRankResult.rows.length === 0)
+            return res.status(404).json({ success: false, error: 'Zielrang nicht gefunden.' });
+        const newRank = newRankResult.rows[0];
+
+        if (newRank.is_founder_rank)
+            return res.status(403).json({ success: false, error: 'Der Gründer-Rang kann nicht zugewiesen werden.' });
+        if (!requesterInfo.is_founder_rank && newRank.rank_order <= requesterInfo.rank_order)
+            return res.status(403).json({ success: false, error: 'Du kannst niemanden auf oder über deinen eigenen Rang befördern.' });
+
+        await pool.query('UPDATE alliance_members SET rank_id = $1 WHERE alliance_id = $2 AND commander_id = $3', [newRankId, id, targetCommanderId]);
+        res.json({ success: true });
+    } catch (error) {
+        console.error('[Server] members/:id/promote Fehler:', error.message);
+        res.status(500).json({ success: false, error: error.message });
+    }
+});
+
+app.post('/alliances/:id/members/:commanderId/kick', async (req, res) => {
+    const id = parseInt(req.params.id, 10);
+    const targetCommanderId = parseInt(req.params.commanderId, 10);
+    const { requesterCommanderId } = req.body;
+    if (!id || !targetCommanderId || !requesterCommanderId)
+        return res.status(400).json({ success: false, error: 'Fehlende Parameter' });
+
+    try {
+        if (!(await allianceHasPermission(requesterCommanderId, id, 'can_kick_members')))
+            return res.status(403).json({ success: false, error: 'Keine Berechtigung, Mitglieder zu entfernen.' });
+
+        const requesterInfo = await getMemberRankInfo(requesterCommanderId, id);
+        const targetInfo = await getMemberRankInfo(targetCommanderId, id);
+        if (!requesterInfo || !targetInfo)
+            return res.status(404).json({ success: false, error: 'Mitglied nicht gefunden.' });
+
+        if (targetInfo.is_founder_rank)
+            return res.status(403).json({ success: false, error: 'Der Gründer kann nicht entfernt werden.' });
+        if (!requesterInfo.is_founder_rank && targetInfo.rank_order <= requesterInfo.rank_order)
+            return res.status(403).json({ success: false, error: 'Du kannst nur Mitglieder unterhalb deines eigenen Rangs entfernen.' });
+
+        const memberResult = await pool.query(
+            'SELECT commander_coord FROM alliance_members WHERE alliance_id = $1 AND commander_id = $2',
+            [id, targetCommanderId]
+        );
+        const allianceResult = await pool.query('SELECT name, tag FROM alliances WHERE id = $1', [id]);
+
+        await pool.query('DELETE FROM alliance_members WHERE alliance_id = $1 AND commander_id = $2', [id, targetCommanderId]);
+
+        if (memberResult.rows.length > 0 && allianceResult.rows.length > 0) {
+            const alliance = allianceResult.rows[0];
+            await sendAllianceMail(targetCommanderId, memberResult.rows[0].commander_coord,
+                'Aus der Allianz entfernt', // LOCALIZE
+                `Du wurdest aus der Allianz "${alliance.name}" [${alliance.tag}] entfernt.`); // LOCALIZE
+        }
+
+        res.json({ success: true });
+    } catch (error) {
+        console.error('[Server] members/:id/kick Fehler:', error.message);
         res.status(500).json({ success: false, error: error.message });
     }
 });
@@ -1508,18 +1830,23 @@ app.post('/alliances/charter/:id/sign', async (req, res) => {
         );
         const newAlliance = allianceResult.rows[0];
 
+        // NEU (Phase R1): Die 5 Start-Ränge anlegen, BEVOR irgendjemand
+        // eingetragen wird — sonst gäbe es kurzzeitig Mitglieder ohne
+        // gültigen rank_id.
+        const rankIds = await createDefaultAllianceRanks(newAlliance.id);
+
         // Gruender als Mitglied eintragen
         await pool.query(
-            'INSERT INTO alliance_members (alliance_id, commander_id, commander_name, commander_coord, role) VALUES ($1, $2, $3, $4, $5)',
-            [newAlliance.id, charter.founder_commander_id, charter.founder_name, charter.founder_coord, 'founder']
+            'INSERT INTO alliance_members (alliance_id, commander_id, commander_name, commander_coord, role, rank_id) VALUES ($1, $2, $3, $4, $5, $6)',
+            [newAlliance.id, charter.founder_commander_id, charter.founder_name, charter.founder_coord, 'founder', rankIds['Gründer']]
         );
 
         // Alle Unterzeichner als Mitglieder eintragen
         const signatures = await pool.query('SELECT * FROM alliance_charter_signatures WHERE charter_id = $1', [id]);
         for (const sig of signatures.rows) {
             await pool.query(
-                'INSERT INTO alliance_members (alliance_id, commander_id, commander_name, commander_coord, role) VALUES ($1, $2, $3, $4, $5) ON CONFLICT (commander_id) DO NOTHING',
-                [newAlliance.id, sig.signer_commander_id, sig.signer_name, sig.signer_coord, 'member']
+                'INSERT INTO alliance_members (alliance_id, commander_id, commander_name, commander_coord, role, rank_id) VALUES ($1, $2, $3, $4, $5, $6) ON CONFLICT (commander_id) DO NOTHING',
+                [newAlliance.id, sig.signer_commander_id, sig.signer_name, sig.signer_coord, 'member', rankIds['Mitglied']]
             );
         }
 
@@ -1803,12 +2130,172 @@ app.post('/alliance-relationships/declare-peace', async (req, res) => {
 // Nur der GRÜNDER der anfragenden/antwortenden Allianz darf das auslösen
 // (gleiche Rollen-Prüfung wie bei PUT /alliances/:id/edit).
 // -------------------------------------------------------
+// UMGESTELLT (22.08., Phase R2): prüft jetzt über das neue Rang-System
+// (is_founder_rank), NICHT mehr über das alte role-Textfeld — das bleibt
+// nur noch als Anzeige-Info bestehen ("Gründer"/"Mitglied" in der
+// Mitgliederliste), ist aber keine Rechte-Quelle mehr. Name unverändert,
+// damit keine der verbleibenden Aufrufstellen geändert werden muss.
 async function isAllianceFounder(commanderId, allianceId) {
     const result = await pool.query(
-        'SELECT role FROM alliance_members WHERE alliance_id = $1 AND commander_id = $2',
+        `SELECT r.is_founder_rank
+         FROM alliance_members m
+         JOIN alliance_ranks r ON r.id = m.rank_id
+         WHERE m.alliance_id = $1 AND m.commander_id = $2`,
         [allianceId, commanderId]
     );
-    return result.rows.length > 0 && result.rows[0].role === 'founder';
+    return result.rows.length > 0 && result.rows[0].is_founder_rank === true;
+}
+
+// -------------------------------------------------------
+// Rang-System — Grundlage für individuell konfigurierbare Ministerien
+// (Phase R1). isAllianceFounder() oben wurde in Phase R2 bereits auf
+// dieses System umgestellt. Die Endpunkte unten (Bewerbungen,
+// Beziehungen) nutzen jetzt allianceHasPermission() statt
+// isAllianceFounder(), damit diese Rechte an Offiziere/Ministerien
+// delegierbar sind, nicht mehr fest an den Gründer gebunden.
+// -------------------------------------------------------
+
+// Whitelist statt freier String-Interpolation in SQL — auch wenn der
+// Parameter nie aus req.body kommt (immer fest im Code vorgegeben),
+// verhindert das Tippfehler UND SQL-Injection strukturell.
+const ALLIANCE_PERMISSION_COLUMNS = [
+    'can_manage_applications',
+    'can_manage_relationships',
+    'can_edit_alliance_info',
+    'can_kick_members',
+    'can_promote_members'
+];
+
+// Generische Rechte-Prüfung — EINE Stelle für alle künftigen
+// Berechtigungs-Checks, egal wie viele individuelle Ränge eine
+// Allianz später hat. is_founder_rank hat IMMER alle Rechte.
+async function allianceHasPermission(commanderId, allianceId, permissionColumn) {
+    if (!ALLIANCE_PERMISSION_COLUMNS.includes(permissionColumn))
+        throw new Error(`Unbekannte Berechtigungsspalte: ${permissionColumn}`);
+
+    const result = await pool.query(
+        `SELECT r.is_founder_rank, r.${permissionColumn} AS has_permission
+         FROM alliance_members m
+         JOIN alliance_ranks r ON r.id = m.rank_id
+         WHERE m.alliance_id = $1 AND m.commander_id = $2`,
+        [allianceId, commanderId]
+    );
+    if (result.rows.length === 0) return false;
+    return result.rows[0].is_founder_rank || result.rows[0].has_permission === true;
+}
+
+async function getFounderRankId(allianceId) {
+    const result = await pool.query(
+        'SELECT id FROM alliance_ranks WHERE alliance_id = $1 AND is_founder_rank = true LIMIT 1',
+        [allianceId]
+    );
+    return result.rows.length > 0 ? result.rows[0].id : null;
+}
+
+async function getDefaultRankId(allianceId) {
+    const result = await pool.query(
+        'SELECT id FROM alliance_ranks WHERE alliance_id = $1 AND is_default_rank = true LIMIT 1',
+        [allianceId]
+    );
+    return result.rows.length > 0 ? result.rows[0].id : null;
+}
+
+// NEU (22.08., Phase R3): liefert rank_order + is_founder_rank eines
+// Mitglieds — Grundlage für die "nur nach unten"-Regel bei Befördern/
+// Kicken (siehe /members/:commanderId/promote und /kick unten).
+async function getMemberRankInfo(commanderId, allianceId) {
+    const result = await pool.query(
+        `SELECT m.rank_id, r.rank_order, r.is_founder_rank
+         FROM alliance_members m JOIN alliance_ranks r ON r.id = m.rank_id
+         WHERE m.alliance_id = $1 AND m.commander_id = $2`,
+        [allianceId, commanderId]
+    );
+    return result.rows.length > 0 ? result.rows[0] : null;
+}
+
+// Wird EINMALIG bei Allianz-Gründung aufgerufen — legt die 5 Start-
+// Ränge an. Alle Namen/Rechte danach frei änderbar (Phase R4, UI).
+// Kriegsminister/Außenminister starten bewusst mit identischen Rechten
+// (Beziehungen verwalten) — der Gründer differenziert das bei Bedarf
+// selbst aus, das ist nur ein sinnvoller Startpunkt, keine feste Regel.
+async function createDefaultAllianceRanks(allianceId) {
+    const defaultRanks = [
+        { name: 'Gründer', rank_order: 0, is_founder_rank: true, is_default_rank: false,
+          can_manage_applications: true, can_manage_relationships: true, can_edit_alliance_info: true, can_kick_members: true, can_promote_members: true },
+        { name: 'Kriegsminister', rank_order: 10, is_founder_rank: false, is_default_rank: false,
+          can_manage_applications: false, can_manage_relationships: true, can_edit_alliance_info: false, can_kick_members: false, can_promote_members: false },
+        { name: 'Außenminister', rank_order: 10, is_founder_rank: false, is_default_rank: false,
+          can_manage_applications: false, can_manage_relationships: true, can_edit_alliance_info: false, can_kick_members: false, can_promote_members: false },
+        { name: 'Innenminister', rank_order: 10, is_founder_rank: false, is_default_rank: false,
+          can_manage_applications: true, can_manage_relationships: false, can_edit_alliance_info: false, can_kick_members: true, can_promote_members: true },
+        { name: 'Mitglied', rank_order: 100, is_founder_rank: false, is_default_rank: true,
+          can_manage_applications: false, can_manage_relationships: false, can_edit_alliance_info: false, can_kick_members: false, can_promote_members: false }
+    ];
+
+    const rankIds = {};
+    for (const rank of defaultRanks) {
+        const result = await pool.query(
+            `INSERT INTO alliance_ranks
+                (alliance_id, name, rank_order, is_founder_rank, is_default_rank,
+                 can_manage_applications, can_manage_relationships, can_edit_alliance_info, can_kick_members, can_promote_members)
+             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)
+             RETURNING id, name`,
+            [allianceId, rank.name, rank.rank_order, rank.is_founder_rank, rank.is_default_rank,
+             rank.can_manage_applications, rank.can_manage_relationships, rank.can_edit_alliance_info, rank.can_kick_members, rank.can_promote_members]
+        );
+        rankIds[rank.name] = result.rows[0].id;
+    }
+    return rankIds; // { "Gründer": 1, "Kriegsminister": 2, ... } — IDs, nicht Namen, für die Inserts unten
+}
+
+// -------------------------------------------------------
+// NEU (22.08., Phase R2): Einmalige Migration für Allianzen, die VOR
+// Phase R1 gegründet wurden — die haben weder alliance_ranks-Zeilen
+// noch einen rank_id bei ihren Mitgliedern. Legt bei Bedarf die 5
+// Start-Ränge nachträglich an und ordnet bestehende Mitglieder anhand
+// des alten 'role'-Felds zu ('founder' -> Gründer-Rang, sonst ->
+// Standard-Rang). Wird bei jedem Serverstart aufgerufen, aber
+// idempotent (WHERE rank_id IS NULL findet beim zweiten Mal nichts mehr).
+// -------------------------------------------------------
+async function backfillAllianceRanks() {
+    try {
+        const alliancesNeedingBackfill = await pool.query(
+            `SELECT DISTINCT alliance_id FROM alliance_members WHERE rank_id IS NULL`
+        );
+
+        for (const row of alliancesNeedingBackfill.rows) {
+            const allianceId = row.alliance_id;
+
+            const existingRanks = await pool.query(
+                'SELECT id, is_founder_rank, is_default_rank FROM alliance_ranks WHERE alliance_id = $1',
+                [allianceId]
+            );
+
+            let founderRankId, defaultRankId;
+            if (existingRanks.rows.length === 0) {
+                const rankIds = await createDefaultAllianceRanks(allianceId);
+                founderRankId = rankIds['Gründer'];
+                defaultRankId = rankIds['Mitglied'];
+            } else {
+                founderRankId = existingRanks.rows.find(r => r.is_founder_rank)?.id;
+                defaultRankId = existingRanks.rows.find(r => r.is_default_rank)?.id;
+            }
+
+            await pool.query(
+                `UPDATE alliance_members SET rank_id = $1 WHERE alliance_id = $2 AND rank_id IS NULL AND role = 'founder'`,
+                [founderRankId, allianceId]
+            );
+            await pool.query(
+                `UPDATE alliance_members SET rank_id = $1 WHERE alliance_id = $2 AND rank_id IS NULL AND role != 'founder'`,
+                [defaultRankId, allianceId]
+            );
+        }
+
+        if (alliancesNeedingBackfill.rows.length > 0)
+            console.log(`[Server] Allianz-Rang-Backfill: ${alliancesNeedingBackfill.rows.length} Allianz(en) migriert.`);
+    } catch (e) {
+        console.error('[Server] Allianz-Rang-Backfill Fehler:', e.message);
+    }
 }
 
 app.post('/alliance-relationships/propose', async (req, res) => {
@@ -1821,8 +2308,8 @@ app.post('/alliance-relationships/propose', async (req, res) => {
         return res.status(400).json({ success: false, error: 'Nicht mit der eigenen Allianz möglich' });
 
     try {
-        if (!(await isAllianceFounder(requesterCommanderId, allianceId)))
-            return res.status(403).json({ success: false, error: 'Nur der Gründer darf Bündnisse vorschlagen.' });
+        if (!(await allianceHasPermission(requesterCommanderId, allianceId, 'can_manage_relationships')))
+            return res.status(403).json({ success: false, error: 'Keine Berechtigung, Bündnisse vorzuschlagen.' });
 
         const [a, b] = orderIds(allianceId, targetAllianceId);
         const result = await pool.query(
@@ -1846,8 +2333,8 @@ app.post('/alliance-relationships/respond', async (req, res) => {
         return res.status(400).json({ success: false, error: 'Fehlende Parameter' });
 
     try {
-        if (!(await isAllianceFounder(requesterCommanderId, allianceId)))
-            return res.status(403).json({ success: false, error: 'Nur der Gründer darf antworten.' });
+        if (!(await allianceHasPermission(requesterCommanderId, allianceId, 'can_manage_relationships')))
+            return res.status(403).json({ success: false, error: 'Keine Berechtigung, auf Bündnisanfragen zu antworten.' });
 
         const [a, b] = orderIds(allianceId, targetAllianceId);
         const existing = await pool.query(
