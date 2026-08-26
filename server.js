@@ -1212,6 +1212,27 @@ app.post('/alliances/:id/leave', async (req, res) => {
     if (!id || !commanderId) return res.status(400).json({ success: false, error: 'Fehlende Parameter' });
 
     try {
+        // NEU (23.08.): Gründer darf NICHT einfach austreten, solange noch
+        // andere Mitglieder da sind — sonst bliebe die Allianz ohne jeden
+        // Gründer zurück (niemand könnte mehr Name/Tag/Logo ändern, Ränge
+        // verwalten, etc.). Erst den Rang übergeben (siehe
+        // /transfer-founder unten), dann normal austreten. Ist er der
+        // EINZIGE Verbleibende, greift automatisch der bestehende
+        // "letztes Mitglied -> Allianz löschen"-Weg weiter unten.
+        const founderCheck = await getMemberRankInfo(commanderId, id);
+        if (founderCheck && founderCheck.is_founder_rank) {
+            const totalCountResult = await pool.query(
+                'SELECT COUNT(*) AS cnt FROM alliance_members WHERE alliance_id = $1',
+                [id]
+            );
+            if (parseInt(totalCountResult.rows[0].cnt, 10) > 1) {
+                return res.status(400).json({
+                    success: false,
+                    error: 'Als Gründer musst du den Rang erst an ein anderes Mitglied übergeben, bevor du die Allianz verlassen kannst.'
+                });
+            }
+        }
+
         // Koordinate + Allianzname VOR dem Löschen holen (danach weg)
         const memberResult = await pool.query(
             'SELECT commander_coord FROM alliance_members WHERE alliance_id = $1 AND commander_id = $2',
@@ -1254,6 +1275,57 @@ app.post('/alliances/:id/leave', async (req, res) => {
         res.json({ success: true });
     } catch (error) {
         console.error('[Server] alliances/:id/leave Fehler:', error.message);
+        res.status(500).json({ success: false, error: error.message });
+    }
+});
+
+// -------------------------------------------------------
+// NEU (23.08.): Gründer-Rang an ein anderes Mitglied übergeben. Nur der
+// AKTUELLE Gründer darf das auslösen. Der abgebende Gründer landet auf
+// dem Standard-Rang (normales Mitglied) — kann danach normal über
+// /leave austreten, falls gewünscht.
+// -------------------------------------------------------
+app.post('/alliances/:id/transfer-founder', async (req, res) => {
+    const id = parseInt(req.params.id, 10);
+    const { requesterCommanderId, targetCommanderId } = req.body;
+    if (!id || !requesterCommanderId || !targetCommanderId)
+        return res.status(400).json({ success: false, error: 'Fehlende Parameter' });
+    if (requesterCommanderId === targetCommanderId)
+        return res.status(400).json({ success: false, error: 'Du bist bereits Gründer.' });
+
+    try {
+        if (!(await isAllianceFounder(requesterCommanderId, id)))
+            return res.status(403).json({ success: false, error: 'Nur der aktuelle Gründer darf den Rang übergeben.' });
+
+        const targetInfo = await getMemberRankInfo(targetCommanderId, id);
+        if (!targetInfo)
+            return res.status(404).json({ success: false, error: 'Zielmitglied nicht gefunden.' });
+
+        const founderRankId = await getFounderRankId(id);
+        const defaultRankId = await getDefaultRankId(id);
+        if (!founderRankId || !defaultRankId)
+            return res.status(500).json({ success: false, error: 'Rang-Konfiguration unvollständig.' });
+
+        await pool.query('UPDATE alliance_members SET rank_id = $1, role = $2 WHERE alliance_id = $3 AND commander_id = $4',
+            [founderRankId, 'founder', id, targetCommanderId]);
+        await pool.query('UPDATE alliance_members SET rank_id = $1, role = $2 WHERE alliance_id = $3 AND commander_id = $4',
+            [defaultRankId, 'member', id, requesterCommanderId]);
+
+        const allianceResult = await pool.query('SELECT name, tag FROM alliances WHERE id = $1', [id]);
+        const targetMemberResult = await pool.query(
+            'SELECT commander_coord FROM alliance_members WHERE alliance_id = $1 AND commander_id = $2',
+            [id, targetCommanderId]
+        );
+        if (allianceResult.rows.length > 0 && targetMemberResult.rows.length > 0) {
+            const alliance = allianceResult.rows[0];
+            await sendAllianceMail(targetCommanderId, targetMemberResult.rows[0].commander_coord,
+                'Du bist jetzt Gründer', // LOCALIZE
+                `Du wurdest zum neuen Gründer der Allianz "${alliance.name}" [${alliance.tag}] ernannt.`); // LOCALIZE
+        }
+
+        res.json({ success: true });
+    } catch (error) {
+        console.error('[Server] alliances/:id/transfer-founder Fehler:', error.message);
         res.status(500).json({ success: false, error: error.message });
     }
 });
