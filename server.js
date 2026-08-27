@@ -2523,14 +2523,16 @@ app.post('/reportBug', async (req, res) => {
 // komplett (noch nie über PUT angelegt), taucht er hier einfach nicht
 // auf — der Client zeigt dann seinen eigenen Platzhaltertext.
 // -------------------------------------------------------
+// GEÄNDERT (27.08.): Liefert jetzt ein ARRAY statt eines Objekts mit den
+// Schlüsseln als Feldnamen — JsonUtility (Unity) kann keine Objekte mit
+// BELIEBIGEN/dynamischen Schlüsseln einlesen (kein Dictionary-Support).
+// Mit einem Array aus {key, content, version, updated_at}-Einträgen
+// funktioniert das clientseitig unabhängig davon, wie viele agb_*-Teile
+// es gerade gibt (agb_a, agb_b, ... agb_z, ohne Codeänderung hier).
 app.get('/legal-texts', async (req, res) => {
     try {
         const result = await pool.query('SELECT key, content, version, updated_at FROM legal_texts');
-        const texts = {};
-        for (const row of result.rows) {
-            texts[row.key] = { content: row.content, version: row.version };
-        }
-        res.json({ success: true, texts });
+        res.json({ success: true, texts: result.rows });
     } catch (error) {
         console.error('[Server] legal-texts GET Fehler:', error.message);
         res.status(500).json({ success: false, error: error.message });
