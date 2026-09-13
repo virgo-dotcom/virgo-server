@@ -434,7 +434,56 @@ async function initDatabase() {
         `);
         await pool.query(`CREATE INDEX IF NOT EXISTS idx_support_messages_created_at ON support_messages (created_at DESC);`);
 
-        console.log('[DB] legal_texts + support_messages bereit.');
+        // -------------------------------------------------------
+        // NEU (13.09.): Virgo-Shop-Artikelkatalog. Bewusst in Postgres,
+        // NICHT in PlayFab — Handel ist Multiplayer-relevanter Fortschritt,
+        // soll ueber Render laufen wie Kampf/Allianzen, nicht ueber
+        // PlayFab CloudScript (das ab jetzt nur noch fuer Login/Registrierung/
+        // Account-Verwaltung zustaendig sein soll). Preise/Artikel hier
+        // aenderbar, ohne einen neuen Client-Build zu brauchen.
+        // -------------------------------------------------------
+        await pool.query(`
+            CREATE TABLE IF NOT EXISTS shop_items (
+                item_id TEXT PRIMARY KEY,
+                display_name TEXT NOT NULL,
+                category TEXT NOT NULL,
+                cost_icc INTEGER NOT NULL,
+                reward_kind TEXT NOT NULL,
+                reward_index INTEGER NOT NULL,
+                reward_amount INTEGER NOT NULL,
+                active BOOLEAN NOT NULL DEFAULT true,
+                created_at TIMESTAMPTZ NOT NULL DEFAULT now()
+            );
+        `);
+        await pool.query(`CREATE INDEX IF NOT EXISTS idx_shop_items_category ON shop_items (category);`);
+
+        // Startbestueckung (13.09.2026 abgesprochen) — nur einfuegen, falls
+        // der item_id noch nicht existiert, damit spaetere manuelle
+        // Preisaenderungen bei jedem Serverstart erhalten bleiben.
+        const defaultShopItems = [
+            ['res_metall',      '100.000 Metall',                'ressourcen', 100,  'resource', 0, 100000],
+            ['res_kristall',    '100.000 Kristall',              'ressourcen', 100,  'resource', 1, 100000],
+            ['res_treibstoff',  '100.000 Treibstoff',            'ressourcen', 100,  'resource', 2, 100000],
+            ['res_energie',     '100.000 Energie',               'ressourcen', 100,  'resource', 3, 100000],
+            ['res_blaupausen',  '1.000 Blaupausen',              'ressourcen', 100,  'resource', 4, 1000],
+            ['fleet_warship01', '100x Orbitaljaeger (Warship01)', 'flotten',    250,  'warship',  0, 100],
+            ['fleet_warship02', '50x Raumjaeger (Warship02)',     'flotten',    250,  'warship',  1, 50],
+            ['fleet_warship03', '10x Kosmosjaeger (Warship03)',   'flotten',    250,  'warship',  2, 10],
+            ['fleet_warship04', '1x Sternkreuzer (Warship04)',    'flotten',    250,  'warship',  3, 1],
+            ['fleet_ship01',    '10x Containerschiff (Ship01)',   'flotten',    250,  'ship',     1, 10],
+            ['fleet_ship03',    '1x Kolonisationsschiff (Ship03)','flotten',    250,  'ship',     3, 1],
+            ['item_ship05',     '1x Kernbombe (Ship05)',          'gegenstaende', 1000, 'ship',   5, 1]
+        ];
+        for (const row of defaultShopItems) {
+            await pool.query(
+                `INSERT INTO shop_items (item_id, display_name, category, cost_icc, reward_kind, reward_index, reward_amount)
+                 VALUES ($1, $2, $3, $4, $5, $6, $7)
+                 ON CONFLICT (item_id) DO NOTHING`,
+                row
+            );
+        }
+
+        console.log('[DB] legal_texts + support_messages + shop_items bereit.');
 
         // Sperre gegen doppelte Flottenverarbeitung. Egal WOHER ein doppelter
         // Aufruf für dieselbe Flotte kommt (Client-Doppelklick, zwei offene
@@ -2612,6 +2661,100 @@ app.get('/supportMessages', async (req, res) => {
         res.json({ success: true, messages: result.rows });
     } catch (error) {
         console.error('[Server] supportMessages GET Fehler:', error.message);
+        res.status(500).json({ success: false, error: error.message });
+    }
+});
+
+// =========================================================
+// VIRGO SHOP (NEU, 13.09.2026)
+// Preise/Artikel liegen in Postgres (shop_items), nicht im Client und
+// nicht in PlayFab — der Client schickt nur itemId + targetCoord,
+// Preis und Belohnung werden ausschliesslich hier serverseitig
+// nachgeschlagen. Ein manipulierter Client kann sich dadurch keine
+// falschen Preise/Mengen erschleichen (gleiches Prinzip wie bei Kampf/
+// Forschung: Server ist alleinige Autoritaet).
+// =========================================================
+
+app.get('/shop/items', async (req, res) => {
+    try {
+        const result = await pool.query(
+            'SELECT * FROM shop_items WHERE active = true ORDER BY category, cost_icc'
+        );
+        res.json({ success: true, items: result.rows });
+    } catch (error) {
+        console.error('[Server] shop/items GET Fehler:', error.message);
+        res.status(500).json({ success: false, error: error.message });
+    }
+});
+
+app.post('/shop/purchase', async (req, res) => {
+    const { playFabId, itemId, targetCoord } = req.body;
+    if (!playFabId || !itemId || !targetCoord)
+        return res.status(400).json({ success: false, error: 'Fehlende Parameter' });
+
+    try {
+        const itemResult = await pool.query(
+            'SELECT * FROM shop_items WHERE item_id = $1 AND active = true',
+            [itemId]
+        );
+        if (itemResult.rows.length === 0)
+            return res.status(404).json({ success: false, error: 'Unbekannter Artikel' });
+        const item = itemResult.rows[0];
+
+        const planetKey = 'planet_' + targetCoord.replace(/:/g, '_');
+
+        // Beides in EINEM PlayFab-Aufruf laden.
+        const dataResult = await playfabServer('/Server/GetUserData', {
+            PlayFabId: playFabId,
+            Keys: ['commander_data', planetKey]
+        });
+
+        if (!dataResult.Data || !dataResult.Data['commander_data'])
+            return res.status(404).json({ success: false, error: 'Commander nicht gefunden' });
+        if (!dataResult.Data[planetKey])
+            return res.status(404).json({ success: false, error: 'Zielplanet nicht gefunden' });
+
+        const commander = JSON.parse(dataResult.Data['commander_data'].Value);
+        const planet = JSON.parse(dataResult.Data[planetKey].Value);
+
+        // WICHTIG: Nur EIGENE Kolonien duerfen Ziel sein - verhindert,
+        // dass jemand Belohnungen auf einen fremden Planeten schreiben laesst.
+        if (!commander.colonies || !commander.colonies.includes(targetCoord))
+            return res.status(403).json({ success: false, error: 'Zielkolonie gehoert dir nicht' });
+
+        if (!commander.accountResources || commander.accountResources.length < 5)
+            commander.accountResources = [0, 0, 0, 0, 0];
+
+        if (commander.accountResources[4] < item.cost_icc)
+            return res.status(400).json({
+                success: false, error: 'Nicht genug ICC', iccBalance: commander.accountResources[4]
+            });
+
+        if (item.reward_kind === 'resource') {
+            if (!planet.ressources || planet.ressources.length < 5) planet.ressources = [0, 0, 0, 0, 0];
+            planet.ressources[item.reward_index] += item.reward_amount;
+        } else if (item.reward_kind === 'warship') {
+            if (!planet.warships || planet.warships.length < 10) planet.warships = new Array(10).fill(0);
+            planet.warships[item.reward_index] += item.reward_amount;
+        } else if (item.reward_kind === 'ship') {
+            if (!planet.ships || planet.ships.length < 6) planet.ships = new Array(6).fill(0);
+            planet.ships[item.reward_index] += item.reward_amount;
+        }
+
+        commander.accountResources[4] -= item.cost_icc;
+
+        await playfabServer('/Server/UpdateUserData', {
+            PlayFabId: playFabId,
+            Data: {
+                commander_data: JSON.stringify(commander),
+                [planetKey]: JSON.stringify(planet)
+            },
+            Permission: 'Private'
+        });
+
+        res.json({ success: true, newIccBalance: commander.accountResources[4] });
+    } catch (error) {
+        console.error('[Server] shop/purchase Fehler:', error.message);
         res.status(500).json({ success: false, error: error.message });
     }
 });
