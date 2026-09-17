@@ -2596,6 +2596,61 @@ app.post('/reportBug', async (req, res) => {
 });
 
 // -------------------------------------------------------
+// Admin-Cheat: Account-gebundene Ressource (Ress06-10, z.B. ICC)
+// gutschreiben/abziehen. Anders als Ress01-05 gehoert das nicht zu
+// einer Kolonie, sondern zum Commander direkt (accountResources) -
+// deshalb per Commander-ID statt Koordinate adressiert. Die Ziel-
+// PlayFabId wird ueber commander_highscore (dort schon vorhanden,
+// wird bei jedem Highscore-Tick aktualisiert) aus der Commander-ID
+// aufgeloest, da der Client selbst keine fremden PlayFabIds kennt.
+// ressIndex: 0=Ress06, 1=Ress07, 2=Ress08, 3=Ress09, 4=Ress10 (=ICC).
+// amount darf negativ sein (Delete-Cheat) - Ergebnis wird bei 0 gedeckelt.
+// -------------------------------------------------------
+app.post('/admin/giveAccountResource', async (req, res) => {
+    const { requesterCommanderId, targetCommanderId, ressIndex, amount } = req.body;
+
+    if (!ADMIN_COMMANDER_IDS.includes(requesterCommanderId))
+        return res.status(403).json({ success: false, error: 'Nur Admin-Accounts dürfen das.' });
+    if (!targetCommanderId || ressIndex == null || ressIndex < 0 || ressIndex > 4 || !amount)
+        return res.status(400).json({ success: false, error: 'Fehlende oder ungültige Parameter (ressIndex muss 0-4 sein, entspricht Ress06-Ress10)' });
+
+    try {
+        const pfidResult = await pool.query(
+            'SELECT playfab_id FROM commander_highscore WHERE commander_id = $1',
+            [targetCommanderId]
+        );
+        if (pfidResult.rows.length === 0 || !pfidResult.rows[0].playfab_id)
+            return res.status(404).json({ success: false, error: `Kein Account für Commander ${targetCommanderId} gefunden` });
+
+        const targetPlayFabId = pfidResult.rows[0].playfab_id;
+
+        const dataResult = await playfabServer('/Server/GetUserData', {
+            PlayFabId: targetPlayFabId,
+            Keys: ['commander_data']
+        });
+        if (!dataResult.Data || !dataResult.Data['commander_data'])
+            return res.status(404).json({ success: false, error: 'Commander-Daten nicht gefunden' });
+
+        const commander = JSON.parse(dataResult.Data['commander_data'].Value);
+        if (!commander.accountResources || commander.accountResources.length < 5)
+            commander.accountResources = [0, 0, 0, 0, 0];
+
+        commander.accountResources[ressIndex] = Math.max(0, commander.accountResources[ressIndex] + amount);
+
+        await playfabServer('/Server/UpdateUserData', {
+            PlayFabId: targetPlayFabId,
+            Data: { commander_data: JSON.stringify(commander) },
+            Permission: 'Private'
+        });
+
+        res.json({ success: true, newBalance: commander.accountResources[ressIndex] });
+    } catch (error) {
+        console.error('[Server] admin/giveAccountResource Fehler:', error.message);
+        res.status(500).json({ success: false, error: error.message });
+    }
+});
+
+// -------------------------------------------------------
 // Rechtstexte — GET ist komplett offen (auch ohne Login lesbar,
 // absichtlich, siehe Kommentar bei der Tabellen-Erstellung). PUT ist
 // nur für Admin-Accounts, adressiert über den Text-Key (aktuell:
