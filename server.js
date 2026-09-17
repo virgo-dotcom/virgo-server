@@ -483,7 +483,27 @@ async function initDatabase() {
             );
         }
 
-        console.log('[DB] legal_texts + support_messages + shop_items bereit.');
+        // -------------------------------------------------------
+        // NEU (17.09.): ICC-Geschenkkiste. Einzige bisherige ICC-Quelle
+        // ist der Shop-Verkauf (der ICC nur ausgibt, nie erzeugt) — die
+        // Kiste gibt Spielern pro festem 30-Minuten-Zeitfenster (UTC,
+        // :00/:30) einmalig 5 ICC je eigener Kolonie. Gleiches
+        // Primary-Key-Prinzip wie bei processed_fleets weiter unten:
+        // (playfab_id, window_start) ist PRIMARY KEY, der erste INSERT
+        // fuer ein Zeitfenster gewinnt atomar — verhindert, dass schnelles
+        // Doppelklicken zweimal Belohnung gutschreibt (wichtig, da ICC
+        // eine Premium-Waehrung ist).
+        // -------------------------------------------------------
+        await pool.query(`
+            CREATE TABLE IF NOT EXISTS giftbox_claims (
+                playfab_id TEXT NOT NULL,
+                window_start TIMESTAMPTZ NOT NULL,
+                claimed_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+                PRIMARY KEY (playfab_id, window_start)
+            );
+        `);
+
+        console.log('[DB] legal_texts + support_messages + shop_items + giftbox_claims bereit.');
 
         // Sperre gegen doppelte Flottenverarbeitung. Egal WOHER ein doppelter
         // Aufruf für dieselbe Flotte kommt (Client-Doppelklick, zwei offene
@@ -2755,6 +2775,107 @@ app.post('/shop/purchase', async (req, res) => {
         res.json({ success: true, newIccBalance: commander.accountResources[4] });
     } catch (error) {
         console.error('[Server] shop/purchase Fehler:', error.message);
+        res.status(500).json({ success: false, error: error.message });
+    }
+});
+
+// =========================================================
+// ICC-GESCHENKKISTE (17.09.) — einzige bisherige ICC-Quelle. Pro
+// 30-Minuten-Fenster (UTC, :00/:30) einmal oeffenbar, Belohnung =
+// 5 ICC je eigener Kolonie. Siehe giftbox_claims-Tabelle in
+// initDatabase() fuer das Anti-Doppelklick-Prinzip.
+// =========================================================
+
+function currentGiftBoxWindow() {
+    const now = new Date();
+    const slotMinutes = Math.floor(now.getUTCMinutes() / 30) * 30;
+    const windowStart = new Date(Date.UTC(
+        now.getUTCFullYear(), now.getUTCMonth(), now.getUTCDate(),
+        now.getUTCHours(), slotMinutes, 0, 0
+    ));
+    const nextResetUtc = new Date(windowStart.getTime() + 30 * 60000);
+    return { windowStart, nextResetUtc };
+}
+
+app.get('/giftbox/status', async (req, res) => {
+    const { playFabId } = req.query;
+    if (!playFabId)
+        return res.status(400).json({ success: false, error: 'Fehlende Parameter' });
+
+    try {
+        const { windowStart, nextResetUtc } = currentGiftBoxWindow();
+        const result = await pool.query(
+            'SELECT 1 FROM giftbox_claims WHERE playfab_id = $1 AND window_start = $2',
+            [playFabId, windowStart]
+        );
+        res.json({
+            success: true,
+            canClaim: result.rows.length === 0,
+            nextResetUtc: nextResetUtc.toISOString()
+        });
+    } catch (error) {
+        console.error('[Server] giftbox/status Fehler:', error.message);
+        res.status(500).json({ success: false, error: error.message });
+    }
+});
+
+app.post('/giftbox/claim', async (req, res) => {
+    const { playFabId } = req.body;
+    if (!playFabId)
+        return res.status(400).json({ success: false, error: 'Fehlende Parameter' });
+
+    try {
+        const { windowStart, nextResetUtc } = currentGiftBoxWindow();
+
+        // Atomar: nur der erste INSERT fuer dieses (playfab_id, window_start)
+        // gewinnt. Ein zweiter Klick im selben Fenster (egal wie schnell)
+        // scheitert hier an der PRIMARY KEY-Regel, bevor ueberhaupt ICC
+        // gutgeschrieben wird.
+        const claimResult = await pool.query(
+            `INSERT INTO giftbox_claims (playfab_id, window_start) VALUES ($1, $2)
+             ON CONFLICT (playfab_id, window_start) DO NOTHING
+             RETURNING *`,
+            [playFabId, windowStart]
+        );
+
+        if (claimResult.rowCount === 0) {
+            return res.status(409).json({
+                success: false,
+                error: 'Geschenkkiste wurde in diesem Zeitfenster bereits geoeffnet',
+                nextResetUtc: nextResetUtc.toISOString()
+            });
+        }
+
+        const dataResult = await playfabServer('/Server/GetUserData', {
+            PlayFabId: playFabId,
+            Keys: ['commander_data']
+        });
+
+        if (!dataResult.Data || !dataResult.Data['commander_data'])
+            return res.status(404).json({ success: false, error: 'Commander nicht gefunden' });
+
+        const commander = JSON.parse(dataResult.Data['commander_data'].Value);
+        if (!commander.accountResources || commander.accountResources.length < 5)
+            commander.accountResources = [0, 0, 0, 0, 0];
+
+        const colonyCount = commander.colonies ? commander.colonies.length : 0;
+        const iccReward = colonyCount * 5;
+        commander.accountResources[4] += iccReward;
+
+        await playfabServer('/Server/UpdateUserData', {
+            PlayFabId: playFabId,
+            Data: { commander_data: JSON.stringify(commander) },
+            Permission: 'Private'
+        });
+
+        res.json({
+            success: true,
+            iccReward,
+            newIccBalance: commander.accountResources[4],
+            nextResetUtc: nextResetUtc.toISOString()
+        });
+    } catch (error) {
+        console.error('[Server] giftbox/claim Fehler:', error.message);
         res.status(500).json({ success: false, error: error.message });
     }
 });
