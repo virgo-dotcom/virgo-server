@@ -460,12 +460,27 @@ async function initDatabase() {
         // Startbestueckung (13.09.2026 abgesprochen) — nur einfuegen, falls
         // der item_id noch nicht existiert, damit spaetere manuelle
         // Preisaenderungen bei jedem Serverstart erhalten bleiben.
+        //
+        // GEAENDERT (18.09.2026): Die 5 alten "ressourcen"-Artikel hatten
+        // falsch verdrahtete reward_index-Werte (z.B. schrieb "Metall" in
+        // Wahrheit auf Ress01/Energie statt Ress03/Metalle — siehe
+        // ResourceNames.cs fuer die echte Reihenfolge). Alte Artikel hier
+        // deaktiviert statt geloescht (Kaufhistorie bleibt referenzierbar),
+        // neue mit korrektem Index eingefuegt. display_name ist ab jetzt nur
+        // noch Server-Doku — der Client baut den angezeigten Namen fuer
+        // reward_kind="resource" IMMER aus ResourceNames.GetName(reward_index),
+        // damit eine Umbenennung dort ueberall automatisch durchschlaegt.
+        await pool.query(
+            `UPDATE shop_items SET active = false
+             WHERE item_id IN ('res_metall', 'res_kristall', 'res_treibstoff', 'res_energie', 'res_blaupausen')`
+        );
+
         const defaultShopItems = [
-            ['res_metall',      '100.000 Metall',                'ressourcen', 100,  'resource', 0, 100000],
-            ['res_kristall',    '100.000 Kristall',              'ressourcen', 100,  'resource', 1, 100000],
-            ['res_treibstoff',  '100.000 Treibstoff',            'ressourcen', 100,  'resource', 2, 100000],
-            ['res_energie',     '100.000 Energie',               'ressourcen', 100,  'resource', 3, 100000],
-            ['res_blaupausen',  '1.000 Blaupausen',              'ressourcen', 100,  'resource', 4, 1000],
+            ['ress00', '100.000 Energie',     'ressourcen', 100, 'resource', 0, 100000],
+            ['ress01', '100.000 Wasserstoff', 'ressourcen', 100, 'resource', 1, 100000],
+            ['ress02', '100.000 Metalle',     'ressourcen', 100, 'resource', 2, 100000],
+            ['ress03', '100.000 Werkzeug',    'ressourcen', 100, 'resource', 3, 100000],
+            ['ress04', '100.000 Daten',       'ressourcen', 100, 'resource', 4, 100000],
             ['fleet_warship01', '100x Orbitaljaeger (Warship01)', 'flotten',    250,  'warship',  0, 100],
             ['fleet_warship02', '50x Raumjaeger (Warship02)',     'flotten',    250,  'warship',  1, 50],
             ['fleet_warship03', '10x Kosmosjaeger (Warship03)',   'flotten',    250,  'warship',  2, 10],
