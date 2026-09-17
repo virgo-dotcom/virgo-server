@@ -518,7 +518,62 @@ async function initDatabase() {
             );
         `);
 
-        console.log('[DB] legal_texts + support_messages + shop_items + giftbox_claims bereit.');
+        // -------------------------------------------------------
+        // NEU (18.09.): Echte Promocodes fuer ALLE Spieler (Social-Media-
+        // Aktionen), NICHT zu verwechseln mit den Admin-Cheatcodes in
+        // PromoCodePopup.cs. Ersetzt die alte, nie fertig gebaute PlayFab-
+        // CloudScript-Funktion "RedeemPromoCode" (siehe deren bekannter
+        // Planet_/planet_-Bug) komplett — laeuft jetzt wie Shop/Geschenkkiste
+        // ueber server.js/Postgres.
+        //
+        // reference_id: interner, stabiler Schluessel (z.B. "Promo00001"),
+        // bleibt auch dann gleich, wenn der oeffentliche Code sich mal
+        // aendern sollte. public_code: das, was auf Social Media steht und
+        // der Spieler eintippt (z.B. "VIRGO2026"). story_text: der Text, der
+        // in der immer gleichen Story-Sequenz-UI angezeigt wird - Belohnung
+        // ist bislang IMMER eine Account-Ressource (Ress06-10, reward_index
+        // 0-4 = Ress06-Ress10, siehe accountResources[] Konvention).
+        //
+        // promo_redemptions: gleiches Prinzip wie giftbox_claims - PRIMARY
+        // KEY (commander_id, reference_id) laesst nur den ersten Versuch
+        // gewinnen, verhindert doppelte Einloesung ganz ohne Race-Condition.
+        // -------------------------------------------------------
+        await pool.query(`
+            CREATE TABLE IF NOT EXISTS promo_codes (
+                reference_id TEXT PRIMARY KEY,
+                public_code TEXT NOT NULL UNIQUE,
+                valid_from TIMESTAMPTZ,
+                valid_until TIMESTAMPTZ,
+                story_text TEXT NOT NULL,
+                reward_index INTEGER NOT NULL,
+                reward_amount INTEGER NOT NULL,
+                active BOOLEAN NOT NULL DEFAULT true,
+                created_at TIMESTAMPTZ NOT NULL DEFAULT now()
+            );
+        `);
+        await pool.query(`
+            CREATE TABLE IF NOT EXISTS promo_redemptions (
+                commander_id INTEGER NOT NULL,
+                reference_id TEXT NOT NULL,
+                redeemed_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+                PRIMARY KEY (commander_id, reference_id)
+            );
+        `);
+
+        // Erster echter Promocode (18.09.2026 abgesprochen) - nur einfuegen,
+        // falls reference_id noch nicht existiert, damit spaetere manuelle
+        // Anpassungen (z.B. Text nachschaerfen) bei jedem Serverstart erhalten
+        // bleiben.
+        await pool.query(
+            `INSERT INTO promo_codes (reference_id, public_code, story_text, reward_index, reward_amount)
+             VALUES ($1, $2, $3, $4, $5)
+             ON CONFLICT (reference_id) DO NOTHING`,
+            ['Promo00001', 'VIRGO2026',
+             'Promocode akzeptiert.\nCommander, öffne die Kiste, um deine Belohnung zu erhalten.',
+             4, 100]
+        );
+
+        console.log('[DB] legal_texts + support_messages + shop_items + giftbox_claims + promo_codes bereit.');
 
         // Sperre gegen doppelte Flottenverarbeitung. Egal WOHER ein doppelter
         // Aufruf für dieselbe Flotte kommt (Client-Doppelklick, zwei offene
@@ -2946,6 +3001,76 @@ app.post('/giftbox/claim', async (req, res) => {
         });
     } catch (error) {
         console.error('[Server] giftbox/claim Fehler:', error.message);
+        res.status(500).json({ success: false, error: error.message });
+    }
+});
+
+// =========================================================
+// PROMOCODES (18.09.) — fuer ALLE Spieler, zeitlich begrenzt, je Account
+// nur einmal einloesbar. NICHT zu verwechseln mit den Admin-Cheatcodes
+// aus PromoCodePopup.cs (StartAdminMode!-Befehle) - diese hier sind
+// oeffentlich (Social Media) und laufen komplett serverseitig, der
+// Client kennt weder Belohnung noch Gueltigkeit im Voraus.
+// =========================================================
+app.post('/promo/redeem', async (req, res) => {
+    const { playFabId, commanderId, code } = req.body;
+    if (!playFabId || !commanderId || !code)
+        return res.status(400).json({ success: false, error: 'Fehlende Parameter' });
+
+    try {
+        const codeResult = await pool.query(
+            'SELECT * FROM promo_codes WHERE LOWER(public_code) = LOWER($1) AND active = true',
+            [code.trim()]
+        );
+        if (codeResult.rows.length === 0)
+            return res.status(404).json({ success: false, error: 'Ungültiger Code.' });
+
+        const promo = codeResult.rows[0];
+        const now = new Date();
+        if (promo.valid_from && now < new Date(promo.valid_from))
+            return res.status(400).json({ success: false, error: 'Dieser Code ist noch nicht gültig.' });
+        if (promo.valid_until && now > new Date(promo.valid_until))
+            return res.status(400).json({ success: false, error: 'Dieser Code ist abgelaufen.' });
+
+        // Atomar: nur der erste Einloese-Versuch pro Commander gewinnt.
+        const redemptionResult = await pool.query(
+            `INSERT INTO promo_redemptions (commander_id, reference_id) VALUES ($1, $2)
+             ON CONFLICT (commander_id, reference_id) DO NOTHING
+             RETURNING *`,
+            [commanderId, promo.reference_id]
+        );
+        if (redemptionResult.rowCount === 0)
+            return res.status(409).json({ success: false, error: 'Diesen Code hast du bereits eingelöst.' });
+
+        const dataResult = await playfabServer('/Server/GetUserData', {
+            PlayFabId: playFabId,
+            Keys: ['commander_data']
+        });
+        if (!dataResult.Data || !dataResult.Data['commander_data'])
+            return res.status(404).json({ success: false, error: 'Commander nicht gefunden' });
+
+        const commander = JSON.parse(dataResult.Data['commander_data'].Value);
+        if (!commander.accountResources || commander.accountResources.length < 5)
+            commander.accountResources = [0, 0, 0, 0, 0];
+
+        commander.accountResources[promo.reward_index] += promo.reward_amount;
+
+        await playfabServer('/Server/UpdateUserData', {
+            PlayFabId: playFabId,
+            Data: { commander_data: JSON.stringify(commander) },
+            Permission: 'Private'
+        });
+
+        res.json({
+            success: true,
+            referenceId: promo.reference_id,
+            storyText: promo.story_text,
+            rewardIndex: promo.reward_index,
+            rewardAmount: promo.reward_amount,
+            newBalance: commander.accountResources[promo.reward_index]
+        });
+    } catch (error) {
+        console.error('[Server] promo/redeem Fehler:', error.message);
         res.status(500).json({ success: false, error: error.message });
     }
 });
