@@ -48,6 +48,7 @@
 //  §19  resolveCombat: der eigentliche Kampf
 //  §20  Nachbereitung: Rueckflug, Mails, Flugzeit
 //  §21  Serverstart
+//  §22  Commander-ID-Vergabe (/assignCommanderId): Warteschlange, Zaehler in PlayFab
 //
 //  WICHTIGE ARBEITSREGELN FUER DIESE DATEI
 //  - Laufendes System: NICHT umsortieren, nichts loeschen ohne Pruefung.
@@ -5043,6 +5044,90 @@ async function processFleetArrival(playFabId, commander, fleet, now) {
     }
     return null;
 }
+// #####################################################################
+// §22  COMMANDER-ID-VERGABE (/assignCommanderId)
+//      Ersetzt CloudScript handlers.AssignCommanderId (nicht atomar, konnte bei
+//      gleichzeitigen Registrierungen dieselbe ID doppelt vergeben).
+//      Der ZAEHLER bleibt in PlayFab (Title Internal Data "NextCommanderId"),
+//      NICHT in Postgres - eine neu angelegte Datenbank darf IDs nie zuruecksetzen.
+//      Personenbezogene Daten werden hier nicht gespeichert (nur die Zahl).
+// #####################################################################
+
+// -------------------------------------------------------
+// Alle Vergaben laufen streng nacheinander (Warteschlange). Node fuehrt
+// JavaScript in nur EINEM Strang aus, deshalb genuegt das, solange genau
+// EINE Server-Instanz laeuft (aktuell der Fall, Render Free). ACHTUNG: Wird
+// der Dienst spaeter auf mehrere Instanzen skaliert, reicht diese
+// Warteschlange NICHT mehr - dann muss die Vergabe atomar in einer
+// Datenbank (z.B. Postgres-SEQUENCE, gegen PlayFab abgeglichen) erfolgen.
+// -------------------------------------------------------
+let commanderIdQueue = Promise.resolve();
+function runCommanderIdExclusive(task) {
+    const result = commanderIdQueue.then(task, task);
+    commanderIdQueue = result.catch(() => {});
+    return result;
+}
+
+const COMMANDER_ID_START = 1000000;
+
+async function assignCommanderIdFor(playFabId) {
+    // 1) Hat dieser Account schon eine ID? Dann dieselbe zurueckgeben (idempotent).
+    const existing = await playfabServer('/Server/GetUserInternalData',
+        { PlayFabId: playFabId, Keys: ['commanderId'] });
+    const existingValue = parseInt(existing?.Data?.commanderId?.Value, 10);
+    if (!isNaN(existingValue)) return { commanderId: existingValue, isNew: false };
+
+    // 2) Naechste freie ID: PlayFab-Zaehler, zur Sicherheit nie unter der groessten
+    //    bekannten ID im Highscore (verhindert Rueckfall, falls der Zaehler je
+    //    verloren ginge).
+    const counterData = await playfabServer('/Server/GetTitleInternalData', { Keys: ['NextCommanderId'] });
+    let nextId = parseInt(counterData?.Data?.NextCommanderId, 10);
+    if (isNaN(nextId) || nextId < COMMANDER_ID_START) nextId = COMMANDER_ID_START;
+    try {
+        const maxResult = await pool.query('SELECT MAX(commander_id) AS max_id FROM commander_highscore');
+        const maxKnown = parseInt(maxResult.rows[0]?.max_id, 10);
+        if (!isNaN(maxKnown) && maxKnown >= nextId) nextId = maxKnown + 1;
+    } catch (error) { /* Datenbank nicht erreichbar: PlayFab-Zaehler allein genuegt */ }
+
+    // 3) ERST den Zaehler erhoehen, DANN dem Spieler die ID geben. Schlaegt Schritt 4
+    //    fehl, geht nur eine Nummer verloren (Luecke), aber es entsteht nie eine
+    //    doppelte ID.
+    await playfabServer('/Server/SetTitleInternalData',
+        { Key: 'NextCommanderId', Value: String(nextId + 1) });
+
+    // 4) ID beim Spieler speichern.
+    await playfabServer('/Server/UpdateUserInternalData',
+        { PlayFabId: playFabId, Data: { commanderId: String(nextId) } });
+
+    return { commanderId: nextId, isNew: true };
+}
+
+// Identitaet ausschliesslich aus dem geprueften Anmelde-Ticket (req.auth.playFabId,
+// siehe §02) - nichts aus dem Body. Dieser Endpunkt verlangt das Ticket IMMER,
+// unabhaengig von AUTH_MODE.
+app.post('/assignCommanderId', async (req, res) => {
+    let playFabId = req.auth && req.auth.playFabId;
+    if (!playFabId) {
+        const ticket = req.get('X-Session-Ticket');
+        if (ticket) playFabId = await authenticateTicket(ticket);
+    }
+    if (!playFabId)
+        return res.status(401).json({ success: false, error: 'Nicht angemeldet.' });
+
+    try {
+        const result = await runCommanderIdExclusive(() => assignCommanderIdFor(playFabId));
+        if (result.isNew) console.log(`[Commander] ID ${result.commanderId} vergeben`);
+        res.json({
+            success: true,
+            commanderId: result.commanderId,
+            message: result.isNew ? `Commander-ID ${result.commanderId} vergeben.` : 'Bestehende Commander-ID zurueckgegeben.'
+        });
+    } catch (error) {
+        console.error('[Server] assignCommanderId Fehler:', error.message);
+        res.status(500).json({ success: false, error: 'Commander-ID konnte nicht vergeben werden.' });
+    }
+});
+
 
 // #####################################################################
 // §21  SERVERSTART (app.listen)
