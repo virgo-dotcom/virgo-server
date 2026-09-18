@@ -23,12 +23,53 @@
 //     nicht mehr den kompletten Bericht.
 // ============================================================
 
+// ============================================================
+//  INHALTSVERZEICHNIS  (Stand 19.09.2026)
+//  Zum Springen: im Editor nach dem Kuerzel suchen, z.B.  §11
+//
+//  §01  Einleitung + Inhaltsverzeichnis (diese Stelle)
+//  §02  Grundkonfiguration: CORS, PlayFab-Zugang
+//  §03  Datenbank-Setup: initDatabase() - ALLE Tabellen
+//  §04  Datenbank-Helfer: Flotten-Claim, Angriffs-Traces, Nummern
+//  §05  Kleine Basis-Endpunkte: Status, Bericht, Dev-Todos, Ankuendigungen
+//  §06  Allianzen (gross): Beitritt, Bewerbungen, Raenge, Urkunde, Admin
+//  §07  Beziehungen: Freundschaft/Krieg/Frieden (Spieler + Allianz)
+//  §08  Rechte-System: Allianz-Berechtigungen (Hilfsfunktionen)
+//  §09  Allianz-Buendnisse: propose/respond (ally, nap)
+//  §10  Admin + Support: Bug-Meldung, Admin-Cheat, AGB, Support
+//  §11  ICC-Wirtschaft: Virgo-Shop, Geschenkkiste, Promocodes
+//  §12  Angriffs-Warnung, Admin-Berichte, playfabServer()-Helfer
+//  §13  /processFleet: angekommene Flotte verarbeiten
+//  §14  Server-Tick (alle 5 Min.): laeuft fuer ALLE Spieler
+//  §15  Wirtschafts-/Highscore-Berechnung (BUILDING_ECONOMY)
+//  §16  Planeten + Highscore-Abfragen
+//  §17  Ressourcenproduktion
+//  §18  Kampf-Konstanten und -Formeln
+//  §19  resolveCombat: der eigentliche Kampf
+//  §20  Nachbereitung: Rueckflug, Mails, Flugzeit
+//  §21  Serverstart
+//
+//  WICHTIGE ARBEITSREGELN FUER DIESE DATEI
+//  - Laufendes System: NICHT umsortieren, nichts loeschen ohne Pruefung.
+//    In der Vergangenheit sind Bugs durch geaenderte Reihenfolge entstanden
+//    (Express-Routen und Tick-Ablauf sind reihenfolge-empfindlich).
+//  - Diese Abschnittsmarker und das Verzeichnis sind reine Kommentare.
+//    Neue Abschnitte: Kuerzel §22 usw. vergeben und hier eintragen.
+//  - Nach jeder Aenderung an der Server-Logik die Folgen nachpruefen
+//    (siehe Merkzettel im Obsidian/Memory: Server-Aenderungen pruefen).
+// ============================================================
+
 const express = require('express');
 const axios   = require('axios');
 const { Pool } = require('pg');
 const app     = express();
 
 app.use(express.json());
+
+// #####################################################################
+// §02  GRUNDKONFIGURATION: CORS + PlayFab-Zugang
+//      Nur Einstellungen, keine Spiellogik.
+// #####################################################################
 
 // -------------------------------------------------------
 // CORS — WICHTIG für WebGL-Builds!
@@ -51,6 +92,12 @@ app.use((req, res, next) => {
 const PLAYFAB_TITLE_ID  = '192413';
 const PLAYFAB_SECRET    = process.env.PLAYFAB_SECRET_KEY;
 const PLAYFAB_BASE_URL  = `https://${PLAYFAB_TITLE_ID}.playfabapi.com`;
+
+// #####################################################################
+// §03  DATENBANK-SETUP (initDatabase)
+//      Legt beim Serverstart ALLE Postgres-Tabellen an (CREATE TABLE IF NOT EXISTS) + nachtraegliche ALTER TABLEs.
+//      Neue Tabelle? -> hier ergaenzen, ans Ende der Funktion.
+// #####################################################################
 
 // -------------------------------------------------------
 // PostgreSQL Verbindung (Kampfberichte)
@@ -650,6 +697,10 @@ async function initDatabase() {
 }
 initDatabase();
 
+// #####################################################################
+// §04  DATENBANK-HELFER (Flotten-Claim, Angriffs-Traces, Bericht-/Mail-Nummern)
+// #####################################################################
+
 // Versucht, eine Flotte exklusiv "zu beanspruchen", bevor sie verarbeitet
 // wird. Gibt true zurück, wenn dieser Aufruf die Flotte verarbeiten darf;
 // false, wenn ein anderer Prozess sie bereits (zeitgleich) übernommen hat.
@@ -755,6 +806,10 @@ async function getReportById(reportId) {
         return null;
     }
 }
+
+// #####################################################################
+// §05  KLEINE BASIS-ENDPUNKTE (Status, Kampfbericht, Dev-Todos, Ankuendigungen, VirgoDom-Nachrichten)
+// #####################################################################
 
 // -------------------------------------------------------
 // Health Check
@@ -994,6 +1049,11 @@ app.post('/virgodom-messages', async (req, res) => {
         res.status(500).json({ success: false, error: error.message });
     }
 });
+
+// #####################################################################
+// §06  ALLIANZEN (Liste, Beitritt, Bewerbungen, Raenge, Kick/Befoerdern, Admin-Tools, Gruendungsurkunde)
+//      Reicht bis §07. Die Rechte-Helfer (allianceHasPermission u.a.) stehen weiter hinten bei §08.
+// #####################################################################
 
 // =========================================================
 // ALLIANZEN
@@ -2095,6 +2155,10 @@ app.post('/alliances/charter/:id/sign', async (req, res) => {
     }
 });
 
+// #####################################################################
+// §07  BEZIEHUNGEN (Spieler-Freundschaften/Krieg/Frieden + Allianz-Krieg/Frieden)
+// #####################################################################
+
 // =========================================================
 // SPIELER-BEZIEHUNGEN (RelationshipManager-Kern)
 // =========================================================
@@ -2355,6 +2419,12 @@ app.post('/alliance-relationships/declare-peace', async (req, res) => {
 // Nur der GRÜNDER der anfragenden/antwortenden Allianz darf das auslösen
 // (gleiche Rollen-Prüfung wie bei PUT /alliances/:id/edit).
 // -------------------------------------------------------
+// #####################################################################
+// §08  RECHTE-SYSTEM (isAllianceFounder, allianceHasPermission, Standard-Raenge, Backfill)
+//      Hilfsfunktionen, keine Endpunkte. Der Kommentarblock DAVOR (NEU 21.08., ally/nap) gehoert zu den
+//      Buendnis-Endpunkten in §09 und steht nur historisch bedingt hier.
+// #####################################################################
+
 // UMGESTELLT (22.08., Phase R2): prüft jetzt über das neue Rang-System
 // (is_founder_rank), NICHT mehr über das alte role-Textfeld — das bleibt
 // nur noch als Anzeige-Info bestehen ("Gründer"/"Mitglied" in der
@@ -2523,6 +2593,10 @@ async function backfillAllianceRanks() {
     }
 }
 
+// #####################################################################
+// §09  ALLIANZ-BUENDNISSE (propose / respond fuer ally + nap)
+// #####################################################################
+
 app.post('/alliance-relationships/propose', async (req, res) => {
     const { allianceId, targetAllianceId, requesterCommanderId, type } = req.body;
     if (!allianceId || !targetAllianceId || !requesterCommanderId || !type)
@@ -2595,6 +2669,12 @@ app.post('/alliance-relationships/respond', async (req, res) => {
         res.status(500).json({ success: false, error: error.message });
     }
 });
+
+// #####################################################################
+// §10  ADMIN + SUPPORT (Bug-Meldung, /admin/giveAccountResource, Rechtstexte/AGB, Support-Nachrichten)
+//      Der Kommentar direkt hier zu /notifyAttack gehoert zur Route in §12 (Zeile dort), nicht zu §10.
+//      ADMIN_COMMANDER_IDS steht in diesem Abschnitt.
+// #####################################################################
 
 // -------------------------------------------------------
 // Angriffs-Warnung an den Verteidiger schicken — wird vom ANGREIFER-Client
@@ -2823,6 +2903,10 @@ app.get('/supportMessages', async (req, res) => {
         res.status(500).json({ success: false, error: error.message });
     }
 });
+
+// #####################################################################
+// §11  ICC-WIRTSCHAFT (Virgo-Shop, Geschenkkiste, Promocodes)
+// #####################################################################
 
 // =========================================================
 // VIRGO SHOP (NEU, 13.09.2026)
@@ -3090,6 +3174,11 @@ app.post('/promo/redeem', async (req, res) => {
     }
 });
 
+// #####################################################################
+// §12  ANGRIFFS-WARNUNG, ADMIN-BERICHTE, playfabServer()-HELFER
+//      /notifyAttack, /admin/reports und die Hilfsfunktion playfabServer(), die viele andere Abschnitte nutzen.
+// #####################################################################
+
 app.post('/notifyAttack', async (req, res) => {
     const { fleetId, attackerCommanderId, attackerName, originCoord, destinationCoord, arrivalUtc } = req.body;
     if (!fleetId || !attackerName || !originCoord || !destinationCoord || !arrivalUtc)
@@ -3199,6 +3288,10 @@ async function playfabServer(endpoint, data) {
     return response.data.data;
 }
 
+// #####################################################################
+// §13  /processFleet (verarbeitet eine angekommene Flotte)
+// #####################################################################
+
 // -------------------------------------------------------
 // Flotte verarbeiten (Kampf, Rückflug, etc.)
 // Wird von Unity aufgerufen, sobald eine Flotte (clientseitig
@@ -3298,6 +3391,11 @@ app.post('/processFleet', async (req, res) => {
         res.status(500).json({ error: error.message });
     }
 });
+
+// #####################################################################
+// §14  SERVER-TICK (alle 5 Min. von cron-job.org) - Allianz-Punkte, Ablaeufe, serverTickHandler
+//      ACHTUNG: laeuft automatisch fuer ALLE Spieler. Aenderungen hier besonders sorgfaeltig pruefen.
+// #####################################################################
 
 // -------------------------------------------------------
 // Server Tick (alle 5 Minuten von außen aufrufen)
@@ -3540,6 +3638,11 @@ async function serverTickHandler(req, res) {
 app.post('/serverTick', serverTickHandler);
 app.get('/serverTick', serverTickHandler);
 
+// #####################################################################
+// §15  WIRTSCHAFTS- UND HIGHSCORE-BERECHNUNG (BUILDING_ECONOMY, Punkte-Formeln)
+//      BUILDING_ECONOMY muss manuell mit Unity (BuildingDefinition.cs) synchron gehalten werden.
+// #####################################################################
+
 // -------------------------------------------------------
 // Ressourcenproduktion
 // -------------------------------------------------------
@@ -3688,6 +3791,10 @@ async function updateCommanderHighscore(commander, planets, playFabId) {
         console.error(`[Server] updateCommanderHighscore Fehler (${commander.commanderId}):`, e.message);
     }
 }
+
+// #####################################################################
+// §16  PLANETEN + HIGHSCORE-ABFRAGEN (repair-ownership, Kolonien einsehen, Ranglisten)
+// #####################################################################
 
 // -------------------------------------------------------
 // Selbst-Reparatur für verwaiste Planeten — behebt genau das Szenario
@@ -3870,6 +3977,10 @@ app.get('/highscore/commanders/:commanderId', async (req, res) => {
     }
 });
 
+// #####################################################################
+// §17  RESSOURCENPRODUKTION (Produktion pro Tick, Lagerkapazitaet)
+// #####################################################################
+
 // Produktion PRO TICK (5 Sekunden) für ein Gebäude auf einer bestimmten
 // Stufe — Portierung von BuildingDefinition.GetProduction() aus Unity.
 function getProductionPerTick(buildingIndex, level) {
@@ -3987,6 +4098,10 @@ function produceResources(planet, elapsedSeconds, commander) {
 
     return planet;
 }
+
+// #####################################################################
+// §18  KAMPF-KONSTANTEN UND -FORMELN (Waffen, Schilde, Verluste, Flottenbonus, Zeit-Formatierung)
+// #####################################################################
 
 // =========================================================
 // KAMPF-HILFSFUNKTIONEN (Portierung aus CombatManager.cs)
@@ -4240,6 +4355,10 @@ async function getPlanetOwnerInfo(coord) {
         return null;
     }
 }
+
+// #####################################################################
+// §19  KAMPF AUFLOESEN (resolveCombat - groesste Einzelfunktion)
+// #####################################################################
 
 // =========================================================
 // KAMPF AUFLÖSEN
@@ -4581,6 +4700,10 @@ async function resolveCombat(attackerPlayFabId, attackerCommander, attackerFleet
     return finalReturnFleet;
 }
 
+// #####################################################################
+// §20  NACHBEREITUNG (Rueckflug, Kampf-Mails, Flugzeit, sendMail, Forschung anwenden)
+// #####################################################################
+
 function buildReturnFleet(fleet, now, warshipsRemaining, lootRessources) {
     const flightTime = calculateFlightTime(fleet.destinationCoord, fleet.originCoord, fleet.engineLevel || 1, fleet.fuelFactor || 1);
     return {
@@ -4734,6 +4857,10 @@ async function processFleetArrival(playFabId, commander, fleet, now) {
     }
     return null;
 }
+
+// #####################################################################
+// §21  SERVERSTART (app.listen)
+// #####################################################################
 
 // -------------------------------------------------------
 // Server starten
