@@ -84,6 +84,7 @@ app.use((req, res, next) => {
     res.header('Access-Control-Allow-Origin', '*');
     res.header('Access-Control-Allow-Methods', 'GET,POST,PUT,DELETE,OPTIONS');
     res.header('Access-Control-Allow-Headers', 'Content-Type, X-Session-Ticket');
+    res.header('Access-Control-Max-Age', '86400');
     if (req.method === 'OPTIONS') return res.sendStatus(204);
     next();
 });
@@ -158,7 +159,7 @@ async function authCommanderIdFor(playFabId) {
 }
 
 const AUTH_PLAYFABID_FIELDS  = ['playFabId', 'playfabId', 'senderPlayFabId'];
-const AUTH_COMMANDERID_FIELDS = ['commanderId', 'requesterCommanderId', 'senderCommanderId', 'founderCommanderId'];
+const AUTH_COMMANDERID_FIELDS = ['commanderId', 'requesterCommanderId', 'senderCommanderId', 'founderCommanderId', 'requesterId'];
 
 app.use(async (req, res, next) => {
     if (AUTH_MODE === 'off' || req.method === 'OPTIONS') return next();
@@ -177,7 +178,7 @@ app.use(async (req, res, next) => {
                 authLog(req, 'PLAYFABID-ABWEICHUNG', `Feld ${field}`);
         }
         for (const field of AUTH_COMMANDERID_FIELDS) {
-            const claimed = body[field];
+            const claimed = body[field] !== undefined ? body[field] : (req.query || {})[field];
             if (claimed === undefined || claimed === null) continue;
             const actual = await authCommanderIdFor(playFabId);
             if (actual !== null && Number(claimed) !== Number(actual))
