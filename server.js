@@ -3049,7 +3049,10 @@ app.put('/legal-texts/:key', async (req, res) => {
 // einsehen) ist nur für Admin-Accounts.
 // -------------------------------------------------------
 app.post('/supportMessage', async (req, res) => {
-    const { senderCommanderId, senderName, senderEmail, message } = req.body;
+    // Datenschutz (19.09.2026): eine evtl. mitgeschickte E-Mail-Adresse wird bewusst
+    // IGNORIERT und nicht gespeichert (Personendaten nur in PlayFab). Die Spalte
+    // sender_email bleibt vorerst bestehen, wird aber nicht mehr befuellt.
+    const { senderCommanderId, senderName, message } = req.body;
 
     if (!message || !message.trim())
         return res.status(400).json({ success: false, error: 'Nachricht darf nicht leer sein.' });
@@ -3058,9 +3061,9 @@ app.post('/supportMessage', async (req, res) => {
 
     try {
         const result = await pool.query(
-            `INSERT INTO support_messages (sender_commander_id, sender_name, sender_email, message)
-             VALUES ($1, $2, $3, $4) RETURNING *`,
-            [senderCommanderId || null, senderName || null, senderEmail || null, message.trim()]
+            `INSERT INTO support_messages (sender_commander_id, sender_name, message)
+             VALUES ($1, $2, $3) RETURNING *`,
+            [senderCommanderId || null, senderName || null, message.trim()]
         );
         res.json({ success: true, supportMessage: result.rows[0] });
     } catch (error) {
