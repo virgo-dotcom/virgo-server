@@ -95,16 +95,27 @@ const PLAYFAB_SECRET    = process.env.PLAYFAB_SECRET_KEY;
 const PLAYFAB_BASE_URL  = `https://${PLAYFAB_TITLE_ID}.playfabapi.com`;
 
 // -------------------------------------------------------
-// AUTHENTIFIZIERUNG - STUFE 1 (19.09.2026): NUR BEOBACHTEN, BLOCKIERT NICHTS.
+// AUTHENTIFIZIERUNG (19.09.2026)
 // Der Client schickt sein PlayFab-Anmeldeticket im Header X-Session-Ticket.
 // Der Server prueft es bei PlayFab (AuthenticateSessionTicket) und vergleicht
-// die dadurch BEWIESENE Identitaet mit den Angaben im Request-Body. Abweichungen
-// und fehlende Tickets werden nur ins Log geschrieben (Praefix [Auth]).
-// AUTH_MODE (Render-Umgebungsvariable): off = aus, log = beobachten (Standard).
-// 'enforce' ist erst in Stufe 4 vorgesehen und verhaelt sich bis dahin wie 'log'.
+// die dadurch BEWIESENE Identitaet mit den Angaben in Body und URL.
+//
+// Render-Umgebungsvariablen:
+//   AUTH_MODE    off     = komplett aus (Notausschalter)
+//                log     = beobachten, nur ins Log schreiben, blockiert NICHTS (Standard)
+//                enforce = die in AUTH_ENFORCE genannten Gruppen wirklich erzwingen
+//   AUTH_ENFORCE Kommagetrennte Gruppen, z.B. "admin" oder "admin,player".
+//                Leer = nichts wird erzwungen, auch nicht bei AUTH_MODE=enforce.
+//
+// Gruppen (siehe AUTH_POLICY): public, keyed, internal = keine Ticket-Pruefung;
+// player = gueltiges Ticket + Identitaets-Angaben muessen zum Ticket passen;
+// admin  = wie player + bewiesener Commander muss in ADMIN_COMMANDER_IDS stehen.
+// Neue Endpunkte fallen automatisch in 'player' (sicher als Standard).
 // Es werden keine Tickets und keine Klartext-Personendaten geloggt.
 // -------------------------------------------------------
 const AUTH_MODE = (process.env.AUTH_MODE || 'log').toLowerCase();
+const AUTH_ENFORCE_GROUPS = (process.env.AUTH_ENFORCE || '')
+    .split(',').map(s => s.trim().toLowerCase()).filter(Boolean);
 const AUTH_TICKET_TTL_MS    = 5 * 60 * 1000;
 const AUTH_COMMANDER_TTL_MS = 10 * 60 * 1000;
 const AUTH_CACHE_MAX        = 5000;
@@ -112,13 +123,38 @@ const authTicketCache    = new Map(); // ticket -> { playFabId, expires }
 const authCommanderCache = new Map(); // playFabId -> { commanderId, expires }
 const authLogThrottle    = new Map(); // logKey -> letzte Ausgabe (ms)
 
-function authLog(req, reason, detail) {
+// Reihenfolge wichtig: der ERSTE passende Eintrag gewinnt.
+const AUTH_POLICY = [
+    ['*',    /^\/$/,                           'public'],   // Startseite / Render-Healthcheck
+    ['GET',  /^\/legal-texts$/,                'public'],   // AGB muessen VOR dem Login lesbar sein
+    ['POST', /^\/supportMessage$/,             'public'],   // Support-Formular auch ohne Login
+    ['*',    /^\/serverTick$/,                 'internal'], // cron-job.org, kein Spieler-Ticket
+    ['*',    /^\/devtodos(\/.*)?$/,            'keyed'],    // eigener ADMIN_KEY
+    ['GET',  /^\/admin\/reports$/,             'keyed'],    // eigener ADMIN_KEY
+    ['POST', /^\/admin\/giveAccountResource$/, 'admin'],
+    ['*',    /^\/alliances\/admin\/.+/,        'admin'],
+    ['PUT',  /^\/legal-texts\/.+/,             'admin'],
+    ['GET',  /^\/supportMessages$/,            'admin'],
+    ['POST', /^\/announcements$/,              'admin'],
+    ['PUT',  /^\/announcements\/\d+\/done$/,   'admin'],
+    ['POST', /^\/virgodom-messages$/,          'admin'],
+    ['*',    /^\/.*/,                          'player']    // alles andere
+];
+
+function authGroupFor(req) {
+    for (const [method, pattern, group] of AUTH_POLICY) {
+        if ((method === '*' || method === req.method) && pattern.test(req.path)) return group;
+    }
+    return 'player';
+}
+
+function authLog(req, reason, detail, blocked) {
     const key = `${req.method} ${req.path} ${reason}`;
     const now = Date.now();
     if (now - (authLogThrottle.get(key) || 0) < 60000) return;
     if (authLogThrottle.size > AUTH_CACHE_MAX) authLogThrottle.clear();
     authLogThrottle.set(key, now);
-    console.warn(`[Auth][${AUTH_MODE}] ${key}${detail ? ' - ' + detail : ''}`);
+    console.warn(`[Auth][${blocked ? 'BLOCKIERT' : AUTH_MODE}] ${key}${detail ? ' - ' + detail : ''}`);
 }
 
 async function authenticateTicket(ticket) {
@@ -141,55 +177,104 @@ async function authenticateTicket(ticket) {
     }
 }
 
+// Commander-ID eines Spielers: PlayFab (UserInternalData "commanderId") ist die
+// Quelle der Wahrheit; commander_highscore dient nur als Rueckfall.
 async function authCommanderIdFor(playFabId) {
     const cached = authCommanderCache.get(playFabId);
     if (cached && cached.expires > Date.now()) return cached.commanderId;
+    let commanderId = null;
     try {
-        const result = await pool.query(
-            'SELECT commander_id FROM commander_highscore WHERE playfab_id = $1', [playFabId]);
-        const commanderId = result.rows.length > 0 ? result.rows[0].commander_id : null;
-        if (commanderId !== null) {
-            if (authCommanderCache.size > AUTH_CACHE_MAX) authCommanderCache.clear();
-            authCommanderCache.set(playFabId, { commanderId, expires: Date.now() + AUTH_COMMANDER_TTL_MS });
-        }
-        return commanderId;
-    } catch (error) {
-        return null;
+        const response = await axios.post(
+            `${PLAYFAB_BASE_URL}/Server/GetUserInternalData`,
+            { PlayFabId: playFabId, Keys: ['commanderId'] },
+            { headers: { 'Content-Type': 'application/json', 'X-SecretKey': PLAYFAB_SECRET }, timeout: 5000 }
+        );
+        const value = parseInt(response.data?.data?.Data?.commanderId?.Value, 10);
+        if (!isNaN(value)) commanderId = value;
+    } catch (error) { /* Rueckfall unten */ }
+    if (commanderId === null) {
+        try {
+            const result = await pool.query(
+                'SELECT commander_id FROM commander_highscore WHERE playfab_id = $1', [playFabId]);
+            if (result.rows.length > 0) commanderId = result.rows[0].commander_id;
+        } catch (error) { /* bleibt null */ }
     }
+    if (commanderId !== null) {
+        if (authCommanderCache.size > AUTH_CACHE_MAX) authCommanderCache.clear();
+        authCommanderCache.set(playFabId, { commanderId, expires: Date.now() + AUTH_COMMANDER_TTL_MS });
+    }
+    return commanderId;
 }
 
-const AUTH_PLAYFABID_FIELDS  = ['playFabId', 'playfabId', 'senderPlayFabId'];
+const AUTH_PLAYFABID_FIELDS   = ['playFabId', 'playfabId', 'senderPlayFabId'];
 const AUTH_COMMANDERID_FIELDS = ['commanderId', 'requesterCommanderId', 'senderCommanderId', 'founderCommanderId', 'requesterId'];
+
+// Gibt null zurueck, wenn alles passt, sonst { reason, detail }.
+async function authCheckClaims(req, playFabId, group) {
+    const body  = req.body  || {};
+    const query = req.query || {};
+    const claimedValue = (field) => body[field] !== undefined ? body[field] : query[field];
+
+    for (const field of AUTH_PLAYFABID_FIELDS) {
+        const claimed = claimedValue(field);
+        if (claimed && claimed !== playFabId)
+            return { reason: 'PLAYFABID-ABWEICHUNG', detail: `Feld ${field}` };
+    }
+
+    let actual;
+    for (const field of AUTH_COMMANDERID_FIELDS) {
+        const claimed = claimedValue(field);
+        if (claimed === undefined || claimed === null || claimed === '') continue;
+        if (actual === undefined) actual = await authCommanderIdFor(playFabId);
+        if (actual === null)
+            return { reason: 'COMMANDERID-NICHT-PRUEFBAR', detail: `Feld ${field}` };
+        if (Number(claimed) !== Number(actual))
+            return { reason: 'COMMANDERID-ABWEICHUNG', detail: `Feld ${field}, behauptet ${claimed}, bewiesen ${actual}` };
+    }
+
+    if (group === 'admin') {
+        if (actual === undefined) actual = await authCommanderIdFor(playFabId);
+        if (actual === null || !ADMIN_COMMANDER_IDS.includes(Number(actual)))
+            return { reason: 'ADMIN-NICHT-BEWIESEN' };
+    }
+    return null;
+}
 
 app.use(async (req, res, next) => {
     if (AUTH_MODE === 'off' || req.method === 'OPTIONS') return next();
+    const group = authGroupFor(req);
+    req.auth = { playFabId: null, group };
+    if (group === 'public' || group === 'keyed' || group === 'internal') return next();
+
+    const enforcing = AUTH_MODE === 'enforce' && AUTH_ENFORCE_GROUPS.includes(group);
+    let problem = null;
     try {
-        req.auth = { playFabId: null };
         const ticket = req.get('X-Session-Ticket');
-        if (!ticket) { authLog(req, 'KEIN-TICKET'); return next(); }
-
-        const playFabId = await authenticateTicket(ticket);
-        if (!playFabId) { authLog(req, 'TICKET-UNGUELTIG'); return next(); }
-        req.auth.playFabId = playFabId;
-
-        const body = req.body || {};
-        for (const field of AUTH_PLAYFABID_FIELDS) {
-            if (body[field] && body[field] !== playFabId)
-                authLog(req, 'PLAYFABID-ABWEICHUNG', `Feld ${field}`);
-        }
-        for (const field of AUTH_COMMANDERID_FIELDS) {
-            const claimed = body[field] !== undefined ? body[field] : (req.query || {})[field];
-            if (claimed === undefined || claimed === null) continue;
-            const actual = await authCommanderIdFor(playFabId);
-            if (actual !== null && Number(claimed) !== Number(actual))
-                authLog(req, 'COMMANDERID-ABWEICHUNG', `Feld ${field}, behauptet ${claimed}, bewiesen ${actual}`);
+        if (!ticket) {
+            problem = { reason: 'KEIN-TICKET' };
+        } else {
+            const playFabId = await authenticateTicket(ticket);
+            if (!playFabId) {
+                problem = { reason: 'TICKET-UNGUELTIG' };
+            } else {
+                req.auth.playFabId = playFabId;
+                problem = await authCheckClaims(req, playFabId, group);
+            }
         }
     } catch (error) {
-        console.error('[Auth] Middleware-Fehler (Anfrage laeuft normal weiter):', error.message);
+        console.error('[Auth] Middleware-Fehler:', error.message);
+        if (!enforcing) return next();
+        problem = { reason: 'PRUEFUNG-FEHLGESCHLAGEN' };
     }
-    next();
+
+    if (!problem) return next();
+    authLog(req, `${problem.reason} [${group}]`, problem.detail, enforcing);
+    if (!enforcing) return next();
+    const unauthenticated = problem.reason === 'KEIN-TICKET' || problem.reason === 'TICKET-UNGUELTIG';
+    return res.status(unauthenticated ? 401 : 403)
+        .json({ success: false, error: 'Nicht autorisiert.', code: problem.reason });
 });
-console.log(`[Auth] Modus: ${AUTH_MODE}${AUTH_MODE === 'enforce' ? ' (Erzwingen noch nicht aktiv - verhaelt sich wie log)' : ''}`);
+console.log(`[Auth] Modus: ${AUTH_MODE}, erzwungene Gruppen: ${AUTH_ENFORCE_GROUPS.length ? AUTH_ENFORCE_GROUPS.join(',') : '(keine)'}`);
 
 // #####################################################################
 // §03  DATENBANK-SETUP (initDatabase)
