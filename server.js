@@ -3668,7 +3668,34 @@ async function expireOldApplications(log) {
     }
 }
 
+// -------------------------------------------------------
+// Schutz fuer /serverTick (19.09.2026): Der Tick verarbeitet ALLE Spieler und
+// war bisher fuer jeden im Internet aufrufbar. Jetzt muss der Aufrufer (cron-job.org)
+// einen geheimen Schluessel im Header X-Tick-Key mitschicken. Der Schluessel steht
+// NUR in der Render-Umgebungsvariable SERVERTICK_KEY und im cron-job-Header, nie im Code.
+// Ist SERVERTICK_KEY noch nicht gesetzt, laeuft der Tick wie bisher (Uebergang),
+// mit einer Warnung im Log.
+// -------------------------------------------------------
+const crypto = require('crypto');
+let serverTickOpenWarned = false;
+function serverTickAuthorized(req) {
+    const expected = process.env.SERVERTICK_KEY;
+    if (!expected) {
+        if (!serverTickOpenWarned) {
+            serverTickOpenWarned = true;
+            console.warn('[Tick] WARNUNG: SERVERTICK_KEY ist nicht gesetzt - /serverTick ist ungeschuetzt!');
+        }
+        return true;
+    }
+    const given = Buffer.from(String(req.get('X-Tick-Key') || ''));
+    const wanted = Buffer.from(expected);
+    return given.length === wanted.length && crypto.timingSafeEqual(given, wanted);
+}
+
 async function serverTickHandler(req, res) {
+    if (!serverTickAuthorized(req))
+        return res.status(401).json({ success: false, error: 'Nicht autorisiert.' });
+
     const log = [];
     const now = new Date();
 
