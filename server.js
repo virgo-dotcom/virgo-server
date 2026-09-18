@@ -28,7 +28,7 @@
 //  Zum Springen: im Editor nach dem Kuerzel suchen, z.B.  §11
 //
 //  §01  Einleitung + Inhaltsverzeichnis (diese Stelle)
-//  §02  Grundkonfiguration: CORS, PlayFab-Zugang
+//  §02  Grundkonfiguration: CORS, PlayFab-Zugang, Authentifizierung (Stufe 1, nur beobachten)
 //  §03  Datenbank-Setup: initDatabase() - ALLE Tabellen
 //  §04  Datenbank-Helfer: Flotten-Claim, Angriffs-Traces, Nummern
 //  §05  Kleine Basis-Endpunkte: Status, Bericht, Dev-Todos, Ankuendigungen
@@ -68,7 +68,7 @@ app.use(express.json());
 
 // #####################################################################
 // §02  GRUNDKONFIGURATION: CORS + PlayFab-Zugang
-//      Nur Einstellungen, keine Spiellogik.
+//      Einstellungen + Ticket-Pruefung im Beobachtungsmodus (AUTH_MODE), keine Spiellogik.
 // #####################################################################
 
 // -------------------------------------------------------
@@ -83,7 +83,7 @@ app.use(express.json());
 app.use((req, res, next) => {
     res.header('Access-Control-Allow-Origin', '*');
     res.header('Access-Control-Allow-Methods', 'GET,POST,PUT,DELETE,OPTIONS');
-    res.header('Access-Control-Allow-Headers', 'Content-Type');
+    res.header('Access-Control-Allow-Headers', 'Content-Type, X-Session-Ticket');
     if (req.method === 'OPTIONS') return res.sendStatus(204);
     next();
 });
@@ -92,6 +92,103 @@ app.use((req, res, next) => {
 const PLAYFAB_TITLE_ID  = '192413';
 const PLAYFAB_SECRET    = process.env.PLAYFAB_SECRET_KEY;
 const PLAYFAB_BASE_URL  = `https://${PLAYFAB_TITLE_ID}.playfabapi.com`;
+
+// -------------------------------------------------------
+// AUTHENTIFIZIERUNG - STUFE 1 (19.09.2026): NUR BEOBACHTEN, BLOCKIERT NICHTS.
+// Der Client schickt sein PlayFab-Anmeldeticket im Header X-Session-Ticket.
+// Der Server prueft es bei PlayFab (AuthenticateSessionTicket) und vergleicht
+// die dadurch BEWIESENE Identitaet mit den Angaben im Request-Body. Abweichungen
+// und fehlende Tickets werden nur ins Log geschrieben (Praefix [Auth]).
+// AUTH_MODE (Render-Umgebungsvariable): off = aus, log = beobachten (Standard).
+// 'enforce' ist erst in Stufe 4 vorgesehen und verhaelt sich bis dahin wie 'log'.
+// Es werden keine Tickets und keine Klartext-Personendaten geloggt.
+// -------------------------------------------------------
+const AUTH_MODE = (process.env.AUTH_MODE || 'log').toLowerCase();
+const AUTH_TICKET_TTL_MS    = 5 * 60 * 1000;
+const AUTH_COMMANDER_TTL_MS = 10 * 60 * 1000;
+const AUTH_CACHE_MAX        = 5000;
+const authTicketCache    = new Map(); // ticket -> { playFabId, expires }
+const authCommanderCache = new Map(); // playFabId -> { commanderId, expires }
+const authLogThrottle    = new Map(); // logKey -> letzte Ausgabe (ms)
+
+function authLog(req, reason, detail) {
+    const key = `${req.method} ${req.path} ${reason}`;
+    const now = Date.now();
+    if (now - (authLogThrottle.get(key) || 0) < 60000) return;
+    if (authLogThrottle.size > AUTH_CACHE_MAX) authLogThrottle.clear();
+    authLogThrottle.set(key, now);
+    console.warn(`[Auth][${AUTH_MODE}] ${key}${detail ? ' - ' + detail : ''}`);
+}
+
+async function authenticateTicket(ticket) {
+    const cached = authTicketCache.get(ticket);
+    if (cached && cached.expires > Date.now()) return cached.playFabId;
+    try {
+        const response = await axios.post(
+            `${PLAYFAB_BASE_URL}/Server/AuthenticateSessionTicket`,
+            { SessionTicket: ticket },
+            { headers: { 'Content-Type': 'application/json', 'X-SecretKey': PLAYFAB_SECRET }, timeout: 5000 }
+        );
+        const playFabId = response.data?.data?.UserInfo?.PlayFabId || null;
+        if (playFabId) {
+            if (authTicketCache.size > AUTH_CACHE_MAX) authTicketCache.clear();
+            authTicketCache.set(ticket, { playFabId, expires: Date.now() + AUTH_TICKET_TTL_MS });
+        }
+        return playFabId;
+    } catch (error) {
+        return null;
+    }
+}
+
+async function authCommanderIdFor(playFabId) {
+    const cached = authCommanderCache.get(playFabId);
+    if (cached && cached.expires > Date.now()) return cached.commanderId;
+    try {
+        const result = await pool.query(
+            'SELECT commander_id FROM commander_highscore WHERE playfab_id = $1', [playFabId]);
+        const commanderId = result.rows.length > 0 ? result.rows[0].commander_id : null;
+        if (commanderId !== null) {
+            if (authCommanderCache.size > AUTH_CACHE_MAX) authCommanderCache.clear();
+            authCommanderCache.set(playFabId, { commanderId, expires: Date.now() + AUTH_COMMANDER_TTL_MS });
+        }
+        return commanderId;
+    } catch (error) {
+        return null;
+    }
+}
+
+const AUTH_PLAYFABID_FIELDS  = ['playFabId', 'playfabId', 'senderPlayFabId'];
+const AUTH_COMMANDERID_FIELDS = ['commanderId', 'requesterCommanderId', 'senderCommanderId', 'founderCommanderId'];
+
+app.use(async (req, res, next) => {
+    if (AUTH_MODE === 'off' || req.method === 'OPTIONS') return next();
+    try {
+        req.auth = { playFabId: null };
+        const ticket = req.get('X-Session-Ticket');
+        if (!ticket) { authLog(req, 'KEIN-TICKET'); return next(); }
+
+        const playFabId = await authenticateTicket(ticket);
+        if (!playFabId) { authLog(req, 'TICKET-UNGUELTIG'); return next(); }
+        req.auth.playFabId = playFabId;
+
+        const body = req.body || {};
+        for (const field of AUTH_PLAYFABID_FIELDS) {
+            if (body[field] && body[field] !== playFabId)
+                authLog(req, 'PLAYFABID-ABWEICHUNG', `Feld ${field}`);
+        }
+        for (const field of AUTH_COMMANDERID_FIELDS) {
+            const claimed = body[field];
+            if (claimed === undefined || claimed === null) continue;
+            const actual = await authCommanderIdFor(playFabId);
+            if (actual !== null && Number(claimed) !== Number(actual))
+                authLog(req, 'COMMANDERID-ABWEICHUNG', `Feld ${field}, behauptet ${claimed}, bewiesen ${actual}`);
+        }
+    } catch (error) {
+        console.error('[Auth] Middleware-Fehler (Anfrage laeuft normal weiter):', error.message);
+    }
+    next();
+});
+console.log(`[Auth] Modus: ${AUTH_MODE}${AUTH_MODE === 'enforce' ? ' (Erzwingen noch nicht aktiv - verhaelt sich wie log)' : ''}`);
 
 // #####################################################################
 // §03  DATENBANK-SETUP (initDatabase)
