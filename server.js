@@ -49,6 +49,7 @@
 //  §20  Nachbereitung: Rueckflug, Mails, Flugzeit
 //  §21  Serverstart
 //  §22  Commander-ID-Vergabe (/assignCommanderId): Warteschlange, Zaehler in PlayFab
+//  §23  Account-Daten loeschen (DSGVO, /account/delete-data): nur Postgres-Seite, noch nicht angebunden
 //
 //  WICHTIGE ARBEITSREGELN FUER DIESE DATEI
 //  - Laufendes System: NICHT umsortieren, nichts loeschen ohne Pruefung.
@@ -5152,6 +5153,115 @@ app.post('/assignCommanderId', async (req, res) => {
     } catch (error) {
         console.error('[Server] assignCommanderId Fehler:', error.message);
         res.status(500).json({ success: false, error: 'Commander-ID konnte nicht vergeben werden.' });
+    }
+});
+
+// #####################################################################
+// §23  ACCOUNT-DATEN LOESCHEN (DSGVO, /account/delete-data)
+//      Raeumt die POSTGRES-Seite eines Accounts auf. Die PlayFab-Seite
+//      (Konto, Spielstand, Planeten, Chat) ist NICHT Teil dieses Endpunkts.
+//      Identitaet nur aus dem geprueften Anmelde-Ticket, nichts aus dem Body.
+//      STAND 19.09.2026: Endpunkt ist gebaut, aber noch von KEINEM Client
+//      aufgerufen (Unity-Anbindung + PlayFab-Teil folgen nach Absprache).
+//
+//      Grundsatz: Zeilen mit Personenbezug werden GELOESCHT; Zeilen, die fuer
+//      andere Spieler noetig sind (Unterschriften einer Gruendungsurkunde),
+//      werden ANONYMISIERT (Name -> "Geloeschter Commander").
+//      Bewusst NICHT angefasst (offene Entscheidung): combat_reports und
+//      attack_traces (enthalten nur Commander-IDs; Namen im Berichtstext?),
+//      promo_redemptions (nur Zahl, verhindert doppelte Einloesung).
+// #####################################################################
+
+const DELETED_COMMANDER_NAME = 'Gelöschter Commander'; // LOCALIZE
+
+async function deleteAccountDataFor(playFabId, commanderId) {
+    const client = await pool.connect();
+    const summary = {};
+    try {
+        await client.query('BEGIN');
+
+        if (commanderId !== null) {
+            // 1) Allianz: Gruender mit weiteren Mitgliedern darf nicht einfach gehen
+            //    (gleiche Regel wie /alliances/:id/leave).
+            const memberResult = await client.query(
+                `SELECT m.alliance_id, r.is_founder_rank,
+                        (SELECT COUNT(*) FROM alliance_members x WHERE x.alliance_id = m.alliance_id) AS cnt
+                 FROM alliance_members m LEFT JOIN alliance_ranks r ON r.id = m.rank_id
+                 WHERE m.commander_id = $1`, [commanderId]);
+            if (memberResult.rows.length > 0) {
+                const row = memberResult.rows[0];
+                if (row.is_founder_rank && parseInt(row.cnt, 10) > 1) {
+                    await client.query('ROLLBACK');
+                    return { blocked: 'Als Gründer musst du den Rang erst an ein anderes Mitglied übergeben oder die Allianz auflösen, bevor du deinen Account löschen kannst.' }; // LOCALIZE
+                }
+                await client.query('DELETE FROM alliance_members WHERE commander_id = $1', [commanderId]);
+                const left = await client.query(
+                    'SELECT COUNT(*) AS cnt FROM alliance_members WHERE alliance_id = $1', [row.alliance_id]);
+                if (parseInt(left.rows[0].cnt, 10) === 0) {
+                    await client.query('DELETE FROM alliances WHERE id = $1', [row.alliance_id]);
+                    summary.allianceDissolved = true;
+                }
+            }
+
+            const applications = await client.query(
+                'DELETE FROM alliance_applications WHERE commander_id = $1', [commanderId]);
+            summary.applications = applications.rowCount;
+
+            const signatures = await client.query(
+                'UPDATE alliance_charter_signatures SET signer_name = $2 WHERE signer_commander_id = $1',
+                [commanderId, DELETED_COMMANDER_NAME]);
+            summary.charterSignaturesAnonymized = signatures.rowCount;
+            const charters = await client.query(
+                'UPDATE alliance_charters SET founder_name = $2 WHERE founder_commander_id = $1',
+                [commanderId, DELETED_COMMANDER_NAME]);
+            summary.chartersAnonymized = charters.rowCount;
+
+            const relationships = await client.query(
+                'DELETE FROM player_relationships WHERE commander_id_a = $1 OR commander_id_b = $1', [commanderId]);
+            summary.relationships = relationships.rowCount;
+
+            const support = await client.query(
+                'UPDATE support_messages SET sender_name = NULL, sender_email = NULL, sender_commander_id = NULL WHERE sender_commander_id = $1',
+                [commanderId]);
+            summary.supportMessagesAnonymized = support.rowCount;
+        }
+
+        const highscore = await client.query(
+            'DELETE FROM commander_highscore WHERE playfab_id = $1 OR commander_id = $2', [playFabId, commanderId]);
+        summary.highscore = highscore.rowCount;
+
+        const giftbox = await client.query('DELETE FROM giftbox_claims WHERE playfab_id = $1', [playFabId]);
+        summary.giftboxClaims = giftbox.rowCount;
+
+        await client.query('COMMIT');
+        return { summary };
+    } catch (error) {
+        try { await client.query('ROLLBACK'); } catch (e) { /* ignorieren */ }
+        throw error;
+    } finally {
+        client.release();
+    }
+}
+
+app.post('/account/delete-data', async (req, res) => {
+    let playFabId = req.auth && req.auth.playFabId;
+    if (!playFabId) {
+        const ticket = req.get('X-Session-Ticket');
+        if (ticket) playFabId = await authenticateTicket(ticket);
+    }
+    if (!playFabId)
+        return res.status(401).json({ success: false, error: 'Nicht angemeldet.' });
+
+    try {
+        const commanderId = await authCommanderIdFor(playFabId);
+        const result = await deleteAccountDataFor(playFabId, commanderId);
+        if (result.blocked)
+            return res.status(409).json({ success: false, error: result.blocked });
+        console.log('[Account] Postgres-Daten eines Accounts geloescht');
+        res.json({ success: true, summary: result.summary });
+    } catch (error) {
+        console.error('[Server] account/delete-data Fehler:', error.message);
+        res.status(500).json({ success: false, error: 'Daten konnten nicht gelöscht werden.' });
     }
 });
 
