@@ -547,10 +547,16 @@ async function initDatabase() {
                 story_text TEXT NOT NULL,
                 reward_index INTEGER NOT NULL,
                 reward_amount INTEGER NOT NULL,
+                crate_image_index INTEGER NOT NULL DEFAULT 0,
                 active BOOLEAN NOT NULL DEFAULT true,
                 created_at TIMESTAMPTZ NOT NULL DEFAULT now()
             );
         `);
+        // NEU (18.09.): welche der 10 Kisten-Grafiken (Crate 00-09) die
+        // Story-Sequenz fuer diesen Code zeigt - pro Code frei waehlbar,
+        // gleiches Prinzip wie shopResourceButtonSprites beim Shop. Als
+        // ALTER ergaenzt, falls die Tabelle schon vor dieser Spalte existierte.
+        await pool.query(`ALTER TABLE promo_codes ADD COLUMN IF NOT EXISTS crate_image_index INTEGER NOT NULL DEFAULT 0;`);
         await pool.query(`
             CREATE TABLE IF NOT EXISTS promo_redemptions (
                 commander_id INTEGER NOT NULL,
@@ -565,12 +571,20 @@ async function initDatabase() {
         // Anpassungen (z.B. Text nachschaerfen) bei jedem Serverstart erhalten
         // bleiben.
         await pool.query(
-            `INSERT INTO promo_codes (reference_id, public_code, story_text, reward_index, reward_amount)
-             VALUES ($1, $2, $3, $4, $5)
+            `INSERT INTO promo_codes (reference_id, public_code, story_text, reward_index, reward_amount, crate_image_index)
+             VALUES ($1, $2, $3, $4, $5, $6)
              ON CONFLICT (reference_id) DO NOTHING`,
             ['Promo00001', 'VIRGO2026',
              'Promocode akzeptiert.\nCommander, öffne die Kiste, um deine Belohnung zu erhalten.',
-             4, 100]
+             4, 100, 9]
+        );
+        // Einmaliger Nachtrag (18.09.): Promo00001 existierte schon, bevor es
+        // crate_image_index gab (kam per default auf 0 rein) - hier auf die
+        // gewuenschte Kiste 9 (Crate 09.png) nachziehen. Nur fuer DIESEN
+        // einen Code, kuenftige neue Codes bekommen ihren Wert schon beim
+        // INSERT oben richtig.
+        await pool.query(
+            `UPDATE promo_codes SET crate_image_index = 9 WHERE reference_id = 'Promo00001' AND crate_image_index != 9`
         );
 
         console.log('[DB] legal_texts + support_messages + shop_items + giftbox_claims + promo_codes bereit.');
@@ -3067,6 +3081,7 @@ app.post('/promo/redeem', async (req, res) => {
             storyText: promo.story_text,
             rewardIndex: promo.reward_index,
             rewardAmount: promo.reward_amount,
+            crateImageIndex: promo.crate_image_index,
             newBalance: commander.accountResources[promo.reward_index]
         });
     } catch (error) {
