@@ -134,6 +134,7 @@ const AUTH_POLICY = [
     ['*',    /^\/devtodos(\/.*)?$/,            'keyed'],    // eigener ADMIN_KEY
     ['GET',  /^\/admin\/reports$/,             'keyed'],    // eigener ADMIN_KEY
     ['POST', /^\/admin\/giveAccountResource$/, 'admin'],
+    ['POST', /^\/admin\/inspectPlayer$/,       'admin'],
     ['*',    /^\/alliances\/admin\/.+/,        'admin'],
     ['PUT',  /^\/legal-texts\/.+/,             'admin'],
     ['GET',  /^\/supportMessages$/,            'admin'],
@@ -5393,6 +5394,236 @@ app.post('/account/delete', async (req, res) => {
     } catch (error) {
         console.error('[Server] account/delete Fehler:', error.message);
         res.status(500).json({ success: false, error: 'Der Account konnte nicht gelöscht werden. Bitte später erneut versuchen.' }); // LOCALIZE
+    }
+});
+
+// #####################################################################
+// §24  ADMIN: SPIELER-INFO (/admin/inspectPlayer)
+//      Zeigt einem Admin ALLE zu einer Commander-ID (oder PlayFab-ID) gespeicherten
+//      Daten als Text: PlayFab-Konto, Spieldaten, interne Daten, Kolonien,
+//      Postgres-Zeilen. Gedacht zum Pruefen VOR und NACH einer Konto-Loeschung.
+//      Nur fuer Admins (Commander-ID aus dem Ticket muss in ADMIN_COMMANDER_IDS stehen).
+//      Der Bericht wird NICHT geloggt (enthaelt personenbezogene Daten).
+//      Eingabe: "1000005"  oder  "1405316AFCC3DEDE"  optional gefolgt von Koordinaten
+//      ("1000005 1:1:1:1 1:1:1:2"), damit auch NACH einer Loeschung die Kolonien
+//      geprueft werden koennen.
+// #####################################################################
+
+function parseInspectQuery(rawQuery) {
+    const tokens = String(rawQuery || '').trim().split(/[\s,;]+/).filter(Boolean);
+    if (tokens.length === 0) return null;
+    const first = tokens[0];
+    const coords = tokens.slice(1).filter(t => /^\d{1,5}:\d{1,5}:\d{1,5}:\d{1,5}$/.test(t));
+    if (/^\d{1,8}$/.test(first)) return { commanderId: parseInt(first, 10), playFabId: null, coords };
+    if (/^[0-9A-Fa-f]{8,20}$/.test(first)) return { commanderId: null, playFabId: first.toUpperCase(), coords };
+    return null;
+}
+
+function inspectErrorText(error) {
+    return (error && error.response && error.response.data && error.response.data.errorMessage) || (error && error.message) || 'unbekannter Fehler';
+}
+
+async function buildPlayerInspectionReport(rawQuery) {
+    const parsed = parseInspectQuery(rawQuery);
+    if (!parsed) return 'Eingabe nicht erkannt.\nBitte eine Commander-ID (z.B. 1000005) oder eine PlayFab-ID eingeben.\nOptional danach Koordinaten, z.B.: 1000005 1:1:1:1 1:1:1:2';
+
+    const out = [];
+    const add = (line = '') => out.push(line);
+    let { commanderId, playFabId } = parsed;
+    let coords = parsed.coords.slice();
+
+    // ---- IDs ermitteln ----
+    if (playFabId === null) {
+        try {
+            const r = await pool.query('SELECT playfab_id FROM commander_highscore WHERE commander_id = $1', [commanderId]);
+            if (r.rows.length > 0 && r.rows[0].playfab_id) playFabId = r.rows[0].playfab_id;
+        } catch (e) { /* unten gemeldet */ }
+    } else {
+        try {
+            const r = await pool.query('SELECT commander_id FROM commander_highscore WHERE playfab_id = $1', [playFabId]);
+            if (r.rows.length > 0) commanderId = r.rows[0].commander_id;
+        } catch (e) { /* unten gemeldet */ }
+    }
+
+    add('=== UEBERSICHT ===');
+    add('Commander-ID: ' + (commanderId !== null ? commanderId : '(nicht ermittelbar)'));
+    add('PlayFab-ID:   ' + (playFabId !== null ? playFabId : '(nicht ermittelbar - kein Highscore-Eintrag mit dieser ID)'));
+
+    // ---- PlayFab: Konto ----
+    add('');
+    add('=== PLAYFAB: KONTO (Benutzername, E-Mail, Anzeigename) ===');
+    let accountFound = false;
+    if (playFabId === null) {
+        add('Nicht pruefbar (keine PlayFab-ID bekannt). Tipp: Nach einer Loeschung die PlayFab-ID aus dem Vorher-Bericht eingeben.');
+    } else {
+        try {
+            const data = await playfabServer('/Server/GetUserAccountInfo', { PlayFabId: playFabId });
+            const info = data && data.UserInfo;
+            if (!info) { add('Kein Konto gefunden.'); }
+            else {
+                accountFound = true;
+                add('Konto VORHANDEN');
+                add('Erstellt:        ' + (info.Created || '-'));
+                add('Letzter Login:   ' + ((info.TitleInfo && info.TitleInfo.LastLogin) || '-'));
+                add('Benutzername:    ' + (info.Username || '-'));
+                add('Anzeigename:     ' + ((info.TitleInfo && info.TitleInfo.DisplayName) || '-'));
+                add('E-Mail:          ' + ((info.PrivateInfo && info.PrivateInfo.Email) || '-'));
+            }
+        } catch (error) {
+            add('KEIN Konto gefunden (geloescht oder nie vorhanden). PlayFab: ' + inspectErrorText(error));
+        }
+    }
+
+    // ---- PlayFab: Spieldaten ----
+    add('');
+    add('=== PLAYFAB: SPIELDATEN (UserData) ===');
+    let commanderData = null;
+    if (playFabId === null) add('Nicht pruefbar (keine PlayFab-ID).');
+    else {
+        try {
+            const data = await playfabServer('/Server/GetUserData', { PlayFabId: playFabId });
+            const entries = Object.entries((data && data.Data) || {});
+            if (entries.length === 0) add('Keine Eintraege.');
+            for (const [key, value] of entries) {
+                const size = value && typeof value.Value === 'string' ? value.Value.length : 0;
+                add(`- ${key}  (${size} Zeichen, zuletzt ${value && value.LastUpdated ? value.LastUpdated : '-'})`);
+                if (key === 'commander_data') {
+                    try { commanderData = JSON.parse(value.Value); } catch (e) { add('    (commander_data nicht lesbar)'); }
+                }
+            }
+            if (commanderData) {
+                add('  commander_data -> Commander-ID: ' + commanderData.commanderId);
+                add('  commander_data -> Anzeigename:  ' + (commanderData.visibleName || '-'));
+                add('  commander_data -> Login-Name:   ' + (commanderData.loginName || '-'));
+                const cols = Array.isArray(commanderData.colonies) ? commanderData.colonies : [];
+                add('  commander_data -> Kolonien (' + cols.length + '): ' + (cols.join(', ') || '-'));
+                for (const c of cols) if (coords.indexOf(c) === -1 && /^\d{1,5}:\d{1,5}:\d{1,5}:\d{1,5}$/.test(c)) coords.push(c);
+            }
+        } catch (error) {
+            add('Nicht lesbar / kein Konto: ' + inspectErrorText(error));
+        }
+    }
+
+    // ---- PlayFab: interne Daten ----
+    add('');
+    add('=== PLAYFAB: INTERNE DATEN (UserInternalData) ===');
+    if (playFabId === null) add('Nicht pruefbar (keine PlayFab-ID).');
+    else {
+        try {
+            const data = await playfabServer('/Server/GetUserInternalData', { PlayFabId: playFabId });
+            const entries = Object.entries((data && data.Data) || {});
+            if (entries.length === 0) add('Keine Eintraege.');
+            for (const [key, value] of entries) {
+                const secret = /code|expires/i.test(key);
+                add(`- ${key}: ` + (secret ? '(vorhanden, Wert nicht angezeigt)' : String(value && value.Value).slice(0, 120)));
+            }
+        } catch (error) {
+            add('Nicht lesbar / kein Konto: ' + inspectErrorText(error));
+        }
+    }
+
+    // ---- Kolonien / oeffentliche Systemdaten ----
+    add('');
+    add('=== KOLONIEN (oeffentliche Systemdaten + gesicherte Gebaeudedaten) ===');
+    if (coords.length === 0) add('Keine Koordinaten bekannt. Tipp: Koordinaten hinter die ID schreiben, z.B. "1000005 1:1:1:1".');
+    else {
+        const byKey = {};
+        for (const c of coords) { const p = c.split(':'); (byKey[`sys_${p[0]}_${p[1]}_${p[2]}`] = byKey[`sys_${p[0]}_${p[1]}_${p[2]}`] || []).push(c); }
+        let titleData = {};
+        try {
+            const r = await playfabServer('/Server/GetTitleData', { Keys: Object.keys(byKey) });
+            titleData = (r && r.Data) || {};
+        } catch (error) { add('Systemdaten nicht lesbar: ' + inspectErrorText(error)); }
+        let internal = {};
+        try {
+            const r = await playfabServer('/Server/GetTitleInternalData', { Keys: coords.map(c => 'Abandoned_' + c.replace(/:/g, '_')) });
+            internal = (r && r.Data) || {};
+        } catch (error) { add('Gesicherte Gebaeudedaten nicht lesbar: ' + inspectErrorText(error)); }
+        for (const c of coords) {
+            const p = c.split(':');
+            const n = parseInt(p[3], 10);
+            let line = c + ': ';
+            const raw = titleData[`sys_${p[0]}_${p[1]}_${p[2]}`];
+            let entry = null;
+            if (raw) { try { entry = (JSON.parse(raw).planets || []).find(x => x.n === n) || null; } catch (e) { /* unten */ } }
+            if (!entry) line += 'kein oeffentlicher Eintrag';
+            else line += `Besitzer=${entry.owner}, Name="${entry.name}", Kolonie-Name="${entry.pname || ''}", PlayFab-ID im Eintrag=${entry.pfid ? 'JA (' + entry.pfid + ')' : 'nein'}`;
+            const saved = internal['Abandoned_' + c.replace(/:/g, '_')];
+            line += ' | gesicherte Gebaeudedaten: ' + (saved ? 'JA (' + String(saved).length + ' Zeichen)' : 'nein');
+            add(line);
+        }
+    }
+
+    // ---- Title-Daten ----
+    add('');
+    add('=== PLAYFAB: TITEL-LISTEN ===');
+    try {
+        const r = await playfabServer('/Server/GetTitleData', { Keys: ['ActivePlayerIds'] });
+        let ids = [];
+        try { ids = JSON.parse((r && r.Data && r.Data.ActivePlayerIds) || '[]'); } catch (e) { /* leer */ }
+        add('In ActivePlayerIds: ' + (playFabId !== null ? (ids.indexOf(playFabId) !== -1 ? 'JA' : 'nein') : '(PlayFab-ID unbekannt)'));
+    } catch (error) { add('ActivePlayerIds nicht lesbar: ' + inspectErrorText(error)); }
+
+    // ---- Postgres ----
+    add('');
+    add('=== POSTGRES (Render-Datenbank) ===');
+    const count = async (label, sql, params) => {
+        try {
+            const r = await pool.query(sql, params);
+            const n = parseInt(r.rows[0] && r.rows[0].cnt, 10);
+            add(`- ${label}: ${isNaN(n) ? '?' : n}`);
+        } catch (e) { add(`- ${label}: (Abfrage fehlgeschlagen: ${e.message})`); }
+    };
+    if (commanderId === null && playFabId === null) add('Keine ID bekannt.');
+    else {
+        try {
+            const r = await pool.query('SELECT * FROM commander_highscore WHERE commander_id = $1 OR playfab_id = $2', [commanderId, playFabId]);
+            add(`- Highscore-Eintrag: ${r.rows.length}` + r.rows.map(x => `  [Name="${x.commander_name}", PlayFab-ID=${x.playfab_id || '-'}]`).join(''));
+        } catch (e) { add(`- Highscore-Eintrag: (Abfrage fehlgeschlagen: ${e.message})`); }
+        try {
+            const r = await pool.query('SELECT alliance_id, commander_name, commander_coord FROM alliance_members WHERE commander_id = $1', [commanderId]);
+            add(`- Allianz-Mitgliedschaft: ${r.rows.length}` + r.rows.map(x => `  [Allianz ${x.alliance_id}, Name="${x.commander_name}", Koord=${x.commander_coord || '-'}]`).join(''));
+        } catch (e) { add(`- Allianz-Mitgliedschaft: (Abfrage fehlgeschlagen: ${e.message})`); }
+        await count('Allianz-Bewerbungen', 'SELECT COUNT(*) AS cnt FROM alliance_applications WHERE commander_id = $1', [commanderId]);
+        await count('Allianzen als Gruender', 'SELECT COUNT(*) AS cnt FROM alliances WHERE founder_commander_id = $1', [commanderId]);
+        await count('Gruendungsurkunden als Gruender (Name gespeichert)', 'SELECT COUNT(*) AS cnt FROM alliance_charters WHERE founder_commander_id = $1', [commanderId]);
+        await count('Urkunden-Unterschriften (Name gespeichert)', 'SELECT COUNT(*) AS cnt FROM alliance_charter_signatures WHERE signer_commander_id = $1', [commanderId]);
+        await count('Freundschaften/Kriege (Spieler-Beziehungen)', 'SELECT COUNT(*) AS cnt FROM player_relationships WHERE commander_id_a = $1 OR commander_id_b = $1', [commanderId]);
+        await count('Support-Nachrichten dieses Spielers', 'SELECT COUNT(*) AS cnt FROM support_messages WHERE sender_commander_id = $1', [commanderId]);
+        await count('Geschenkkisten-Einloesungen', 'SELECT COUNT(*) AS cnt FROM giftbox_claims WHERE playfab_id = $1', [playFabId]);
+        await count('Promocode-Einloesungen (nur Zahlen, bleiben bewusst)', 'SELECT COUNT(*) AS cnt FROM promo_redemptions WHERE commander_id = $1', [commanderId]);
+        await count('Kampfberichte als Angreifer/Verteidiger (bleiben bewusst)', 'SELECT COUNT(*) AS cnt FROM combat_reports WHERE attacker_commander_id = $1 OR defender_commander_id = $1', [commanderId]);
+        await count('Angriffs-Akten (bleiben bewusst)', 'SELECT COUNT(*) AS cnt FROM attack_traces WHERE attacker_commander_id = $1 OR defender_commander_id = $1', [commanderId]);
+        await count('Ankuendigungen/VirgoDom-Nachrichten als Absender (nur Admins)', 'SELECT (SELECT COUNT(*) FROM announcements WHERE sender_commander_id = $1) + (SELECT COUNT(*) FROM virgodom_messages WHERE sender_commander_id = $1) AS cnt', [commanderId]);
+    }
+
+    add('');
+    add('=== NICHT GEPRUEFT ===');
+    add('- Chat-Nachrichten (liegen in PlayFab Title Data, bleiben nach Absprache unveraendert)');
+    add('- Mails im Postfach (liegen im Spielstand commander_data)');
+    add('- PlayFab-interne Protokolle (PlayStream) und Sicherungen von PlayFab');
+    return out.join('\n');
+}
+
+app.post('/admin/inspectPlayer', async (req, res) => {
+    let playFabId = req.auth && req.auth.playFabId;
+    if (!playFabId) {
+        const ticket = req.get('X-Session-Ticket');
+        if (ticket) playFabId = await authenticateTicket(ticket);
+    }
+    if (!playFabId)
+        return res.status(401).json({ success: false, error: 'Nicht angemeldet.' });
+
+    try {
+        const requesterCommanderId = await authCommanderIdFor(playFabId);
+        if (requesterCommanderId === null || !ADMIN_COMMANDER_IDS.includes(Number(requesterCommanderId)))
+            return res.status(403).json({ success: false, error: 'Nur Admin-Accounts dürfen das.' });
+
+        const report = await buildPlayerInspectionReport(req.body && req.body.query);
+        res.json({ success: true, report });
+    } catch (error) {
+        console.error('[Server] admin/inspectPlayer Fehler:', error.message);
+        res.status(500).json({ success: false, error: 'Spieler-Info konnte nicht erstellt werden.' });
     }
 });
 
