@@ -5409,14 +5409,21 @@ app.post('/account/delete', async (req, res) => {
 //      geprueft werden koennen.
 // #####################################################################
 
+// Erkennt selbst, WEN man sucht:
+//   nur Ziffern (bis 8)          -> Commander-ID
+//   12-20 Hex-Zeichen            -> PlayFab-ID (wie in der PlayFab-Spielerliste)
+//   alles andere                 -> Ingame-Name (auch mit Leerzeichen, auch nur ein Teil)
+// Koordinaten (x:x:x:x) duerfen irgendwo im Text stehen und werden separat erkannt.
 function parseInspectQuery(rawQuery) {
-    const tokens = String(rawQuery || '').trim().split(/[\s,;]+/).filter(Boolean);
-    if (tokens.length === 0) return null;
-    const first = tokens[0];
-    const coords = tokens.slice(1).filter(t => /^\d{1,5}:\d{1,5}:\d{1,5}:\d{1,5}$/.test(t));
-    if (/^\d{1,8}$/.test(first)) return { commanderId: parseInt(first, 10), playFabId: null, coords };
-    if (/^[0-9A-Fa-f]{8,20}$/.test(first)) return { commanderId: null, playFabId: first.toUpperCase(), coords };
-    return null;
+    const raw = String(rawQuery || '').trim();
+    if (!raw) return null;
+    const coordPattern = /\b\d{1,5}:\d{1,5}:\d{1,5}:\d{1,5}\b/g;
+    const coords = raw.match(coordPattern) || [];
+    const term = raw.replace(coordPattern, ' ').replace(/[,;]+/g, ' ').replace(/\s+/g, ' ').trim();
+    if (!term) return null;
+    if (/^\d{1,8}$/.test(term)) return { kind: 'commanderId', term, commanderId: parseInt(term, 10), playFabId: null, coords };
+    if (/^[0-9A-Fa-f]{12,20}$/.test(term)) return { kind: 'playFabId', term, commanderId: null, playFabId: term.toUpperCase(), coords };
+    return { kind: 'name', term, commanderId: null, playFabId: null, coords };
 }
 
 function inspectErrorText(error) {
@@ -5425,12 +5432,44 @@ function inspectErrorText(error) {
 
 async function buildPlayerInspectionReport(rawQuery) {
     const parsed = parseInspectQuery(rawQuery);
-    if (!parsed) return 'Eingabe nicht erkannt.\nBitte eine Commander-ID (z.B. 1000005) oder eine PlayFab-ID eingeben.\nOptional danach Koordinaten, z.B.: 1000005 1:1:1:1 1:1:1:2';
+    if (!parsed) return 'Bitte etwas eingeben: Commander-ID (z.B. 1000005), Ingame-Name (z.B. Agnes) oder PlayFab-ID (z.B. 1405316AFCC3DEDE).\nOptional danach Koordinaten, z.B.: 1000005 1:1:1:1 1:1:1:2';
 
     const out = [];
     const add = (line = '') => out.push(line);
     let { commanderId, playFabId } = parsed;
     let coords = parsed.coords.slice();
+
+    // ---- Namenssuche: Name -> Commander-ID + PlayFab-ID (ueber den Highscore) ----
+    let searchNote = '';
+    if (parsed.kind === 'name') {
+        const escaped = parsed.term.replace(/[\\%_]/g, m => '\\' + m);
+        let matches = [];
+        try {
+            const exact = await pool.query(
+                'SELECT commander_id, commander_name, playfab_id FROM commander_highscore WHERE LOWER(commander_name) = LOWER($1) ORDER BY commander_id LIMIT 10', [parsed.term]);
+            matches = exact.rows;
+            if (matches.length === 0) {
+                const partial = await pool.query(
+                    "SELECT commander_id, commander_name, playfab_id FROM commander_highscore WHERE commander_name ILIKE $1 ESCAPE '\\' ORDER BY commander_id LIMIT 10", ['%' + escaped + '%']);
+                matches = partial.rows;
+            }
+        } catch (e) {
+            return 'Namenssuche fehlgeschlagen: ' + e.message;
+        }
+        if (matches.length === 0)
+            return `Kein Spieler mit dem Namen "${parsed.term}" gefunden.\nHinweis: Die Namenssuche nutzt den Highscore. Bei einem geloeschten Spieler gibt es ihn dort nicht mehr - dann die PlayFab-ID eingeben (steht im Vorher-Bericht).`;
+        if (matches.length > 1)
+            return `Mehrere Treffer fuer "${parsed.term}" - bitte die Commander-ID eingeben:\n` +
+                matches.map(m => `  ${m.commander_id}  =  ${m.commander_name}`).join('\n');
+        commanderId = matches[0].commander_id;
+        playFabId = matches[0].playfab_id || null;
+        searchNote = `Suche "${parsed.term}" -> erkannt als Name -> Treffer: ${matches[0].commander_name} (Commander-ID ${commanderId})`;
+    } else if (parsed.kind === 'playFabId') {
+        searchNote = `Suche "${parsed.term}" -> erkannt als PlayFab-ID`;
+    } else {
+        searchNote = `Suche "${parsed.term}" -> erkannt als Commander-ID`;
+    }
+    if (searchNote) { add(searchNote); add(); }
 
     // ---- IDs ermitteln ----
     if (playFabId === null) {
