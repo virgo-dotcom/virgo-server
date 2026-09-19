@@ -3694,6 +3694,29 @@ function serverTickAuthorized(req) {
     return given.length === wanted.length && crypto.timingSafeEqual(given, wanted);
 }
 
+// -------------------------------------------------------
+// Welche Mission gehoert wem? (19.09.2026, Fix "Flotten verschwinden")
+//   'combat'      Angriff (3)                                     -> Server (resolveCombat)
+//   'return'      Rueckflug (10)                                  -> Server (processReturn)
+//   'client'      Verlegen (0), Transport (1), Verladen (2),
+//                 Kolonisation (4)                                -> verarbeitet der CLIENT (live oder
+//                                                                    beim naechsten Login, siehe
+//                                                                    FleetManager.LoadFleetsFromCommander)
+//   'unsupported' Stationieren (6), Spionage (7), Invasion (8),
+//                 Sprengung (9)                                   -> noch nicht verfuegbar, Flotte kehrt zurueck
+// Der Tick darf 'client'-Flotten NICHT anfassen: er hat sie frueher stillschweigend aus der
+// Liste geloescht (Schiffe/Ressourcen weg, wenn der Spieler bei der Ankunft offline war).
+// -------------------------------------------------------
+function classifyFleetMission(mission) {
+    const m = typeof mission === 'string' ? mission.toLowerCase() : mission;
+    if (m === 3 || m === 'attack') return 'combat';
+    if (m === 10 || m === 'return') return 'return';
+    if (m === undefined || m === null || m === 0 || m === 1 || m === 2 || m === 4 ||
+        m === 'transfer' || m === 'transport' || m === 'verladen' || m === 'colonize' || m === 'colonization')
+        return 'client';
+    return 'unsupported';
+}
+
 async function serverTickHandler(req, res) {
     if (!serverTickAuthorized(req))
         return res.status(401).json({ success: false, error: 'Nicht autorisiert.' });
@@ -3776,6 +3799,12 @@ async function serverTickHandler(req, res) {
                         if (fleet.hasArrived) { idsToRemove.add(fleet.fleetId); continue; }
                         if (new Date(fleet.arrivalUtc) > now) continue;
 
+                        // Nur Missionen bearbeiten, die der SERVER kennt. Alles andere (Verlegen,
+                        // Transport, Verladen, Kolonisation) bleibt in der Liste und wird vom Client
+                        // verarbeitet - siehe classifyFleetMission.
+                        const missionKind = classifyFleetMission(fleet.mission);
+                        if (missionKind === 'client') continue;
+
                         // Race-Guard: wird diese Flotte gerade zeitgleich woanders
                         // verarbeitet (z.B. Client-Request über /processFleet)?
                         // Falls ja, hier überspringen statt doppelt zu verarbeiten —
@@ -3786,11 +3815,18 @@ async function serverTickHandler(req, res) {
                         commander.activeFleets[f].hasArrived = true;
                         const missionNum = fleet.mission;
 
-                        if (missionNum === 3 || missionNum === 'Attack') {
+                        if (missionKind === 'combat') {
                             const returnFleet = await resolveCombat(playFabId, commander, fleet, now, log);
                             if (returnFleet) returnFleets.push(returnFleet);
-                        } else if (missionNum === 10 || missionNum === 'Return') {
+                        } else if (missionKind === 'return') {
                             await processReturn(playFabId, commander, fleet, log);
+                        } else {
+                            // Mission noch nicht verfuegbar (Stationieren/Spionage/Invasion/Sprengung):
+                            // Flotte mit Fracht zurueckschicken statt sie zu loeschen.
+                            returnFleets.push(buildReturnFleet(fleet, now, fleet.warships || [0,0,0,0,0,0,0,0,0,0], fleet.ressources));
+                            await sendMail(commander, 'Mission nicht verfügbar', // LOCALIZE
+                                `Flotte ${fleet.fleetId} hat ${fleet.destinationCoord} erreicht, aber diese Mission ist noch nicht verfügbar. Die Flotte kehrt nach ${fleet.originCoord} zurück.`, 1); // LOCALIZE
+                            log.push(`Mission ${missionNum} nicht verfuegbar, Flotte ${fleet.fleetId} kehrt zurueck`);
                         }
 
                         idsToRemove.add(fleet.fleetId);
