@@ -5157,23 +5157,63 @@ app.post('/assignCommanderId', async (req, res) => {
 });
 
 // #####################################################################
-// §23  ACCOUNT-DATEN LOESCHEN (DSGVO, /account/delete-data)
-//      Raeumt die POSTGRES-Seite eines Accounts auf. Die PlayFab-Seite
-//      (Konto, Spielstand, Planeten, Chat) ist NICHT Teil dieses Endpunkts.
+// §23  ACCOUNT LOESCHEN (DSGVO, /account/delete)
+//      Loescht ein Spielerkonto vollstaendig (PlayFab-Konto + Postgres-Daten).
 //      Identitaet nur aus dem geprueften Anmelde-Ticket, nichts aus dem Body.
-//      STAND 19.09.2026: Endpunkt ist gebaut, aber noch von KEINEM Client
-//      aufgerufen (Unity-Anbindung + PlayFab-Teil folgen nach Absprache).
 //
-//      Grundsatz: Zeilen mit Personenbezug werden GELOESCHT; Zeilen, die fuer
-//      andere Spieler noetig sind (Unterschriften einer Gruendungsurkunde),
-//      werden ANONYMISIERT (Name -> "Geloeschter Commander").
-//      Bewusst NICHT angefasst (offene Entscheidung): combat_reports und
-//      attack_traces (enthalten nur Commander-IDs; Namen im Berichtstext?),
-//      promo_redemptions (nur Zahl, verhindert doppelte Einloesung).
+//      SICHERHEIT: Der Endpunkt ist standardmaessig AUS. Er laeuft nur, wenn in
+//      Render die Umgebungsvariable ACCOUNT_DELETE_ENABLED=true gesetzt ist, und
+//      nur mit dem Body { "confirm": "DELETE_MY_ACCOUNT" }.
+//
+//      ABLAUF (Reihenfolge ist wichtig; jeder Schritt vor dem letzten ist so
+//      gebaut, dass ein erneuter Versuch weiterlaufen kann):
+//        0. Gruender einer Allianz mit weiteren Mitgliedern -> abbrechen, nichts passiert
+//        1. commander_data lesen (Liste der Kolonien)
+//        2. Je Kolonie, die dem Spieler laut oeffentlichen Systemdaten WIRKLICH
+//           gehoert: Planetendaten (Gebaeudestufen) in Title Internal Data sichern
+//           ("Abandoned_g_s_sys_n") und den Planeten auf "Verlassene Kolonie"
+//           (Besitzer 900002) umschreiben, pfid + Kolonie-Name entfernen
+//        3. Postgres-Zeilen loeschen/anonymisieren
+//        4. Aus ActivePlayerIds austragen
+//        5. ZULETZT: PlayFab-Konto loeschen (Admin/DeleteMasterPlayerAccount;
+//           entfernt das Konto aus ALLEN Titeln, PlayFab arbeitet es asynchron ab)
+//      Bewusst unangetastet: Chat (Nutzerentscheidung), combat_reports/attack_traces,
+//      promo_redemptions (nur Zahlen).
 // #####################################################################
 
 const DELETED_COMMANDER_NAME = 'Gelöschter Commander'; // LOCALIZE
+const ABANDONED_OWNER_ID     = 900002;
+const ABANDONED_COLONY_NAME  = 'Verlassene Kolonie'; // LOCALIZE
+const ACCOUNT_DELETE_CONFIRM = 'DELETE_MY_ACCOUNT';
 
+// Title Data wird hier per "lesen-aendern-schreiben" bearbeitet - Loeschungen laufen
+// deshalb nacheinander (gleiche Ueberlegung wie bei /assignCommanderId).
+let accountDeleteQueue = Promise.resolve();
+function runAccountDeleteExclusive(task) {
+    const result = accountDeleteQueue.then(task, task);
+    accountDeleteQueue = result.catch(() => {});
+    return result;
+}
+
+function isValidColonyCoord(coord) {
+    return typeof coord === 'string' && /^\d{1,5}:\d{1,5}:\d{1,5}:\d{1,5}$/.test(coord);
+}
+
+const FOUNDER_BLOCK_MESSAGE = 'Als Gründer musst du den Rang erst an ein anderes Mitglied übergeben oder die Allianz auflösen, bevor du deinen Account löschen kannst.'; // LOCALIZE
+
+// Nur lesen: Ist der Spieler Gruender einer Allianz mit weiteren Mitgliedern?
+async function accountDeletionBlockedReason(commanderId) {
+    const result = await pool.query(
+        `SELECT r.is_founder_rank,
+                (SELECT COUNT(*) FROM alliance_members x WHERE x.alliance_id = m.alliance_id) AS cnt
+         FROM alliance_members m LEFT JOIN alliance_ranks r ON r.id = m.rank_id
+         WHERE m.commander_id = $1`, [commanderId]);
+    if (result.rows.length > 0 && result.rows[0].is_founder_rank && parseInt(result.rows[0].cnt, 10) > 1)
+        return FOUNDER_BLOCK_MESSAGE;
+    return null;
+}
+
+// Postgres-Seite (eine Transaktion: bei einem Fehler wird nichts geloescht)
 async function deleteAccountDataFor(playFabId, commanderId) {
     const client = await pool.connect();
     const summary = {};
@@ -5181,8 +5221,6 @@ async function deleteAccountDataFor(playFabId, commanderId) {
         await client.query('BEGIN');
 
         if (commanderId !== null) {
-            // 1) Allianz: Gruender mit weiteren Mitgliedern darf nicht einfach gehen
-            //    (gleiche Regel wie /alliances/:id/leave).
             const memberResult = await client.query(
                 `SELECT m.alliance_id, r.is_founder_rank,
                         (SELECT COUNT(*) FROM alliance_members x WHERE x.alliance_id = m.alliance_id) AS cnt
@@ -5192,7 +5230,7 @@ async function deleteAccountDataFor(playFabId, commanderId) {
                 const row = memberResult.rows[0];
                 if (row.is_founder_rank && parseInt(row.cnt, 10) > 1) {
                     await client.query('ROLLBACK');
-                    return { blocked: 'Als Gründer musst du den Rang erst an ein anderes Mitglied übergeben oder die Allianz auflösen, bevor du deinen Account löschen kannst.' }; // LOCALIZE
+                    return { blocked: FOUNDER_BLOCK_MESSAGE };
                 }
                 await client.query('DELETE FROM alliance_members WHERE commander_id = $1', [commanderId]);
                 const left = await client.query(
@@ -5243,7 +5281,96 @@ async function deleteAccountDataFor(playFabId, commanderId) {
     }
 }
 
-app.post('/account/delete-data', async (req, res) => {
+// Kolonien -> "Verlassene Kolonie". Gibt es einen Fehler beim Sichern, bricht ALLES ab
+// (Fehler wird weitergereicht), damit keine Gebaeudedaten verloren gehen.
+async function handOverColonies(playFabId, commanderId, colonies) {
+    let handedOver = 0, skipped = 0;
+    const byKey = {};
+    for (const coord of colonies) {
+        const [g, s, sys, n] = coord.split(':');
+        (byKey[`sys_${g}_${s}_${sys}`] = byKey[`sys_${g}_${s}_${sys}`] || []).push({ coord, n: parseInt(n, 10) });
+    }
+    const keys = Object.keys(byKey);
+    if (keys.length === 0) return { handedOver, skipped };
+
+    const titleData = await playfabServer('/Server/GetTitleData', { Keys: keys });
+    for (const key of keys) {
+        const raw = titleData?.Data?.[key];
+        if (!raw) { skipped += byKey[key].length; continue; }
+        const systemData = JSON.parse(raw);
+        let changed = false;
+        for (const { coord, n } of byKey[key]) {
+            const entry = (systemData.planets || []).find(p => p.n === n);
+            // Nur Planeten, die laut OEFFENTLICHEN Daten wirklich diesem Spieler gehoeren
+            // (die Kolonie-Liste im Spielstand kann der Spieler selbst veraendern).
+            if (!entry || Number(entry.owner) !== Number(commanderId) || (entry.pfid && entry.pfid !== playFabId)) {
+                skipped++;
+                continue;
+            }
+            const planetKey = 'planet_' + coord.replace(/:/g, '_');
+            const planetData = await playfabServer('/Server/GetUserData', { PlayFabId: playFabId, Keys: [planetKey] });
+            const planetValue = planetData?.Data?.[planetKey]?.Value;
+            if (planetValue) {
+                await playfabServer('/Server/SetTitleInternalData',
+                    { Key: 'Abandoned_' + coord.replace(/:/g, '_'), Value: planetValue });
+            }
+            entry.owner = ABANDONED_OWNER_ID;
+            entry.name  = ABANDONED_COLONY_NAME;
+            entry.pname = '';
+            delete entry.pfid;
+            changed = true;
+            handedOver++;
+        }
+        if (changed)
+            await playfabServer('/Server/SetTitleData', { Key: key, Value: JSON.stringify(systemData) });
+    }
+    return { handedOver, skipped };
+}
+
+async function removeFromActivePlayerIds(playFabId) {
+    const data = await playfabServer('/Server/GetTitleData', { Keys: ['ActivePlayerIds'] });
+    let ids = [];
+    try { ids = JSON.parse(data?.Data?.ActivePlayerIds || '[]'); } catch (e) { return; }
+    if (!Array.isArray(ids) || ids.indexOf(playFabId) === -1) return;
+    await playfabServer('/Server/SetTitleData',
+        { Key: 'ActivePlayerIds', Value: JSON.stringify(ids.filter(id => id !== playFabId)) });
+}
+
+async function deleteAccountCompletely(playFabId) {
+    const commanderId = await authCommanderIdFor(playFabId); // kann null sein (Registrierung nie abgeschlossen)
+
+    if (commanderId !== null) {
+        const blocked = await accountDeletionBlockedReason(commanderId);
+        if (blocked) return { blocked };
+    }
+
+    let colonies = [];
+    const userData = await playfabServer('/Server/GetUserData', { PlayFabId: playFabId, Keys: ['commander_data'] });
+    const rawCommander = userData?.Data?.commander_data?.Value;
+    if (rawCommander) {
+        const commander = JSON.parse(rawCommander); // ungueltig -> Fehler -> Abbruch, nichts wurde veraendert
+        if (Array.isArray(commander.colonies))
+            colonies = Array.from(new Set(commander.colonies.filter(isValidColonyCoord)));
+    }
+
+    let handover = { handedOver: 0, skipped: 0 };
+    if (commanderId !== null && colonies.length > 0)
+        handover = await handOverColonies(playFabId, commanderId, colonies);
+
+    const postgres = await deleteAccountDataFor(playFabId, commanderId);
+    if (postgres.blocked) return { blocked: postgres.blocked };
+
+    await removeFromActivePlayerIds(playFabId);
+
+    // Letzter, nicht umkehrbarer Schritt
+    await playfabServer('/Admin/DeleteMasterPlayerAccount', { PlayFabId: playFabId, MetaData: 'ingame-account-delete' });
+
+    authTicketCache.clear();
+    authCommanderCache.delete(playFabId);
+    return { summary: { colonies: handover, postgres: postgres.summary } };
+}
+
+app.post('/account/delete', async (req, res) => {
     let playFabId = req.auth && req.auth.playFabId;
     if (!playFabId) {
         const ticket = req.get('X-Session-Ticket');
@@ -5252,19 +5379,22 @@ app.post('/account/delete-data', async (req, res) => {
     if (!playFabId)
         return res.status(401).json({ success: false, error: 'Nicht angemeldet.' });
 
+    if (process.env.ACCOUNT_DELETE_ENABLED !== 'true')
+        return res.status(503).json({ success: false, error: 'Die Konto-Löschung ist noch nicht freigeschaltet.' }); // LOCALIZE
+    if (!req.body || req.body.confirm !== ACCOUNT_DELETE_CONFIRM)
+        return res.status(400).json({ success: false, error: 'Bestätigung fehlt.' }); // LOCALIZE
+
     try {
-        const commanderId = await authCommanderIdFor(playFabId);
-        const result = await deleteAccountDataFor(playFabId, commanderId);
+        const result = await runAccountDeleteExclusive(() => deleteAccountCompletely(playFabId));
         if (result.blocked)
             return res.status(409).json({ success: false, error: result.blocked });
-        console.log('[Account] Postgres-Daten eines Accounts geloescht');
+        console.log('[Account] Ein Spielerkonto wurde geloescht');
         res.json({ success: true, summary: result.summary });
     } catch (error) {
-        console.error('[Server] account/delete-data Fehler:', error.message);
-        res.status(500).json({ success: false, error: 'Daten konnten nicht gelöscht werden.' });
+        console.error('[Server] account/delete Fehler:', error.message);
+        res.status(500).json({ success: false, error: 'Der Account konnte nicht gelöscht werden. Bitte später erneut versuchen.' }); // LOCALIZE
     }
 });
-
 
 // #####################################################################
 // §21  SERVERSTART (app.listen)
