@@ -5312,8 +5312,15 @@ async function handOverColonies(playFabId, commanderId, colonies) {
             const planetData = await playfabServer('/Server/GetUserData', { PlayFabId: playFabId, Keys: [planetKey] });
             const planetValue = planetData?.Data?.[planetKey]?.Value;
             if (planetValue) {
+                // Die Kopie enthaelt Gebaeude/Schiffe/Ressourcen, aber NICHT den Namen des Spielers:
+                // ownerName, ownerPlayerId und der selbst gewaehlte Kolonie-Name werden ersetzt.
+                // Ist der Text nicht lesbar, bricht alles ab (Fehler), statt ungesaeubert zu sichern.
+                const planetObject = JSON.parse(planetValue);
+                planetObject.ownerPlayerId = ABANDONED_OWNER_ID;
+                planetObject.ownerName     = ABANDONED_COLONY_NAME;
+                planetObject.name          = ABANDONED_COLONY_NAME;
                 await playfabServer('/Server/SetTitleInternalData',
-                    { Key: 'Abandoned_' + coord.replace(/:/g, '_'), Value: planetValue });
+                    { Key: 'Abandoned_' + coord.replace(/:/g, '_'), Value: JSON.stringify(planetObject) });
             }
             entry.owner = ABANDONED_OWNER_ID;
             entry.name  = ABANDONED_COLONY_NAME;
