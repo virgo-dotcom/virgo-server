@@ -50,6 +50,8 @@
 //  §21  Serverstart
 //  §22  Commander-ID-Vergabe (/assignCommanderId): Warteschlange, Zaehler in PlayFab
 //  §23  Account-Daten loeschen (DSGVO, /account/delete-data): nur Postgres-Seite, noch nicht angebunden
+//  §24  Admin-Spieler-Info (/admin/inspectPlayer)
+//  §25  KAMPF V2 (Rundenkampf, Mischbonus, Zivile in letzter Reihe): steht VOR §21; aktiv nur bei COMBAT_ENGINE=shadow|v2
 //
 //  WICHTIGE ARBEITSREGELN FUER DIESE DATEI
 //  - Laufendes System: NICHT umsortieren, nichts loeschen ohne Pruefung.
@@ -4702,7 +4704,7 @@ async function resolveCombat(attackerPlayFabId, attackerCommander, attackerFleet
         defenderBonusPercent: 0
     };
 
-    const attackerFleetBonus  = calculateFleetBonus(attackerFleet.warships);
+    let attackerFleetBonus  = calculateFleetBonus(attackerFleet.warships); // let: bei COMBAT_ENGINE=v2 wird spaeter ueberschrieben (§25)
     const attackerStrengthRaw = calculateShipStrength(attackerFleet.warships, attackerFleet.ships, attackerCommander)
                                 * (1 + attackerFleetBonus);
     report.attackerBonusPercent = Math.round(attackerFleetBonus * 1000) / 10; // z.B. 27.5
@@ -4758,13 +4760,13 @@ async function resolveCombat(attackerPlayFabId, attackerCommander, attackerFleet
 
     // PHASE 2+3: Stärke & HP
     const attackerStrength = attackerStrengthRaw;
-    const defenderFleetBonus = calculateFleetBonus(defWarships);
+    let defenderFleetBonus = calculateFleetBonus(defWarships); // let: siehe oben (§25)
     report.defenderBonusPercent = Math.round(defenderFleetBonus * 1000) / 10;
     const defenderStrength = calculateShipStrength(defWarships, defShips, defenderCommander) * (1 + defenderFleetBonus);
     const defenderHP        = calculateShipHP(defWarships, defShips, defenderCommander) * (1 + defenderFleetBonus);
 
     // PHASE 4: Sieger
-    const attackerWins = attackerStrength >= defenderHP;
+    let attackerWins = attackerStrength >= defenderHP; // let: siehe oben (§25)
     report.attackerWins = attackerWins;
 
     // PHASE 5: Verluste
@@ -4775,10 +4777,60 @@ async function resolveCombat(attackerPlayFabId, attackerCommander, attackerFleet
     const defenderLossPercent = attackerWins ? loserLoss : winnerLoss;
 
     const attackerShipsBefore    = attackerFleet.ships || [0,0,0,0,0,0];
-    const attackerAfterWarships  = applyLosses(attackerFleet.warships, attackerLossPercent);
-    const attackerAfterShips     = applyLosses(attackerShipsBefore, attackerLossPercent);
-    const defenderAfterWarships  = applyLosses(defWarships, defenderLossPercent);
-    const defenderAfterShips     = applyLosses(defShips, defenderLossPercent);
+    let attackerAfterWarships  = applyLosses(attackerFleet.warships, attackerLossPercent); // let: siehe oben (§25)
+    let attackerAfterShips     = applyLosses(attackerShipsBefore, attackerLossPercent);
+    let defenderAfterWarships  = applyLosses(defWarships, defenderLossPercent);
+    let defenderAfterShips     = applyLosses(defShips, defenderLossPercent);
+
+    // ---------------------------------------------------------------
+    // KAMPF V2 (§25): nur wenn COMBAT_ENGINE=shadow oder v2. Standard (v1) = diese ganze Stelle tut nichts.
+    //   shadow = v2 rechnet mit und schreibt nur ins Log, das Ergebnis bleibt das der alten Formel (v1)
+    //   v2     = v2 ueberschreibt Sieger, Verluste und Bonus-Prozente; Rundenbericht kommt in den Bericht
+    // Fehler in v2 fuehren NIE zum Abbruch, sondern zurueck zur alten Formel.
+    // ---------------------------------------------------------------
+    const combatEngine = getCombatEngineMode();
+    let v2Result = null;
+    let useV2 = false;
+    if (combatEngine !== 'v1') {
+        try {
+            const v2Seed = Math.floor(Math.random() * 2147483646) + 1;
+            v2Result = runCombatV2({
+                attacker: { warships: attackerFleet.warships, ships: attackerShipsBefore,
+                            research: v2ResearchOf(attackerCommander), retreatLossPercent: attackerFleet.retreatLossPercent },
+                defender: { warships: defWarships, ships: defShips, research: v2ResearchOf(defenderCommander) },
+                seed: v2Seed
+            });
+            const v1Text = attackerWins ? 'Angreifer siegt' : 'Verteidiger siegt';
+            const v2Line = `[Kampf ${combatEngine}] ${attackerFleet.fleetId} | ${v2Summary(v2Result)} | v1: ${v1Text}`;
+            log.push(v2Line);
+            console.log(v2Line);
+            if (combatEngine === 'v2') useV2 = true;
+        } catch (e) {
+            v2Result = null;
+            useV2 = false;
+            log.push(`[Kampf v2] Fehler, Rueckfall auf v1: ${e.message}`);
+            console.error('[Kampf v2] Fehler, Rueckfall auf v1:', e.message);
+        }
+    }
+    if (useV2) {
+        attackerWins          = (v2Result.outcome === 'win');
+        report.attackerWins   = attackerWins;
+        attackerAfterWarships = v2Result.attacker.warships;
+        attackerAfterShips    = v2Result.attacker.ships;
+        defenderAfterWarships = v2Result.defender.warships;
+        defenderAfterShips    = v2Result.defender.ships;
+        attackerFleetBonus    = v2Result.attackerBonusPercent / 100;
+        defenderFleetBonus    = v2Result.defenderBonusPercent / 100;
+        report.attackerBonusPercent = v2Result.attackerBonusPercent;
+        report.defenderBonusPercent = v2Result.defenderBonusPercent;
+        // Zusatzfelder im Bericht (alte Felder bleiben unveraendert; aeltere Spiel-Versionen ignorieren Neues)
+        report.engineVersion     = 2;
+        report.outcomeKind       = v2Result.outcome;      // win | lose | both | draw | retreat
+        report.attackerRetreated = v2Result.retreated;
+        report.combatSeed        = v2Result.seed;
+        report.rounds            = v2Result.roundLog;
+        report.roundsStart       = { round: 0, att: v2Result.startState.att, def: v2Result.startState.def, events: [] };
+    }
 
     const attackerParticipant = buildParticipant(attackerCommander, attackerFleet.fleetId, true, false, false,
         attackerFleet.warships, attackerShipsBefore, attackerAfterWarships, attackerAfterShips,
@@ -4799,8 +4851,13 @@ async function resolveCombat(attackerPlayFabId, attackerCommander, attackerFleet
     if (attackerWins && defenderPlanet) {
         const ironReserve = (defenderPlanet.buildings[0] || 0) * IRON_RESERVE_PER_LEVEL;
         let totalCargo = 0;
-        for (const n of attackerShipsBefore) totalCargo += (n || 0) * 1000; // Cargo-Platzhalter je Zivilschiff
-        for (const n of attackerFleet.warships) totalCargo += (n || 0) * 100;
+        if (useV2) {
+            // v2: Tragkapazitaet der UEBERLEBENDEN Schiffe (Asset-Werte, siehe §25)
+            totalCargo = v2CargoCapacity(attackerAfterWarships, attackerAfterShips);
+        } else {
+            for (const n of attackerShipsBefore) totalCargo += (n || 0) * 1000; // Cargo-Platzhalter je Zivilschiff
+            for (const n of attackerFleet.warships) totalCargo += (n || 0) * 100;
+        }
 
         const lootOrder = [2, 1, 3];
         let remaining = totalCargo;
@@ -4938,7 +4995,17 @@ async function resolveCombat(attackerPlayFabId, attackerCommander, attackerFleet
     log.push(`Kampf: ${attackerFleet.fleetId} | ${attackerWins ? 'Angreifer siegt' : 'Verteidiger siegt'} | Verluste ${report.totalAttackerLosses}/${report.totalDefenderLosses}`);
 
     // Rückflug-Flotte (mit Beute, Erfahrung wurde bereits direkt verbucht)
-    const finalReturnFleet = buildReturnFleet(attackerFleet, now, attackerAfterWarships, lootedRessources);
+    // v2: ueberlebende Zivilschiffe fliegen mit zurueck (bisher wurden zivile Verluste im Rueckflug nie abgezogen);
+    //     ist die gesamte Flotte vernichtet, gibt es keinen Rueckflug (null, beide Aufrufer koennen damit umgehen).
+    let finalReturnFleet;
+    if (useV2) {
+        const survivorsLeft = sumArray(attackerAfterWarships) + sumArray(attackerAfterShips);
+        finalReturnFleet = survivorsLeft > 0
+            ? buildReturnFleet({ ...attackerFleet, ships: attackerAfterShips }, now, attackerAfterWarships, lootedRessources)
+            : null;
+    } else {
+        finalReturnFleet = buildReturnFleet(attackerFleet, now, attackerAfterWarships, lootedRessources);
+    }
 
     // NEU: Angriffs-Akte — Kampf abgeschlossen, Rückflug-Flotte erzeugt
     await upsertAttackTrace(attackerFleet.fleetId, {
@@ -4946,7 +5013,7 @@ async function resolveCombat(attackerPlayFabId, attackerCommander, attackerFleet
         combat_success: true,
         combat_report_id: report.reportId,
         shield_held: false,
-        return_fleet_id: finalReturnFleet.fleetId
+        return_fleet_id: finalReturnFleet ? finalReturnFleet.fleetId : null
     });
 
     return finalReturnFleet;
@@ -5708,6 +5775,410 @@ app.post('/admin/inspectPlayer', async (req, res) => {
         res.status(500).json({ success: false, error: 'Spieler-Info konnte nicht erstellt werden.' });
     }
 });
+
+// #####################################################################
+// §25  KAMPF V2 (Rundenkampf: Schiffsgruppen, Schutz gegen Waffenart, Sonderfaehigkeiten, Mischbonus)
+//      Portierung des Kampfsimulators (Unity: CombatSimulator.cs; Konzept in Obsidian:
+//      project_virgo_kampfskript / project_virgo_kampf_uebernahme_plan).
+//      NUR aktiv, wenn die Umgebungsvariable COMBAT_ENGINE auf "shadow" oder "v2" steht.
+//        v1     (Standard) = alte Formel, ganz unveraendert
+//        shadow            = v2 rechnet bei jedem Kampf mit und schreibt nur ins Log (Ergebnis bleibt v1)
+//        v2                = v2 entscheidet (Sieger, Verluste, Rundenbericht)
+//      runCombatV2() ist eine REINE Funktion (kein PlayFab, keine Datenbank) -> einzeln testbar.
+//      Die Formeln sind bewusst GEHEIM: im Kampfbericht stehen nur Ergebnisse, keine Erklaerungen.
+// #####################################################################
+
+const COMBAT_V2 = {
+    hpFactor:           5,     // HP je Schiff = hpFactor x Schutzsumme
+    hardness:           10,    // Schutz mindert Schaden: x 1 / (1 + Schutz / hardness)
+    shotSize:           10,    // Rohschaden je Einzelschuss bei Zufallstreffern (Schwarm)
+    carrierCover:       0.5,   // Zufallstreffer erreichen Traeger (hinten) nur mit dieser Chance
+    maxRounds:          30,    // danach Patt ("draw")
+    civilHp:            100,   // HP je Zivilschiff (wie bisher in der alten Formel)
+    civilJoinLossShare: 0.5,   // Zivile treten ein, wenn so viel der Kriegsschiff-HP-Werte zerstoert ist
+    mixPerGroup:        0.10,  // Flottenbonus je Gruppe (max. 4 Gruppen = 40 %)
+    maxShipsPerSide:    200000 // Schutz vor absurden Zahlen (Speicher); darueber -> Fehler -> Rueckfall auf v1
+};
+
+// Grundwerte Warship01-04 (Quelle: Unity Assets/Ship Assets, Stand 22.09.2026). Warship05-10 sind gesperrt
+// und nehmen am Kampf nicht teil (bleiben unveraendert erhalten).
+const V2_WARSHIPS = [
+    { id: 'Warship01', carrier: false, w: [10, 1, 0],    s: [2, 2, 1] },
+    { id: 'Warship02', carrier: false, w: [15, 0, 12],   s: [6, 2, 3] },
+    { id: 'Warship03', carrier: false, w: [11, 22, 11],  s: [10, 8, 6] },
+    { id: 'Warship04', carrier: true,  w: [90, 45, 120], s: [70, 56, 42] }
+];
+const V2_IDEAL_RATIO = [6, 3, 2, 1];                          // Warship01 : 02 : 03 : 04
+const V2_CARGO_WARSHIP = [100, 170, 280, 460, 100, 100, 100, 100, 100, 100]; // Tragkapazitaet je Kriegsschiff (Assets)
+const V2_CARGO_CIVIL = 1000;                                   // Platzhalter je Zivilschiff wie bisher
+
+function getCombatEngineMode() {
+    const m = String(process.env.COMBAT_ENGINE || 'v1').toLowerCase();
+    return (m === 'v2' || m === 'shadow') ? m : 'v1';
+}
+
+// Gemischte Flotte: Ideal 6:3:2:1. Jede vorhandene Gruppe bis 10 %, max. 40 %. Nur EINE Gruppe = kein Bonus.
+// Schwaechste Passung bestimmt die Qualitaet (verhindert Schein-Mischung).
+function v2MixBonus(warships) {
+    const present = [];
+    for (let i = 0; i < 4; i++) {
+        const n = Math.floor(Number((warships || [])[i]) || 0);
+        if (n > 0) present.push({ i, n });
+    }
+    if (present.length < 2) return 0;
+    let total = 0, sumRatio = 0;
+    for (const p of present) { total += p.n; sumRatio += V2_IDEAL_RATIO[p.i]; }
+    let minQ = 1;
+    for (const p of present) {
+        const share = p.n / total;
+        const ideal = V2_IDEAL_RATIO[p.i] / sumRatio;
+        minQ = Math.min(minQ, share / ideal, ideal / share);
+    }
+    return COMBAT_V2.mixPerGroup * present.length * minQ;
+}
+
+// Zufallsgenerator mit Startwert (reproduzierbar: der Startwert steht im Bericht)
+function v2Rng(seed) {
+    let a = (seed >>> 0) || 1;
+    return function () {
+        a = (a + 0x6D2B79F5) | 0;
+        let t = Math.imul(a ^ (a >>> 15), 1 | a);
+        t = (t + Math.imul(t ^ (t >>> 7), 61 | t)) ^ t;
+        return ((t ^ (t >>> 14)) >>> 0) / 4294967296;
+    };
+}
+
+function v2Num(x, max) {
+    const n = Number(x);
+    if (!Number.isFinite(n) || n < 0) return 0;
+    return Math.min(n, max);
+}
+
+function v2BuildSide(spec, isAttacker, mix) {
+    const res = spec.research || {};
+    const rw = res.w || [0, 0, 0];
+    const rs = res.s || [0, 0, 0];
+    const groups = [];
+    let warHp0 = 0;
+    let totalShips = 0;
+
+    for (let i = 0; i < 4; i++) {
+        const n = Math.floor(v2Num((spec.warships || [])[i], 1e9));
+        if (n <= 0) continue;
+        totalShips += n;
+        const st = V2_WARSHIPS[i];
+        const g = { id: st.id, kind: 'war', idx: i, carrier: st.carrier, active: true, n0: n, w: [0, 0, 0], s: [0, 0, 0], hp0: 0, list: [] };
+        for (let k = 0; k < 3; k++) {
+            g.w[k] = st.w[k] * (1 + 0.01 * v2Num(rw[k], 1000)) * (isAttacker ? 1 + mix : 1);
+            g.s[k] = st.s[k] * (1 + 0.01 * v2Num(rs[k], 1000));
+        }
+        g.hp0 = COMBAT_V2.hpFactor * (g.s[0] + g.s[1] + g.s[2]) * (isAttacker ? 1 : 1 + mix);
+        warHp0 += n * g.hp0;
+        groups.push(g);
+    }
+    for (let i = 0; i < 6; i++) {
+        const n = Math.floor(v2Num((spec.ships || [])[i], 1e9));
+        if (n <= 0) continue;
+        totalShips += n;
+        groups.push({ id: 'Ship0' + i, kind: 'civil', idx: i, carrier: false, active: false, n0: n, w: [0, 0, 0], s: [0, 0, 0], hp0: COMBAT_V2.civilHp, list: [] });
+    }
+    if (totalShips > COMBAT_V2.maxShipsPerSide) throw new Error('Kampf v2: zu viele Schiffe (' + totalShips + ')');
+    for (const g of groups) for (let j = 0; j < g.n0; j++) g.list.push({ hp: g.hp0 });
+    return { groups, warHp0, civilActive: false };
+}
+
+function v2Alive(side) {
+    let n = 0;
+    for (const g of side.groups) n += g.list.length;
+    return n;
+}
+
+function v2WarAlive(side) {
+    let n = 0;
+    for (const g of side.groups) if (g.kind === 'war') n += g.list.length;
+    return n;
+}
+
+// Anteil der zerstoerten Kriegsschiffe (nach HP-Wert gewichtet, 0..1). Ohne Kriegsschiffe: 1.
+function v2DestroyedShare(side) {
+    if (side.warHp0 <= 0) return 1;
+    let left = 0;
+    for (const g of side.groups) if (g.kind === 'war') left += g.list.length * g.hp0;
+    return Math.max(0, Math.min(1, 1 - left / side.warHp0));
+}
+
+function v2ActivateCivil(side) {
+    side.civilActive = true;
+    for (const g of side.groups) if (g.kind === 'civil') g.active = true;
+}
+
+function v2HitShip(g, ship, raw, wi) {
+    const f = 1 / (1 + g.s[wi] / COMBAT_V2.hardness);
+    const e = raw * f;
+    if (e >= ship.hp) {
+        const used = ship.hp / f;
+        const eff = ship.hp;
+        ship.hp = 0;
+        return { used, eff, killed: true };
+    }
+    ship.hp -= e;
+    return { used: raw, eff: e, killed: false };
+}
+
+function v2AddLog(log, key, raw, eff, kills) {
+    const e = log[key] || (log[key] = { raw: 0, eff: 0, kills: 0 });
+    e.raw += raw; e.eff += eff; e.kills += kills;
+}
+
+// Zufallsverteilung ("Schwarm"): Schuesse auf zufaellige lebende Schiffe der aktiven Gruppen
+function v2Scatter(groups, raw, wi, log, mode, rng) {
+    if (raw <= 0) return;
+    let packets = Math.max(1, Math.ceil(raw / COMBAT_V2.shotSize));
+    packets = Math.min(packets, 5000);
+    const each = raw / packets;
+    const weight = new Array(groups.length);
+    for (let k = 0; k < packets; k++) {
+        let total = 0;
+        for (let i = 0; i < groups.length; i++) {
+            const g = groups[i];
+            const w = g.list.length === 0 ? 0 : g.list.length * (g.carrier ? COMBAT_V2.carrierCover : 1);
+            weight[i] = w;
+            total += w;
+        }
+        if (total <= 0) return;
+        let pick = rng() * total;
+        let gi = 0;
+        while (gi < groups.length - 1 && pick >= weight[gi]) { pick -= weight[gi]; gi++; }
+        const target = groups[gi];
+        if (target.list.length === 0) continue;
+        const idx = Math.floor(rng() * target.list.length);
+        const ship = target.list[idx];
+        const h = v2HitShip(target, ship, each, wi);
+        v2AddLog(log, wi + mode + '|' + target.id, h.used, h.eff, h.killed ? 1 : 0);
+        if (h.killed) {
+            target.list[idx] = target.list[target.list.length - 1];
+            target.list.pop();
+        }
+    }
+}
+
+// Gezielter Beschuss in fester Reihenfolge, Ueberschuss laeuft auf das naechste Ziel weiter
+function v2Sequence(order, raw, wi, log, mode) {
+    let r = raw;
+    for (const t of order) {
+        if (r <= 1e-6) break;
+        if (t.ship.hp <= 0) continue;
+        const h = v2HitShip(t.g, t.ship, r, wi);
+        r -= h.used;
+        v2AddLog(log, wi + mode + '|' + t.g.id, h.used, h.eff, h.killed ? 1 : 0);
+    }
+}
+
+function v2Cleanup(groups) {
+    for (const g of groups) g.list = g.list.filter(s => s.hp > 0);
+}
+
+function v2Shuffle(arr, rng) {
+    for (let i = arr.length - 1; i > 0; i--) {
+        const j = Math.floor(rng() * (i + 1));
+        const t = arr[i]; arr[i] = arr[j]; arr[j] = t;
+    }
+}
+
+function v2FirePower(side) {
+    const d = [0, 0, 0];
+    for (const g of side.groups) {
+        if (!g.active) continue;
+        for (let k = 0; k < 3; k++) d[k] += g.w[k] * g.list.length;
+    }
+    return d;
+}
+
+// Ein Schlag einer Seite gegen die aktiven Gruppen des Gegners (d = Feuerkraft vom Rundenanfang)
+function v2Attack(d, defSide, round, log, rng) {
+    const active = () => defSide.groups.filter(g => g.active && g.list.length > 0);
+
+    // Waffe01: Runde 1 gebuendelt (70 %) auf die Gruppe mit dem schwaechsten Schutz01, Rest gestreut
+    if (d[0] > 0) {
+        if (round === 1) {
+            let focus = null;
+            for (const g of active()) if (focus === null || g.s[0] < focus.s[0]) focus = g;
+            if (focus) {
+                const order = focus.list.map(s => ({ g: focus, ship: s }));
+                v2Shuffle(order, rng);
+                v2Sequence(order, d[0] * 0.7, 0, log, 'F');
+                v2Cleanup(defSide.groups);
+                v2Scatter(active(), d[0] * 0.3, 0, log, '', rng);
+            }
+        } else {
+            v2Scatter(active(), d[0], 0, log, '', rng);
+        }
+    }
+
+    // Waffe02 (Raketen): zuerst auf die groessten Schiffe, dazu 5 % Flaechenschaden auf andere Gruppen
+    if (d[1] > 0) {
+        const groups = active().sort((a, b) => b.hp0 - a.hp0);
+        if (groups.length > 0) {
+            const order = [];
+            for (const g of groups) {
+                const ships = g.list.slice().sort((a, b) => b.hp - a.hp);
+                for (const s of ships) order.push({ g, ship: s });
+            }
+            v2Sequence(order, d[1], 1, log, '');
+            v2Cleanup(defSide.groups);
+            const others = active().filter(g => g !== groups[0]);
+            if (others.length > 0) v2Scatter(others, d[1] * 0.05, 1, log, 'AE', rng);
+        }
+    }
+
+    // Waffe03 (Energie): gezielt auf die schwaechsten Schiffe
+    if (d[2] > 0) {
+        const order = [];
+        for (const g of active()) for (const s of g.list) order.push({ g, ship: s });
+        order.sort((a, b) => a.ship.hp - b.ship.hp);
+        v2Sequence(order, d[2], 2, log, '');
+        v2Cleanup(defSide.groups);
+    }
+}
+
+function v2Round1(x) { return Math.round(x * 10) / 10; }
+
+function v2ModeOrder(m) { return m === 'F' ? 0 : (m === '' ? 1 : 2); }
+
+function v2ActionsForReport(log) {
+    const list = [];
+    for (const key of Object.keys(log)) {
+        const e = log[key];
+        if (e.raw <= 1e-4) continue;
+        const bar = key.indexOf('|');
+        const head = key.slice(0, bar);
+        list.push({ w: parseInt(head.charAt(0), 10), m: head.slice(1), t: key.slice(bar + 1), r: v2Round1(e.raw), e: v2Round1(e.eff), k: e.kills });
+    }
+    list.sort((a, b) => (a.w * 10 + v2ModeOrder(a.m)) - (b.w * 10 + v2ModeOrder(b.m)) || (a.t < b.t ? -1 : a.t > b.t ? 1 : 0));
+    return list;
+}
+
+function v2SideState(side, log) {
+    let hp = 0;
+    const groups = side.groups.map(g => {
+        let wounded = 0;
+        for (const s of g.list) { hp += s.hp; if (s.hp < g.hp0 - 1e-4) wounded++; }
+        return { id: g.id, start: g.n0, alive: g.list.length, wounded };
+    });
+    return { groups, hp: v2Round1(hp), fired: v2ActionsForReport(log) };
+}
+
+// ---------------------------------------------------------------------
+// Hauptfunktion (rein). input = {
+//   attacker: { warships[10], ships[6], research: {w:[3], s:[3]}, retreatLossPercent (0 = bis zum Tod) },
+//   defender: { warships[10], ships[6], research: {w:[3], s:[3]} },
+//   seed
+// }
+// Rueckgabe: { outcome: 'win'|'lose'|'both'|'draw'|'retreat', rounds, roundLog[], attacker:{warships,ships},
+//              defender:{warships,ships}, attackerBonusPercent, defenderBonusPercent, retreated, seed }
+// ---------------------------------------------------------------------
+function runCombatV2(input) {
+    const rng = v2Rng(input.seed);
+    const attSpec = input.attacker || {};
+    const defSpec = input.defender || {};
+    const attMix = v2MixBonus(attSpec.warships);
+    const defMix = v2MixBonus(defSpec.warships);
+    const att = v2BuildSide(attSpec, true, attMix);
+    const def = v2BuildSide(defSpec, false, defMix);
+    const retreatPct = Math.min(100, v2Num(attSpec.retreatLossPercent, 100));
+
+    // Zivile treten sofort ein, wenn die Seite gar keine Kriegsschiffe hat
+    if (att.warHp0 <= 0) v2ActivateCivil(att);
+    if (def.warHp0 <= 0) v2ActivateCivil(def);
+
+    const startState = { att: v2SideState(att, {}), def: v2SideState(def, {}) }; // Aufstellung vor Runde 1 (fuer den Bericht)
+    const roundLog = [];
+    let retreated = false;
+
+    if (v2Alive(att) > 0 && v2Alive(def) > 0) {
+        for (let r = 1; r <= COMBAT_V2.maxRounds; r++) {
+            const logA = {}, logD = {};
+            const dAtt = v2FirePower(att);
+            const dDef = v2FirePower(def);
+            v2Attack(dAtt, def, r, logA, rng);
+            v2Attack(dDef, att, r, logD, rng);
+
+            const events = [];
+            const aAlive = v2Alive(att), dAlive = v2Alive(def);
+            if (aAlive > 0 && dAlive > 0) {
+                // Zivile treten in den Kampf ein, wenn der Grossteil der Kriegsschiffe verloren ist.
+                // Mit Rueckzugs-Taktik (retreatPct > 0) treten die Zivilen des Angreifers NIE ein.
+                if (!att.civilActive && retreatPct === 0 && v2DestroyedShare(att) >= COMBAT_V2.civilJoinLossShare) {
+                    v2ActivateCivil(att);
+                    events.push('att:civilJoin');
+                }
+                if (!def.civilActive && v2DestroyedShare(def) >= COMBAT_V2.civilJoinLossShare) {
+                    v2ActivateCivil(def);
+                    events.push('def:civilJoin');
+                }
+                if (retreatPct > 0 && v2DestroyedShare(att) * 100 >= retreatPct) {
+                    retreated = true;
+                    events.push('att:retreat');
+                }
+            }
+            roundLog.push({ round: r, att: v2SideState(att, logA), def: v2SideState(def, logD), events });
+            if (aAlive === 0 || dAlive === 0 || retreated) break;
+        }
+    }
+
+    const aAlive = v2Alive(att), dAlive = v2Alive(def);
+    let outcome;
+    if (aAlive === 0 && dAlive === 0) outcome = (roundLog.length === 0 ? 'draw' : 'both');
+    else if (dAlive === 0) outcome = 'win';
+    else if (aAlive === 0) outcome = 'lose';
+    else if (retreated) outcome = 'retreat';
+    else outcome = 'draw';
+
+    const survivors = (spec, side) => {
+        const war = Array.from({ length: 10 }, (_, i) => Math.max(0, Math.floor(Number((spec.warships || [])[i]) || 0)));
+        const civ = Array.from({ length: 6 }, (_, i) => Math.max(0, Math.floor(Number((spec.ships || [])[i]) || 0)));
+        for (const g of side.groups) {
+            if (g.kind === 'war') war[g.idx] = g.list.length;
+            else civ[g.idx] = g.list.length;
+        }
+        return { warships: war, ships: civ };
+    };
+
+    return {
+        outcome,
+        rounds: roundLog.length,
+        roundLog,
+        startState,
+        attacker: survivors(attSpec, att),
+        defender: survivors(defSpec, def),
+        attackerBonusPercent: v2Round1(attMix * 100),
+        defenderBonusPercent: v2Round1(defMix * 100),
+        retreated,
+        seed: input.seed
+    };
+}
+
+// Forschungsstufen eines Commanders (Feldnamen wie in commander_data)
+function v2ResearchOf(commander) {
+    return {
+        w: [v2Num(commander && commander.weapon01, 1000), v2Num(commander && commander.weapon02, 1000), v2Num(commander && commander.weapon03, 1000)],
+        s: [v2Num(commander && commander.shield01, 1000), v2Num(commander && commander.shield02, 1000), v2Num(commander && commander.shield03, 1000)]
+    };
+}
+
+// Beute-Tragkapazitaet der ueberlebenden Schiffe
+function v2CargoCapacity(warships, ships) {
+    let cap = 0;
+    for (let i = 0; i < 10; i++) cap += (warships[i] || 0) * V2_CARGO_WARSHIP[i];
+    for (let i = 0; i < 6; i++) cap += (ships[i] || 0) * V2_CARGO_CIVIL;
+    return cap;
+}
+
+// Kurzfassung fuer das Log (Schattenmodus / Fehlersuche)
+function v2Summary(res) {
+    return `v2: ${res.outcome} nach ${res.rounds} Runden | Angreifer WS ${res.attacker.warships.slice(0, 4).join('/')} Z ${res.attacker.ships.join('/')} | ` +
+           `Verteidiger WS ${res.defender.warships.slice(0, 4).join('/')} Z ${res.defender.ships.join('/')} | Bonus ${res.attackerBonusPercent}/${res.defenderBonusPercent} | Seed ${res.seed}`;
+}
 
 // #####################################################################
 // §21  SERVERSTART (app.listen)
