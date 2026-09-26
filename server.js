@@ -918,6 +918,18 @@ async function initDatabase() {
         await pool.query(`CREATE INDEX IF NOT EXISTS idx_planet_registry_system ON planet_registry (galaxy_id, sector_id, system_id);`);
         await pool.query(`CREATE INDEX IF NOT EXISTS idx_planet_registry_owner ON planet_registry (owner_commander_id);`);
 
+        // NEU 26.09.2026: Rang-Option "im Allianz-Profil anzeigen" (Minister/Anfuehrer erscheinen im oeffentlichen
+        // Allianz-Profil). Nur beim ALLERERSTEN Anlegen der Spalte werden die drei Start-Ministerien fuer bestehende
+        // Allianzen einmalig auf "anzeigen" gesetzt (danach frei vom Gruender einstellbar).
+        const showInProfileCol = await pool.query(
+            `SELECT 1 FROM information_schema.columns WHERE table_name = 'alliance_ranks' AND column_name = 'show_in_profile'`);
+        await pool.query(`ALTER TABLE alliance_ranks ADD COLUMN IF NOT EXISTS show_in_profile BOOLEAN NOT NULL DEFAULT false;`);
+        if (showInProfileCol.rows.length === 0) {
+            await pool.query(
+                `UPDATE alliance_ranks SET show_in_profile = true
+                 WHERE is_founder_rank = false AND name IN ('Kriegsminister', 'Außenminister', 'Innenminister')`);
+        }
+
         // Erstbefuellung des Registers (§26): NUR wenn es noch komplett leer ist, im Hintergrund NACH dem Start
         // (blockiert nichts), traegt nur fehlende Eintraege aus Title Data sys_* nach und ueberschreibt nie etwas.
         // Nach einem DB-Wechsel fuellt sich das Register dadurch von selbst wieder.
@@ -1377,6 +1389,42 @@ async function sendAllianceMail(commanderId, coord, subject, body) {
     }
 }
 
+// NEU 26.09.2026: RICH-TEXT fuer die oeffentliche Allianz-Beschreibung (Hauptwerbung der Allianz).
+// Erlaubt sind NUR harmlose Formatierungen: <b> <i> <u> <s>, <color=#RRGGBB>, <size=70..150%>, <align=left|center|right>
+// (plus die passenden Schliess-Tags). ALLES andere (<sprite>, <link>, <font>, <space>, <voffset>, <noparse> ...) wird
+// entfernt, damit niemand Layout sprengen, Links faelschen oder Bilder einschleusen kann. Zeilenumbrueche bleiben.
+// Die Bereinigung laeuft SERVERSEITIG beim Speichern (der Client bereinigt beim Anzeigen zusaetzlich).
+const ALLIANCE_DESCRIPTION_MAX = 2000;   // Rohtext inkl. Tags
+const ALLIANCE_INTERNAL_LINE_MAX = 500;  // die drei internen Textfelder
+function sanitizeRichText(raw) {
+    let s = String(raw == null ? '' : raw).replace(/\r\n?/g, '\n');
+    // Steuer-/Zero-Width-/Bidi-Zeichen raus (bleiben: \n und \t)
+    s = s.replace(/[\u0000-\u0008\u000B\u000C\u000E-\u001F\u200B-\u200F\u202A-\u202E\u2066-\u2069]/g, '');
+    s = s.replace(/<\/?[a-zA-Z][^<>]*>/g, (tag) => {
+        const inner = tag.slice(1, -1).trim();
+        let m;
+        if ((m = /^(\/?)(b|i|u|s)$/i.exec(inner))) return `<${m[1]}${m[2].toLowerCase()}>`;
+        if ((m = /^\/(color|size|align)$/i.exec(inner))) return `</${m[1].toLowerCase()}>`;
+        if ((m = /^color\s*=\s*"?#?([0-9a-f]{8}|[0-9a-f]{6}|[0-9a-f]{3})"?$/i.exec(inner))) return `<color=#${m[1]}>`;
+        if ((m = /^size\s*=\s*"?(\d{2,3})%"?$/i.exec(inner))) {
+            const pct = Math.min(150, Math.max(70, parseInt(m[1], 10)));
+            return `<size=${pct}%>`;
+        }
+        if ((m = /^align\s*=\s*"?(left|center|right)"?$/i.exec(inner))) return `<align=${m[1].toLowerCase()}>`;
+        return ''; // alles andere: entfernen
+    });
+    s = s.replace(/\n{4,}/g, '\n\n\n');                 // hoechstens 2 Leerzeilen am Stueck
+    s = s.split('\n').slice(0, 60).join('\n');         // hoechstens 60 Zeilen
+    return s;
+}
+
+// Die drei INTERNEN Textfelder (placeholder_01..03) sind NUR fuer Mitglieder bestimmt -> aus allen oeffentlichen Antworten entfernen.
+function withoutInternalFields(row) {
+    if (!row) return row;
+    const { placeholder_01, placeholder_02, placeholder_03, ...rest } = row;
+    return rest;
+}
+
 // Durchsuchbare Liste ALLER Allianzen — ?search=... filtert auf Name/Tag
 app.get('/alliances', async (req, res) => {
     try {
@@ -1396,7 +1444,7 @@ app.get('/alliances', async (req, res) => {
                  FROM alliances a ORDER BY a.points DESC LIMIT 100`
             );
         }
-        res.json({ success: true, alliances: result.rows });
+        res.json({ success: true, alliances: result.rows.map(withoutInternalFields) });
     } catch (error) {
         console.error('[Server] alliances GET Fehler:', error.message);
         res.status(500).json({ success: false, error: error.message });
@@ -1415,10 +1463,75 @@ app.get('/alliances/:id', async (req, res) => {
         );
         if (result.rows.length === 0)
             return res.status(404).json({ success: false, error: 'Allianz nicht gefunden' });
-        res.json({ success: true, alliance: result.rows[0] });
+        res.json({ success: true, alliance: withoutInternalFields(result.rows[0]) });
     } catch (error) {
         console.error('[Server] alliances/:id GET Fehler:', error.message);
         res.status(500).json({ success: false, error: error.message });
+    }
+});
+
+// NEU 26.09.2026: OEFFENTLICHES Allianz-Profil (fuer jeden abrufbar, auch Nicht-Mitglieder): Allianz-Daten, Gruender und alle
+// Mitglieder, deren Rang "im Allianz-Profil anzeigen" (show_in_profile) hat (z.B. Kriegs-/Aussen-/Innenminister).
+// Bewusst NICHT die komplette Mitgliederliste — nur die oeffentlich gewollte Fuehrung.
+app.get('/alliances/:id/profile', async (req, res) => {
+    const id = parseInt(req.params.id, 10);
+    if (!id) return res.status(400).json({ success: false, error: 'Ungültige ID' });
+    try {
+        const a = await pool.query(
+            `SELECT a.*, (SELECT COUNT(*) FROM alliance_members m WHERE m.alliance_id = a.id) AS member_count
+             FROM alliances a WHERE a.id = $1`, [id]);
+        if (a.rows.length === 0) return res.status(404).json({ success: false, error: 'Allianz nicht gefunden' });
+        const alliance = withoutInternalFields(a.rows[0]);
+
+        const lead = await pool.query(
+            `SELECT m.commander_id, m.commander_name, r.name AS rank_name, r.rank_order, r.is_founder_rank
+             FROM alliance_members m JOIN alliance_ranks r ON r.id = m.rank_id
+             WHERE m.alliance_id = $1 AND (r.is_founder_rank = true OR r.show_in_profile = true)
+             ORDER BY r.is_founder_rank DESC, r.rank_order ASC, m.commander_name ASC`, [id]);
+
+        let founder = null;
+        const founderRow = lead.rows.find(x => x.is_founder_rank);
+        if (founderRow) {
+            founder = { commander_id: founderRow.commander_id, commander_name: founderRow.commander_name };
+        } else {
+            // Rueckfall (sehr alte Allianzen ohne Rang-Zeilen): Gruender ueber founder_commander_id nachschlagen
+            const f = await pool.query(
+                'SELECT commander_id, commander_name FROM alliance_members WHERE alliance_id = $1 AND commander_id = $2',
+                [id, alliance.founder_commander_id]);
+            if (f.rows.length > 0) founder = { commander_id: f.rows[0].commander_id, commander_name: f.rows[0].commander_name };
+        }
+
+        res.json({
+            success: true,
+            alliance,
+            founder,
+            officers: lead.rows.filter(x => !x.is_founder_rank).map(x => ({
+                commander_id: x.commander_id, commander_name: x.commander_name, rank_name: x.rank_name }))
+        });
+    } catch (error) {
+        console.error('[Server] alliances/:id/profile GET Fehler:', error.message);
+        res.status(500).json({ success: false, error: 'Profil konnte nicht geladen werden.' });
+    }
+});
+
+// NEU 26.09.2026: die drei INTERNEN Textfelder (z.B. "Interne Allianzinformationen", "Regeln fuer Allianz-Shop", "Weiteres").
+// Nur fuer MITGLIEDER dieser Allianz abrufbar (?commanderId=...); alle oeffentlichen Endpunkte liefern sie nicht mehr aus.
+app.get('/alliances/:id/internal', async (req, res) => {
+    const id = parseInt(req.params.id, 10);
+    const commanderId = parseInt(req.query.commanderId, 10);
+    if (!id || !commanderId) return res.status(400).json({ success: false, error: 'Fehlende Parameter' });
+    try {
+        const m = await pool.query(
+            'SELECT 1 FROM alliance_members WHERE alliance_id = $1 AND commander_id = $2', [id, commanderId]);
+        if (m.rows.length === 0) return res.status(403).json({ success: false, error: 'Nur für Mitglieder.' });
+        const r = await pool.query(
+            'SELECT placeholder_01, placeholder_02, placeholder_03 FROM alliances WHERE id = $1', [id]);
+        if (r.rows.length === 0) return res.status(404).json({ success: false, error: 'Allianz nicht gefunden' });
+        res.json({ success: true, placeholder_01: r.rows[0].placeholder_01 || '',
+                   placeholder_02: r.rows[0].placeholder_02 || '', placeholder_03: r.rows[0].placeholder_03 || '' });
+    } catch (error) {
+        console.error('[Server] alliances/:id/internal GET Fehler:', error.message);
+        res.status(500).json({ success: false, error: 'Interne Infos konnten nicht geladen werden.' });
     }
 });
 
@@ -1792,7 +1905,7 @@ app.post('/alliances/:id/transfer-founder', async (req, res) => {
 // geändert werden soll.
 app.put('/alliances/:id/edit', async (req, res) => {
     const id = parseInt(req.params.id, 10);
-    const { commanderId, name, tag, logoId, description } = req.body;
+    const { commanderId, name, tag, logoId, description, placeholder01, placeholder02, placeholder03 } = req.body;
     if (!id || !commanderId) return res.status(400).json({ success: false, error: 'Fehlende Parameter' });
 
     try {
@@ -1802,7 +1915,9 @@ app.put('/alliances/:id/edit', async (req, res) => {
         // Entscheidung). Die Beschreibung dagegen IST delegierbar, für
         // Offiziere/Ministerien mit dem passenden Recht.
         const wantsStructuralChange = name !== undefined || tag !== undefined || logoId !== undefined;
-        const wantsDescriptionChange = description !== undefined;
+        // NEU 26.09.2026: die drei oeffentlichen Zeilen (placeholder_01-03) gelten wie die Beschreibung (delegierbar)
+        const wantsDescriptionChange = description !== undefined || placeholder01 !== undefined ||
+                                       placeholder02 !== undefined || placeholder03 !== undefined;
 
         if (wantsStructuralChange && !(await isAllianceFounder(commanderId, id)))
             return res.status(403).json({ success: false, error: 'Nur der Gründer darf Name/Tag/Logo ändern.' });
@@ -1836,9 +1951,15 @@ app.put('/alliances/:id/edit', async (req, res) => {
             updates.push(`logo_id = $${idx++}`); values.push(logoId);
         }
         if (description !== undefined) {
-            if ((description || '').length > 1000)
-                return res.status(400).json({ success: false, error: 'Beschreibung zu lang (max. 1000 Zeichen)' });
-            updates.push(`description = $${idx++}`); values.push(description || '');
+            if ((description || '').length > ALLIANCE_DESCRIPTION_MAX)
+                return res.status(400).json({ success: false, error: `Beschreibung zu lang (max. ${ALLIANCE_DESCRIPTION_MAX} Zeichen)` });
+            updates.push(`description = $${idx++}`); values.push(sanitizeRichText(description));
+        }
+        for (const [field, value] of [['placeholder_01', placeholder01], ['placeholder_02', placeholder02], ['placeholder_03', placeholder03]]) {
+            if (value === undefined) continue;
+            if ((value || '').length > ALLIANCE_INTERNAL_LINE_MAX)
+                return res.status(400).json({ success: false, error: `Interner Text zu lang (max. ${ALLIANCE_INTERNAL_LINE_MAX} Zeichen)` });
+            updates.push(`${field} = $${idx++}`); values.push(sanitizeRichText(value));
         }
 
         if (updates.length === 0)
@@ -1896,7 +2017,7 @@ app.get('/alliances/:id/ranks', async (req, res) => {
 app.post('/alliances/:id/ranks', async (req, res) => {
     const id = parseInt(req.params.id, 10);
     const { requesterCommanderId, name, rankOrder,
-        canManageApplications, canManageRelationships, canEditAllianceInfo, canKickMembers, canPromoteMembers } = req.body;
+        canManageApplications, canManageRelationships, canEditAllianceInfo, canKickMembers, canPromoteMembers, showInProfile } = req.body;
     if (!id || !requesterCommanderId || !name)
         return res.status(400).json({ success: false, error: 'Fehlende Parameter' });
 
@@ -1911,11 +2032,11 @@ app.post('/alliances/:id/ranks', async (req, res) => {
         const result = await pool.query(
             `INSERT INTO alliance_ranks
                 (alliance_id, name, rank_order, is_founder_rank, is_default_rank,
-                 can_manage_applications, can_manage_relationships, can_edit_alliance_info, can_kick_members, can_promote_members)
-             VALUES ($1, $2, $3, false, false, $4, $5, $6, $7, $8)
+                 can_manage_applications, can_manage_relationships, can_edit_alliance_info, can_kick_members, can_promote_members, show_in_profile)
+             VALUES ($1, $2, $3, false, false, $4, $5, $6, $7, $8, $9)
              RETURNING *`,
             [id, trimmedName, rankOrder || 50,
-             !!canManageApplications, !!canManageRelationships, !!canEditAllianceInfo, !!canKickMembers, !!canPromoteMembers]
+             !!canManageApplications, !!canManageRelationships, !!canEditAllianceInfo, !!canKickMembers, !!canPromoteMembers, !!showInProfile]
         );
         res.json({ success: true, rank: result.rows[0] });
     } catch (error) {
@@ -1928,7 +2049,7 @@ app.put('/alliances/:id/ranks/:rankId', async (req, res) => {
     const id = parseInt(req.params.id, 10);
     const rankId = parseInt(req.params.rankId, 10);
     const { requesterCommanderId, name, rankOrder, isDefaultRank,
-        canManageApplications, canManageRelationships, canEditAllianceInfo, canKickMembers, canPromoteMembers } = req.body;
+        canManageApplications, canManageRelationships, canEditAllianceInfo, canKickMembers, canPromoteMembers, showInProfile } = req.body;
     if (!id || !rankId || !requesterCommanderId)
         return res.status(400).json({ success: false, error: 'Fehlende Parameter' });
 
@@ -1962,6 +2083,7 @@ app.put('/alliances/:id/ranks/:rankId', async (req, res) => {
         if (canEditAllianceInfo    !== undefined) { updates.push(`can_edit_alliance_info = $${idx++}`);   values.push(!!canEditAllianceInfo); }
         if (canKickMembers         !== undefined) { updates.push(`can_kick_members = $${idx++}`);         values.push(!!canKickMembers); }
         if (canPromoteMembers      !== undefined) { updates.push(`can_promote_members = $${idx++}`);      values.push(!!canPromoteMembers); }
+        if (showInProfile          !== undefined) { updates.push(`show_in_profile = $${idx++}`);          values.push(!!showInProfile); } // NEU 26.09.2026
 
         if (isDefaultRank === true) {
             // Nur EIN Standard-Rang pro Allianz möglich — alten zuerst
@@ -2164,14 +2286,14 @@ app.put('/alliances/admin/:displayId/redescribe', async (req, res) => {
     const { requesterCommanderId, newDescription } = req.body;
     if (!ADMIN_COMMANDER_IDS.includes(requesterCommanderId))
         return res.status(403).json({ success: false, error: 'Nur Admin-Accounts dürfen das.' });
-    if ((newDescription || '').length > 1000)
-        return res.status(400).json({ success: false, error: 'Beschreibung zu lang (max. 1000 Zeichen)' });
+    if ((newDescription || '').length > ALLIANCE_DESCRIPTION_MAX)
+        return res.status(400).json({ success: false, error: `Beschreibung zu lang (max. ${ALLIANCE_DESCRIPTION_MAX} Zeichen)` });
 
     try {
         const alliance = await getAllianceByDisplayId(req.params.displayId);
         if (!alliance) return res.status(404).json({ success: false, error: 'Allianz nicht gefunden' });
 
-        await pool.query('UPDATE alliances SET description = $1 WHERE id = $2', [newDescription || '', alliance.id]);
+        await pool.query('UPDATE alliances SET description = $1 WHERE id = $2', [sanitizeRichText(newDescription), alliance.id]);
         res.json({ success: true });
     } catch (error) {
         console.error('[Server] admin/redescribe Fehler:', error.message);
@@ -2253,7 +2375,9 @@ app.post('/alliances/charter', async (req, res) => {
         return res.status(400).json({ success: false, error: 'Fehlende Pflichtfelder' });
     if (name.length < 6 || name.length > 30) return res.status(400).json({ success: false, error: 'Name muss 6-30 Zeichen haben' });
     if (tag.length < 3 || tag.length > 6) return res.status(400).json({ success: false, error: 'Tag muss 3-6 Zeichen haben' });
-    if ((description || '').length > 1000) return res.status(400).json({ success: false, error: 'Beschreibung zu lang (max. 1000 Zeichen)' });
+    if ((description || '').length > ALLIANCE_DESCRIPTION_MAX) return res.status(400).json({ success: false, error: `Beschreibung zu lang (max. ${ALLIANCE_DESCRIPTION_MAX} Zeichen)` });
+    for (const line of [placeholder01, placeholder02, placeholder03])
+        if ((line || '').length > ALLIANCE_INTERNAL_LINE_MAX) return res.status(400).json({ success: false, error: `Interner Text zu lang (max. ${ALLIANCE_INTERNAL_LINE_MAX} Zeichen)` });
     if ((logoId || 0) === 0 && !ADMIN_COMMANDER_IDS.includes(founderCommanderId))
         return res.status(403).json({ success: false, error: 'Dieses Logo ist Admin-Accounts vorbehalten.' });
 
@@ -2276,7 +2400,7 @@ app.post('/alliances/charter', async (req, res) => {
              VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12) RETURNING *`,
             [founderCommanderId, founderName || 'Unbekannt', founderCoord || null, founderGalaxyId || 1,
              name.trim(), tag.trim().toUpperCase(),
-             logoId || 0, description || '', placeholder01 || '', placeholder02 || '', placeholder03 || '',
+             logoId || 0, sanitizeRichText(description), sanitizeRichText(placeholder01), sanitizeRichText(placeholder02), sanitizeRichText(placeholder03),
              requiredSignatures]
         );
         res.json({ success: true, charter: result.rows[0] });
@@ -2771,14 +2895,17 @@ async function createDefaultAllianceRanks(allianceId) {
 
     const rankIds = {};
     for (const rank of defaultRanks) {
+        // NEU 26.09.2026: die drei Ministerien erscheinen standardmaessig im oeffentlichen Allianz-Profil
+        const showInProfile = ['Kriegsminister', 'Außenminister', 'Innenminister'].includes(rank.name);
         const result = await pool.query(
             `INSERT INTO alliance_ranks
                 (alliance_id, name, rank_order, is_founder_rank, is_default_rank,
-                 can_manage_applications, can_manage_relationships, can_edit_alliance_info, can_kick_members, can_promote_members)
-             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)
+                 can_manage_applications, can_manage_relationships, can_edit_alliance_info, can_kick_members, can_promote_members, show_in_profile)
+             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)
              RETURNING id, name`,
             [allianceId, rank.name, rank.rank_order, rank.is_founder_rank, rank.is_default_rank,
-             rank.can_manage_applications, rank.can_manage_relationships, rank.can_edit_alliance_info, rank.can_kick_members, rank.can_promote_members]
+             rank.can_manage_applications, rank.can_manage_relationships, rank.can_edit_alliance_info, rank.can_kick_members, rank.can_promote_members,
+             showInProfile]
         );
         rankIds[rank.name] = result.rows[0].id;
     }
