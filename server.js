@@ -52,6 +52,7 @@
 //  §23  Account-Daten loeschen (DSGVO, /account/delete-data): nur Postgres-Seite, noch nicht angebunden
 //  §24  Admin-Spieler-Info (/admin/inspectPlayer)
 //  §25  KAMPF V2 (Rundenkampf, Mischbonus, Zivile in letzter Reihe): steht VOR §21; aktiv nur bei COMBAT_ENGINE=shadow|v2
+//  §26  GALAXIE-REGISTER (planet_registry): serverautoritative Belegung, Schritt 1 (nur lesen/befuellen); steht VOR §21
 //
 //  WICHTIGE ARBEITSREGELN FUER DIESE DATEI
 //  - Laufendes System: NICHT umsortieren, nichts loeschen ohne Pruefung.
@@ -877,6 +878,59 @@ async function initDatabase() {
         await pool.query(`CREATE INDEX IF NOT EXISTS idx_attack_traces_attacker ON attack_traces (attacker_commander_id);`);
         await pool.query(`CREATE INDEX IF NOT EXISTS idx_attack_traces_defender ON attack_traces (defender_commander_id);`);
         await pool.query(`CREATE INDEX IF NOT EXISTS idx_attack_traces_updated ON attack_traces (last_updated_at DESC);`);
+
+        // NEU 23.09.2026: Spieler-Meldungen ("Melden"-Button im Spielerprofil).
+        // Nur Commander-IDs (Zahlen) + Grund/Freitext — bewusst KEINE E-Mail,
+        // kein Klarname, keine IP (siehe Datenschutz-Regel). Freitext kann
+        // trotzdem Personenbezug enthalten (wie Chat/Support) -> nie loggen.
+        await pool.query(`
+            CREATE TABLE IF NOT EXISTS player_reports (
+                id SERIAL PRIMARY KEY,
+                reporter_commander_id INTEGER NOT NULL,
+                reported_commander_id INTEGER NOT NULL,
+                reason TEXT NOT NULL,
+                message TEXT NOT NULL DEFAULT '',
+                created_at TIMESTAMPTZ NOT NULL DEFAULT now()
+            );
+        `);
+        await pool.query(`CREATE INDEX IF NOT EXISTS idx_player_reports_reported ON player_reports (reported_commander_id);`);
+        await pool.query(`CREATE INDEX IF NOT EXISTS idx_player_reports_cooldown ON player_reports (reporter_commander_id, reported_commander_id, created_at);`);
+
+        // NEU 26.09.2026: Galaxie-Register (§26) — serverautoritative Belegung. coord ist PRIMARY KEY, damit
+        // eine Besiedlung spaeter atomar ("wer zuerst kommt") per INSERT ... ON CONFLICT DO NOTHING geht.
+        // Nur IDs + Anzeigenamen (im Spiel oeffentliche Pseudonyme) — keine Personendaten. Das Register laesst
+        // sich jederzeit aus den Title-Data-Eintraegen sys_* neu aufbauen (Admin-Tool "#register rebuild").
+        await pool.query(`
+            CREATE TABLE IF NOT EXISTS planet_registry (
+                coord TEXT PRIMARY KEY,
+                galaxy_id INTEGER NOT NULL,
+                sector_id INTEGER NOT NULL,
+                system_id INTEGER NOT NULL,
+                planet_number INTEGER NOT NULL,
+                owner_commander_id INTEGER NOT NULL,
+                kind TEXT NOT NULL DEFAULT 'player',
+                owner_name TEXT NOT NULL DEFAULT '',
+                planet_name TEXT NOT NULL DEFAULT '',
+                claimed_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+                updated_at TIMESTAMPTZ NOT NULL DEFAULT now()
+            );
+        `);
+        await pool.query(`CREATE INDEX IF NOT EXISTS idx_planet_registry_system ON planet_registry (galaxy_id, sector_id, system_id);`);
+        await pool.query(`CREATE INDEX IF NOT EXISTS idx_planet_registry_owner ON planet_registry (owner_commander_id);`);
+
+        // Erstbefuellung des Registers (§26): NUR wenn es noch komplett leer ist, im Hintergrund NACH dem Start
+        // (blockiert nichts), traegt nur fehlende Eintraege aus Title Data sys_* nach und ueberschreibt nie etwas.
+        // Nach einem DB-Wechsel fuellt sich das Register dadurch von selbst wieder.
+        setTimeout(async () => {
+            try {
+                const c = await pool.query('SELECT COUNT(*) AS cnt FROM planet_registry');
+                if (parseInt(c.rows[0].cnt, 10) !== 0) return;
+                const r = await rebuildPlanetRegistryFromTitleData(false);
+                console.log(`[Registry] Erstbefuellung: ${r.inserted} Planeten eingetragen (sys_* belegt: ${r.found}, Fehler: ${r.errors}).`);
+            } catch (e) {
+                console.error('[Registry] Erstbefuellung fehlgeschlagen:', e.message);
+            }
+        }, 10000);
 
         console.log('[DB] Tabelle combat_reports + Sequenz + Flotten-Sperre + Angriffs-Verfolgung bereit.');
     } catch (e) {
@@ -2933,6 +2987,95 @@ app.post('/reportBug', async (req, res) => {
 });
 
 // -------------------------------------------------------
+// NEU 23.09.2026: Spieler melden (Button im Spielerprofil-Popup).
+// Zustellung wie /reportBug oben: Ingame-Mail direkt ins Admin-Postfach —
+// bewusst KEIN echter E-Mail-Versand (server.js hat keine Mail-Anbindung,
+// SendGrid wurde deaktiviert, siehe Datenschutz-Notizen). Die Meldung
+// selbst landet IMMER in player_reports (Blacklist-Grundlage fuer
+// /admin/inspectPlayer), die Admin-Mail ist nur zusaetzlich/informativ —
+// schlaegt sie fehl, bleibt die Meldung trotzdem gespeichert.
+// reporterCommanderId nutzt bewusst genau diesen Feldnamen (siehe
+// AUTH_COMMANDERID_FIELDS oben), damit die Identitaets-Pruefung greift,
+// sobald AUTH_MODE=enforce fuer die Gruppe 'player' aktiviert wird.
+// -------------------------------------------------------
+const REPORT_REASONS = [
+    'Beleidigung/Belästigung',
+    'Anstößiger Name',
+    'Cheating/Bug-Missbrauch',
+    'Betrug (Ingame)',
+    'Sonstiges'
+];
+
+app.post('/report-player', async (req, res) => {
+    const reporterId = parseInt(req.body?.reporterCommanderId, 10);
+    const reportedId = parseInt(req.body?.reportedCommanderId, 10);
+    const reason = req.body?.reason;
+    const message = String(req.body?.message || '').slice(0, 1000);
+
+    if (!reporterId || !reportedId)
+        return res.status(400).json({ success: false, error: 'Ungültige Commander-ID.' });
+    if (reporterId === reportedId)
+        return res.status(400).json({ success: false, error: 'Du kannst dich nicht selbst melden.' });
+    if (!REPORT_REASONS.includes(reason))
+        return res.status(400).json({ success: false, error: 'Ungültiger Meldegrund.' });
+
+    try {
+        // Spam-Schutz serverseitig (nicht nur im Client umgehbar): derselbe
+        // Zielspieler darf erst nach 5 Minuten erneut gemeldet werden.
+        const recent = await pool.query(
+            `SELECT 1 FROM player_reports
+             WHERE reporter_commander_id = $1 AND reported_commander_id = $2
+               AND created_at > now() - interval '5 minutes'`,
+            [reporterId, reportedId]);
+        if (recent.rows.length > 0)
+            return res.status(429).json({ success: false, error: 'Du hast diesen Spieler gerade erst gemeldet. Bitte warte ein paar Minuten.' });
+
+        await pool.query(
+            `INSERT INTO player_reports (reporter_commander_id, reported_commander_id, reason, message)
+             VALUES ($1, $2, $3, $4)`,
+            [reporterId, reportedId, reason, message]);
+    } catch (error) {
+        console.error('[Server] report-player Fehler (Speichern):', error.message);
+        return res.status(500).json({ success: false, error: error.message });
+    }
+
+    try {
+        const adminData = await playfabServer('/Server/GetUserData', {
+            PlayFabId: ADMIN_PLAYFAB_ID,
+            Keys: ['commander_data']
+        });
+        if (adminData.Data?.['commander_data']) {
+            const adminCommander = JSON.parse(adminData.Data['commander_data'].Value);
+            if (!adminCommander.inbox) adminCommander.inbox = [];
+
+            const mailSeq = await getNextMailSeq();
+            adminCommander.inbox.push({
+                mailId: `M-${adminCommander.commanderId}-${mailSeq}`,
+                category: 0, // System
+                subject: `Spielermeldung: Commander #${reportedId} (${reason})`,
+                body: `Gemeldet von Commander #${reporterId}\nGrund: ${reason}\n\n${message || '(kein Text)'}`,
+                senderName: 'Meldesystem',
+                senderId: 0,
+                isRead: false,
+                isFavorite: false,
+                timestamp: formatTimestamp(new Date()),
+                reportId: ''
+            });
+
+            await playfabServer('/Server/UpdateUserData', {
+                PlayFabId: ADMIN_PLAYFAB_ID,
+                Data: { 'commander_data': JSON.stringify(adminCommander) },
+                Permission: 'Private'
+            });
+        }
+    } catch (error) {
+        console.error('[Server] report-player Fehler (Admin-Mail, Meldung aber gespeichert):', error.message);
+    }
+
+    res.json({ success: true });
+});
+
+// -------------------------------------------------------
 // Admin-Cheat: Account-gebundene Ressource (Ress06-10, z.B. ICC)
 // gutschreiben/abziehen. Anders als Ress01-05 gehoert das nicht zu
 // einer Kolonie, sondern zum Commander direkt (accountResources) -
@@ -4382,6 +4525,10 @@ const HP_MULT_CARRIER = 4.1;  // Warship04-10
 const SHIELD_BUILDING_INDEX   = 10;   // Building10
 const SHIELD_HP_PER_LEVEL     = 5000;
 const IRON_RESERVE_PER_LEVEL  = 1000;
+// NEU 26.09.2026 (Nutzer-Vorgabe): je Angriff und je Ressource koennen hoechstens 33 % des LAGERBESTANDS
+// erbeutet werden (gilt fuer Spieler UND Piraten). Zusaetzlich zur Reserve oben (IRON_RESERVE) und zur
+// Tragkapazitaet. Grundwert — spaeter durch Forschung/Lagergebaeude veraenderbar.
+const LOOT_MAX_SHARE          = 0.33;
 const RECYCLING_BASE          = 0.10;
 const REPAIR_BASE             = 0.10;
 const LOSER_LOSS_MIN          = 0.45;
@@ -4863,8 +5010,10 @@ async function resolveCombat(attackerPlayFabId, attackerCommander, attackerFleet
         let remaining = totalCargo;
         for (const idx of lootOrder) {
             if (remaining <= 0) break;
-            const available = Math.max(0, (defenderPlanet.ressources[idx] || 0) - ironReserve);
-            const taken = Math.min(available, remaining);
+            const stock = defenderPlanet.ressources[idx] || 0;
+            const available = Math.max(0, stock - ironReserve);
+            const shareCap = Math.floor(stock * LOOT_MAX_SHARE); // max. 33 % des Bestands je Angriff
+            const taken = Math.min(available, shareCap, remaining);
             if (taken > 0) {
                 defenderPlanet.ressources[idx] -= taken;
                 report.loot[idx] = taken;
@@ -5541,8 +5690,12 @@ function inspectErrorText(error) {
 }
 
 async function buildPlayerInspectionReport(rawQuery) {
+    // NEU 26.09.2026: Register-Werkzeug (§26) — Befehle mit "#register" am Anfang
+    if (/^\s*#register\b/i.test(String(rawQuery || '')))
+        return await buildRegistryAdminReport(String(rawQuery).trim());
+
     const parsed = parseInspectQuery(rawQuery);
-    if (!parsed) return 'Bitte etwas eingeben: Commander-ID (z.B. 1000005), Ingame-Name (z.B. Agnes) oder PlayFab-ID (z.B. 1405316AFCC3DEDE).\nOptional danach Koordinaten, z.B.: 1000005 1:1:1:1 1:1:1:2';
+    if (!parsed) return 'Bitte etwas eingeben: Commander-ID (z.B. 1000005), Ingame-Name (z.B. Agnes) oder PlayFab-ID (z.B. 1405316AFCC3DEDE).\nOptional danach Koordinaten, z.B.: 1000005 1:1:1:1 1:1:1:2\nGalaxie-Register: #register (Status), #register rebuild, #register 1:1:1:1';
 
     const out = [];
     const add = (line = '') => out.push(line);
@@ -5744,6 +5897,18 @@ async function buildPlayerInspectionReport(rawQuery) {
         await count('Kampfberichte als Angreifer/Verteidiger (bleiben bewusst)', 'SELECT COUNT(*) AS cnt FROM combat_reports WHERE attacker_commander_id = $1 OR defender_commander_id = $1', [commanderId]);
         await count('Angriffs-Akten (bleiben bewusst)', 'SELECT COUNT(*) AS cnt FROM attack_traces WHERE attacker_commander_id = $1 OR defender_commander_id = $1', [commanderId]);
         await count('Ankuendigungen/VirgoDom-Nachrichten als Absender (nur Admins)', 'SELECT (SELECT COUNT(*) FROM announcements WHERE sender_commander_id = $1) + (SELECT COUNT(*) FROM virgodom_messages WHERE sender_commander_id = $1) AS cnt', [commanderId]);
+
+        // NEU 23.09.2026: Meldungen ueber diesen Spieler (Blacklist-Grundlage,
+        // siehe /report-player). Wie Highscore-Eintrag/Allianz-Mitgliedschaft
+        // oben: Anzahl + die letzten paar mit Grund/Zeitpunkt dahinter.
+        try {
+            const totalR = await pool.query('SELECT COUNT(*) AS cnt FROM player_reports WHERE reported_commander_id = $1', [commanderId]);
+            const recentR = await pool.query(
+                'SELECT reason, created_at FROM player_reports WHERE reported_commander_id = $1 ORDER BY created_at DESC LIMIT 5',
+                [commanderId]);
+            add(`- Meldungen gegen diesen Spieler: ${totalR.rows[0].cnt}` +
+                recentR.rows.map(x => `  [${x.reason}, ${formatTimestamp(x.created_at)}]`).join(''));
+        } catch (e) { add(`- Meldungen gegen diesen Spieler: (Abfrage fehlgeschlagen: ${e.message})`); }
     }
 
     add('');
@@ -6178,6 +6343,191 @@ function v2CargoCapacity(warships, ships) {
 function v2Summary(res) {
     return `v2: ${res.outcome} nach ${res.rounds} Runden | Angreifer WS ${res.attacker.warships.slice(0, 4).join('/')} Z ${res.attacker.ships.join('/')} | ` +
            `Verteidiger WS ${res.defender.warships.slice(0, 4).join('/')} Z ${res.defender.ships.join('/')} | Bonus ${res.attackerBonusPercent}/${res.defenderBonusPercent} | Seed ${res.seed}`;
+}
+
+// #####################################################################
+// §26  GALAXIE-REGISTER (planet_registry) — Belegung der Galaxie, serverautoritativ
+//      Hintergrund (Nutzer 26.09.2026): Besiedlung/Belegung wurde bisher im CLIENT entschieden
+//      (FleetManager.HandleColonization am LOKALEN Planeten-Objekt) -> jeder Spieler sah eine andere
+//      Galaxie, Doppel-Besiedlung war moeglich, Piraten waeren nur fuer manche sichtbar.
+//      Plan (Obsidian: project_virgo_enemy_npc_rework):
+//        Schritt 1 (DIESER Abschnitt) = Register + Abfragen + Admin-Werkzeug, nur lesen/befuellen,
+//                   KEINE Verhaltensaenderung im Spiel.
+//        Schritt 2 = Client nutzt das Register (atomare Besiedlung, Zielpruefung, Galaxie-Ansicht)
+//        Schritt 3 = Piraten (kind='pirate')   Schritt 4 = Startplaneten/Sektoren serverseitig
+//      Solange das Register nicht per "#register rebuild" befuellt und geprueft ist, darf "free: true"
+//      NICHT als verlaesslich gelten. Nur IDs + Pseudonyme, keine Personendaten.
+//      Admin-Werkzeug: im AdminPanel, Tab "Spieler-Info", ins Suchfeld eingeben:
+//        #register                    Status (Anzahl je Art/Sektor)
+//        #register rebuild            fehlende Eintraege aus Title Data sys_* nachtragen (ueberschreibt NICHTS,
+//                                     meldet Abweichungen)
+//        #register rebuild force      wie oben, ueberschreibt aber abweichende Eintraege mit sys_* (VORSICHT,
+//                                     sobald das Register die Wahrheit ist)
+//        #register 1:1:1:1            Register-Eintrag einer Koordinate im Vergleich mit sys_*
+// #####################################################################
+
+function normalizeRegistryCoord(raw) {
+    const parts = String(raw || '').split(':').map(p => parseInt(p, 10));
+    if (parts.length !== 4 || parts.some(n => isNaN(n) || n < 1 || n > 99999)) return null;
+    return parts.join(':');
+}
+
+function registryKindForOwner(ownerId) {
+    if (ownerId === ABANDONED_OWNER_ID) return 'abandoned';
+    if (ownerId >= 900000 && ownerId < 1000000) return 'pirate';
+    return 'player';
+}
+
+// Einzelner Planet: frei oder belegt
+app.get('/planet/:coord', async (req, res) => {
+    const coord = normalizeRegistryCoord(req.params.coord);
+    if (!coord) return res.status(400).json({ success: false, error: 'Ungültiges Koordinatenformat.' });
+    try {
+        const r = await pool.query(
+            'SELECT owner_commander_id, kind, owner_name, planet_name FROM planet_registry WHERE coord = $1', [coord]);
+        if (r.rows.length === 0) return res.json({ success: true, coord, free: true });
+        const row = r.rows[0];
+        res.json({ success: true, coord, free: false, ownerCommanderId: row.owner_commander_id,
+                   kind: row.kind, ownerName: row.owner_name, planetName: row.planet_name });
+    } catch (error) {
+        console.error('[Server] planet GET Fehler:', error.message);
+        res.status(500).json({ success: false, error: 'Abfrage fehlgeschlagen.' });
+    }
+});
+
+// Alle belegten Planeten eines Sonnensystems (gleiche Feldnamen wie der Client-Eintrag PublicPlanetEntry:
+// n, owner, name, pname — plus kind)
+app.get('/galaxy/system/:g/:s/:sys', async (req, res) => {
+    const g = parseInt(req.params.g, 10), s = parseInt(req.params.s, 10), sys = parseInt(req.params.sys, 10);
+    if ([g, s, sys].some(n => isNaN(n) || n < 1 || n > 99999))
+        return res.status(400).json({ success: false, error: 'Ungültige Koordinate.' });
+    try {
+        const r = await pool.query(
+            `SELECT planet_number, owner_commander_id, kind, owner_name, planet_name
+             FROM planet_registry WHERE galaxy_id = $1 AND sector_id = $2 AND system_id = $3
+             ORDER BY planet_number`, [g, s, sys]);
+        res.json({ success: true, planets: r.rows.map(x => ({
+            n: x.planet_number, owner: x.owner_commander_id, kind: x.kind, name: x.owner_name, pname: x.planet_name })) });
+    } catch (error) {
+        console.error('[Server] galaxy/system GET Fehler:', error.message);
+        res.status(500).json({ success: false, error: 'Abfrage fehlgeschlagen.' });
+    }
+});
+
+// Register aus den oeffentlichen Systemdaten (Title Data sys_1_<sektor>_<system>) befuellen.
+// Standard: nur FEHLENDE Eintraege nachtragen, abweichende NICHT ueberschreiben (nur melden).
+// force = abweichende Eintraege mit den sys_*-Daten ueberschreiben.
+async function rebuildPlanetRegistryFromTitleData(force) {
+    const MAX_SECTOR = 10, SYSTEMS_PER_SECTOR = 12; // Sektoren > 4 gibt es nur, falls Spieler lokal welche eroeffnet haben
+    const keys = [];
+    for (let s = 1; s <= MAX_SECTOR; s++)
+        for (let sys = 1; sys <= SYSTEMS_PER_SECTOR; sys++) keys.push(`sys_1_${s}_${sys}`);
+
+    const summary = { scanned: keys.length, withData: 0, found: 0, inserted: 0, updated: 0, unchanged: 0, conflicts: [], errors: 0 };
+    for (let i = 0; i < keys.length; i += 40) {
+        const chunk = keys.slice(i, i + 40);
+        let data = {};
+        try {
+            const r = await playfabServer('/Server/GetTitleData', { Keys: chunk });
+            data = (r && r.Data) || {};
+        } catch (e) { summary.errors++; continue; }
+
+        for (const key of chunk) {
+            const raw = data[key];
+            if (!raw) continue;
+            summary.withData++;
+            let systemData;
+            try { systemData = JSON.parse(raw); } catch (e) { summary.errors++; continue; }
+            const m = /^sys_(\d+)_(\d+)_(\d+)$/.exec(key);
+            if (!m) continue;
+            const g = parseInt(m[1], 10), s = parseInt(m[2], 10), sys = parseInt(m[3], 10);
+
+            for (const p of (systemData.planets || [])) {
+                const owner = Number(p.owner), n = Number(p.n);
+                if (!Number.isFinite(owner) || owner <= 0 || !Number.isFinite(n) || n < 1) continue; // -1 = frei
+                summary.found++;
+                const coord = `${g}:${s}:${sys}:${n}`;
+                const kind = registryKindForOwner(owner);
+                const existing = await pool.query('SELECT owner_commander_id FROM planet_registry WHERE coord = $1', [coord]);
+                if (existing.rows.length === 0) {
+                    await pool.query(
+                        `INSERT INTO planet_registry (coord, galaxy_id, sector_id, system_id, planet_number, owner_commander_id, kind, owner_name, planet_name)
+                         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)`,
+                        [coord, g, s, sys, n, owner, kind, String(p.name || ''), String(p.pname || '')]);
+                    summary.inserted++;
+                } else if (existing.rows[0].owner_commander_id !== owner) {
+                    if (force) {
+                        await pool.query(
+                            `UPDATE planet_registry SET owner_commander_id = $2, kind = $3, owner_name = $4, planet_name = $5, updated_at = now()
+                             WHERE coord = $1`, [coord, owner, kind, String(p.name || ''), String(p.pname || '')]);
+                        summary.updated++;
+                    } else {
+                        summary.conflicts.push(`${coord}: Register=${existing.rows[0].owner_commander_id}, sys_=${owner}`);
+                    }
+                } else {
+                    summary.unchanged++;
+                }
+            }
+        }
+    }
+    return summary;
+}
+
+// Text-Bericht fuer das AdminPanel (Tab "Spieler-Info"), aufgerufen aus buildPlayerInspectionReport (§24)
+async function buildRegistryAdminReport(query) {
+    const out = [];
+    const add = (line = '') => out.push(line);
+    const parts = String(query || '').replace(/^#register\s*/i, '').trim().split(/\s+/).filter(Boolean);
+    const cmd = (parts[0] || '').toLowerCase();
+
+    try {
+        if (cmd === 'rebuild') {
+            const force = (parts[1] || '').toLowerCase() === 'force';
+            add(force ? '=== REGISTER NEU AUFBAUEN (force: Abweichungen werden ueberschrieben) ===' : '=== REGISTER NACHTRAGEN (ueberschreibt nichts) ===');
+            const r = await rebuildPlanetRegistryFromTitleData(force);
+            add(`Gepruefte Systeme (Keys): ${r.scanned}, davon mit Daten: ${r.withData}`);
+            add(`Belegte Planeten in sys_*: ${r.found}`);
+            add(`Neu ins Register: ${r.inserted}`);
+            add(`Bereits identisch: ${r.unchanged}`);
+            if (force) add(`Ueberschrieben: ${r.updated}`);
+            add(`Fehler beim Lesen: ${r.errors}`);
+            add(`Abweichungen (Register != sys_*): ${r.conflicts.length}` + (force ? ' (ueberschrieben)' : ''));
+            for (const c of r.conflicts.slice(0, 20)) add('  ' + c);
+            if (r.conflicts.length > 20) add(`  ... und ${r.conflicts.length - 20} weitere`);
+            return out.join('\n');
+        }
+
+        if (/^\d+:\d+:\d+:\d+$/.test(cmd)) {
+            const coord = normalizeRegistryCoord(cmd);
+            add(`=== REGISTER-EINTRAG ${coord} ===`);
+            const r = await pool.query('SELECT * FROM planet_registry WHERE coord = $1', [coord]);
+            if (r.rows.length === 0) add('Register: FREI (kein Eintrag)');
+            else {
+                const x = r.rows[0];
+                add(`Register: Besitzer=${x.owner_commander_id}, Art=${x.kind}, Name="${x.owner_name}", Planetenname="${x.planet_name}", seit ${x.claimed_at}`);
+            }
+            const info = await getPlanetOwnerInfo(coord);
+            if (!info) add('sys_* (Title Data): kein Eintrag');
+            else add(`sys_* (Title Data): Besitzer=${info.ownerCommanderId}, Name="${info.ownerName}", Planetenname="${info.planetName}"`);
+            const registryOwner = r.rows.length ? r.rows[0].owner_commander_id : -1;
+            const sysOwner = info ? info.ownerCommanderId : -1;
+            add(registryOwner === sysOwner ? 'Ergebnis: uebereinstimmend' : 'Ergebnis: ABWEICHUNG zwischen Register und sys_*');
+            return out.join('\n');
+        }
+
+        add('=== GALAXIE-REGISTER: STATUS ===');
+        const total = await pool.query('SELECT COUNT(*) AS cnt FROM planet_registry');
+        add(`Belegte Planeten im Register: ${total.rows[0].cnt}`);
+        const byKind = await pool.query('SELECT kind, COUNT(*) AS cnt FROM planet_registry GROUP BY kind ORDER BY kind');
+        for (const x of byKind.rows) add(`  Art ${x.kind}: ${x.cnt}`);
+        const bySector = await pool.query('SELECT galaxy_id, sector_id, COUNT(*) AS cnt FROM planet_registry GROUP BY galaxy_id, sector_id ORDER BY galaxy_id, sector_id');
+        for (const x of bySector.rows) add(`  Galaxie ${x.galaxy_id}, Sektor ${x.sector_id}: ${x.cnt}`);
+        add();
+        add('Befehle: #register  |  #register rebuild  |  #register rebuild force  |  #register 1:1:1:1');
+    } catch (e) {
+        add('Register-Abfrage fehlgeschlagen: ' + e.message);
+    }
+    return out.join('\n');
 }
 
 // #####################################################################
