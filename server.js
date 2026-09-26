@@ -5580,6 +5580,12 @@ async function handOverColonies(playFabId, commanderId, colonies) {
             delete entry.pfid;
             changed = true;
             handedOver++;
+            // Galaxie-Register (§26) mitfuehren; Fehler hier duerfen die Loeschung NICHT abbrechen
+            try {
+                await pool.query(
+                    `UPDATE planet_registry SET owner_commander_id = $2, kind = 'abandoned', owner_name = $3, planet_name = '', updated_at = now()
+                     WHERE coord = $1`, [coord, ABANDONED_OWNER_ID, ABANDONED_COLONY_NAME]);
+            } catch (e) { console.error('[Registry] Kolonie nicht als verlassen eingetragen:', e.message); }
         }
         if (changed)
             await playfabServer('/Server/SetTitleData', { Key: key, Value: JSON.stringify(systemData) });
@@ -6383,8 +6389,16 @@ app.get('/planet/:coord', async (req, res) => {
     const coord = normalizeRegistryCoord(req.params.coord);
     if (!coord) return res.status(400).json({ success: false, error: 'Ungültiges Koordinatenformat.' });
     try {
-        const r = await pool.query(
+        let r = await pool.query(
             'SELECT owner_commander_id, kind, owner_name, planet_name FROM planet_registry WHERE coord = $1', [coord]);
+        if (r.rows.length === 0 && coordInGalaxyLimits(coord)) {
+            // Altbestand aus sys_* nachtragen (z.B. Startplaneten neuer Spieler); Fehler -> wie bisher "frei" melden
+            try {
+                await healRegistryFromTitleData(coord);
+                r = await pool.query(
+                    'SELECT owner_commander_id, kind, owner_name, planet_name FROM planet_registry WHERE coord = $1', [coord]);
+            } catch (e) { /* ignorieren */ }
+        }
         if (r.rows.length === 0) return res.json({ success: true, coord, free: true });
         const row = r.rows[0];
         res.json({ success: true, coord, free: false, ownerCommanderId: row.owner_commander_id,
@@ -6411,6 +6425,108 @@ app.get('/galaxy/system/:g/:s/:sys', async (req, res) => {
     } catch (error) {
         console.error('[Server] galaxy/system GET Fehler:', error.message);
         res.status(500).json({ success: false, error: 'Abfrage fehlgeschlagen.' });
+    }
+});
+
+// ---------------------------------------------------------------------
+// SCHRITT 2 (26.09.2026): Client nutzt das Register
+// ---------------------------------------------------------------------
+// Grenzen der Galaxie (muessen zu GalaxyManager passen: 12 Systeme je Sektor, max. 15 Planeten je System)
+function coordInGalaxyLimits(coord) {
+    const [g, s, sys, n] = String(coord).split(':').map(Number);
+    return g === 1 && s >= 1 && s <= 50 && sys >= 1 && sys <= 12 && n >= 1 && n <= 15;
+}
+
+// Traegt einen Planeten, den die OEFFENTLICHEN Systemdaten (sys_*) als belegt fuehren, ins Register nach
+// (Altbestand, z.B. Startplaneten neu registrierter Spieler, die der Client noch selbst vergibt).
+// Wirft bei Lesefehlern (PlayFab) — der Aufrufer darf dann NICHT von "frei" ausgehen.
+async function healRegistryFromTitleData(coord) {
+    const [g, s, sys, n] = coord.split(':').map(Number);
+    const key = `sys_${g}_${s}_${sys}`;
+    const result = await playfabServer('/Server/GetTitleData', { Keys: [key] });
+    const raw = result && result.Data ? result.Data[key] : null;
+    if (!raw) return;
+    let systemData;
+    try { systemData = JSON.parse(raw); } catch (e) { return; }
+    const entry = (systemData.planets || []).find(p => Number(p.n) === n);
+    if (!entry) return;
+    const owner = Number(entry.owner);
+    if (!Number.isFinite(owner) || owner <= 0) return; // -1 = frei
+    await pool.query(
+        `INSERT INTO planet_registry (coord, galaxy_id, sector_id, system_id, planet_number, owner_commander_id, kind, owner_name, planet_name)
+         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9) ON CONFLICT (coord) DO NOTHING`,
+        [coord, g, s, sys, n, owner, registryKindForOwner(owner), String(entry.name || ''), String(entry.pname || '')]);
+}
+
+// Alle Eintraege einer Galaxie (Client laedt sie beim Login und danach nur noch Aenderungen: ?since=<serverTime>)
+app.get('/galaxy/registry', async (req, res) => {
+    const g = parseInt(req.query.g, 10) || 1;
+    let since = null;
+    if (req.query.since) {
+        const d = new Date(String(req.query.since));
+        if (!isNaN(d.getTime())) since = d;
+    }
+    try {
+        const t = await pool.query('SELECT now() AS t');
+        const serverTime = t.rows[0].t;
+        const r = since
+            ? await pool.query(
+                `SELECT coord, owner_commander_id, kind, owner_name, planet_name FROM planet_registry
+                 WHERE galaxy_id = $1 AND updated_at >= $2::timestamptz - interval '2 seconds'`, [g, since.toISOString()])
+            : await pool.query(
+                'SELECT coord, owner_commander_id, kind, owner_name, planet_name FROM planet_registry WHERE galaxy_id = $1', [g]);
+        res.json({ success: true, serverTime: new Date(serverTime).toISOString(), planets: r.rows.map(x => ({
+            c: x.coord, owner: x.owner_commander_id, kind: x.kind, name: x.owner_name, pname: x.planet_name })) });
+    } catch (error) {
+        console.error('[Server] galaxy/registry GET Fehler:', error.message);
+        res.status(500).json({ success: false, error: 'Abfrage fehlgeschlagen.' });
+    }
+});
+
+// Besiedlung: ATOMAR ("wer zuerst kommt"). Antworten: 200 claimed (auch wiederholt vom selben Spieler = idempotent, falls die
+// Antwort auf dem Weg verloren ging), 409 occupied (mit Besitzer), 503 wenn die Altdaten nicht lesbar sind (Client versucht es spaeter).
+// commanderId heisst bewusst so (AUTH_COMMANDERID_FIELDS): Identitaetspruefung greift, sobald 'player' erzwungen wird.
+app.post('/planet/claim', async (req, res) => {
+    const commanderId = parseInt(req.body?.commanderId, 10);
+    const coord = normalizeRegistryCoord(req.body?.coord);
+    const ownerName = String(req.body?.ownerName || '').slice(0, 32);
+    if (!commanderId || commanderId < 1000000)
+        return res.status(400).json({ success: false, error: 'Ungültige Commander-ID.' });
+    if (!coord || !coordInGalaxyLimits(coord))
+        return res.status(400).json({ success: false, error: 'Ungültige Koordinate.' });
+
+    // Identitaet: nur bei DEFINITIVEM Widerspruch zwischen Ticket und Body ablehnen (Uebergangsphase AUTH_MODE=log)
+    try {
+        const ticket = req.get('X-Session-Ticket');
+        if (ticket) {
+            const pf = await authenticateTicket(ticket);
+            const proven = pf ? await authCommanderIdFor(pf) : null;
+            if (proven !== null && Number(proven) !== commanderId)
+                return res.status(403).json({ success: false, error: 'Commander-ID passt nicht zum Login.' });
+        }
+    } catch (e) { /* Pruefung nicht moeglich -> wie Uebergangsmodus */ }
+
+    try {
+        try { await healRegistryFromTitleData(coord); }
+        catch (e) {
+            console.error('[Server] planet/claim: sys_-Abgleich fehlgeschlagen:', e.message);
+            return res.status(503).json({ success: false, retry: true, error: 'Belegung gerade nicht prüfbar. Bitte später erneut versuchen.' });
+        }
+        const [g, s, sys, n] = coord.split(':').map(Number);
+        const ins = await pool.query(
+            `INSERT INTO planet_registry (coord, galaxy_id, sector_id, system_id, planet_number, owner_commander_id, kind, owner_name, planet_name)
+             VALUES ($1, $2, $3, $4, $5, $6, 'player', $7, '') ON CONFLICT (coord) DO NOTHING RETURNING coord`,
+            [coord, g, s, sys, n, commanderId, ownerName]);
+        if (ins.rows.length > 0) return res.json({ success: true, claimed: true, coord });
+
+        const cur = await pool.query('SELECT owner_commander_id, kind, owner_name FROM planet_registry WHERE coord = $1', [coord]);
+        const row = cur.rows[0];
+        if (row && row.owner_commander_id === commanderId) return res.json({ success: true, claimed: true, alreadyMine: true, coord });
+        return res.status(409).json({ success: false, occupied: true, error: 'Planet bereits besiedelt.',
+            ownerCommanderId: row ? row.owner_commander_id : 0, kind: row ? row.kind : 'player', ownerName: row ? row.owner_name : '' });
+    } catch (error) {
+        console.error('[Server] planet/claim Fehler:', error.message);
+        res.status(500).json({ success: false, retry: true, error: 'Besiedlung gerade nicht möglich.' });
     }
 });
 
