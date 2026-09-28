@@ -930,6 +930,16 @@ async function initDatabase() {
                  WHERE is_founder_rank = false AND name IN ('Kriegsminister', 'Außenminister', 'Innenminister')`);
         }
 
+        // NEU 28.09.2026: Rang-Recht "Rundmail senden" — analog zu can_kick_members etc. Bewusst
+        // NICHT automatisch an bestehende Nicht-Gruender-Raenge vergeben (Default false), der Gruender
+        // muss es pro Allianz bewusst freigeben. Der Gruender-Rang bekommt es einmalig direkt (er hat
+        // durch is_founder_rank ohnehin immer alle Rechte, das ist nur fuer Konsistenz in der DB).
+        await pool.query(`ALTER TABLE alliance_ranks ADD COLUMN IF NOT EXISTS can_send_broadcast_mail BOOLEAN NOT NULL DEFAULT false;`);
+        await pool.query(`UPDATE alliance_ranks SET can_send_broadcast_mail = true WHERE is_founder_rank = true AND can_send_broadcast_mail = false;`);
+        // Spam-Schutz (Fairplay-Regel): Zeitstempel des letzten Rundmail-Versands pro Allianz,
+        // siehe BROADCAST_MAIL_COOLDOWN_MINUTES weiter unten.
+        await pool.query(`ALTER TABLE alliances ADD COLUMN IF NOT EXISTS last_broadcast_mail_at TIMESTAMPTZ;`);
+
         // Erstbefuellung des Registers (§26): NUR wenn es noch komplett leer ist, im Hintergrund NACH dem Start
         // (blockiert nichts), traegt nur fehlende Eintraege aus Title Data sys_* nach und ueberschreibt nie etwas.
         // Nach einem DB-Wechsel fuellt sich das Register dadurch von selbst wieder.
@@ -1549,7 +1559,7 @@ app.get('/alliances/:id/members', async (req, res) => {
             `SELECT m.*,
                     r.name AS rank_name, r.rank_order, r.is_founder_rank, r.is_default_rank,
                     r.can_manage_applications, r.can_manage_relationships, r.can_edit_alliance_info,
-                    r.can_kick_members, r.can_promote_members,
+                    r.can_kick_members, r.can_promote_members, r.can_send_broadcast_mail,
                     COALESCE(h.total_points, 0) AS total_points,
                     h.updated_at AS last_active_at
              FROM alliance_members m
@@ -2017,7 +2027,8 @@ app.get('/alliances/:id/ranks', async (req, res) => {
 app.post('/alliances/:id/ranks', async (req, res) => {
     const id = parseInt(req.params.id, 10);
     const { requesterCommanderId, name, rankOrder,
-        canManageApplications, canManageRelationships, canEditAllianceInfo, canKickMembers, canPromoteMembers, showInProfile } = req.body;
+        canManageApplications, canManageRelationships, canEditAllianceInfo, canKickMembers, canPromoteMembers, showInProfile,
+        canSendBroadcastMail } = req.body;
     if (!id || !requesterCommanderId || !name)
         return res.status(400).json({ success: false, error: 'Fehlende Parameter' });
 
@@ -2032,11 +2043,13 @@ app.post('/alliances/:id/ranks', async (req, res) => {
         const result = await pool.query(
             `INSERT INTO alliance_ranks
                 (alliance_id, name, rank_order, is_founder_rank, is_default_rank,
-                 can_manage_applications, can_manage_relationships, can_edit_alliance_info, can_kick_members, can_promote_members, show_in_profile)
-             VALUES ($1, $2, $3, false, false, $4, $5, $6, $7, $8, $9)
+                 can_manage_applications, can_manage_relationships, can_edit_alliance_info, can_kick_members, can_promote_members, show_in_profile,
+                 can_send_broadcast_mail)
+             VALUES ($1, $2, $3, false, false, $4, $5, $6, $7, $8, $9, $10)
              RETURNING *`,
             [id, trimmedName, rankOrder || 50,
-             !!canManageApplications, !!canManageRelationships, !!canEditAllianceInfo, !!canKickMembers, !!canPromoteMembers, !!showInProfile]
+             !!canManageApplications, !!canManageRelationships, !!canEditAllianceInfo, !!canKickMembers, !!canPromoteMembers, !!showInProfile,
+             !!canSendBroadcastMail]
         );
         res.json({ success: true, rank: result.rows[0] });
     } catch (error) {
@@ -2049,7 +2062,8 @@ app.put('/alliances/:id/ranks/:rankId', async (req, res) => {
     const id = parseInt(req.params.id, 10);
     const rankId = parseInt(req.params.rankId, 10);
     const { requesterCommanderId, name, rankOrder, isDefaultRank,
-        canManageApplications, canManageRelationships, canEditAllianceInfo, canKickMembers, canPromoteMembers, showInProfile } = req.body;
+        canManageApplications, canManageRelationships, canEditAllianceInfo, canKickMembers, canPromoteMembers, showInProfile,
+        canSendBroadcastMail } = req.body;
     if (!id || !rankId || !requesterCommanderId)
         return res.status(400).json({ success: false, error: 'Fehlende Parameter' });
 
@@ -2084,6 +2098,7 @@ app.put('/alliances/:id/ranks/:rankId', async (req, res) => {
         if (canKickMembers         !== undefined) { updates.push(`can_kick_members = $${idx++}`);         values.push(!!canKickMembers); }
         if (canPromoteMembers      !== undefined) { updates.push(`can_promote_members = $${idx++}`);      values.push(!!canPromoteMembers); }
         if (showInProfile          !== undefined) { updates.push(`show_in_profile = $${idx++}`);          values.push(!!showInProfile); } // NEU 26.09.2026
+        if (canSendBroadcastMail   !== undefined) { updates.push(`can_send_broadcast_mail = $${idx++}`);   values.push(!!canSendBroadcastMail); } // NEU 28.09.2026
 
         if (isDefaultRank === true) {
             // Nur EIN Standard-Rang pro Allianz möglich — alten zuerst
@@ -2138,6 +2153,77 @@ app.delete('/alliances/:id/ranks/:rankId', async (req, res) => {
         res.json({ success: true });
     } catch (error) {
         console.error('[Server] alliances/:id/ranks DELETE Fehler:', error.message);
+        res.status(500).json({ success: false, error: error.message });
+    }
+});
+
+// -------------------------------------------------------
+// NEU (28.09.2026): Rundmail — an alle Mitglieder EINES oder MEHRERER
+// gewaehlter Raenge. Braucht das neue Rang-Recht can_send_broadcast_mail.
+// Text darf genauso "kreativ" formatiert sein wie die Allianzbeschreibung
+// (gleiche sanitizeRichText()-Erlaubnisliste + gleiches Zeichenlimit) —
+// Nutzer-Entscheidung 28.09.2026. Spam-Schutz: ein fester Cooldown pro
+// Allianz (nicht pro Rang/Spieler), damit nicht mehrere Ministerien
+// hintereinander die ganze Allianz zuspammen koennen.
+// -------------------------------------------------------
+const BROADCAST_MAIL_COOLDOWN_MINUTES = 10;
+
+app.post('/alliances/:id/broadcast-mail', async (req, res) => {
+    const id = parseInt(req.params.id, 10);
+    const { requesterCommanderId, rankIds, message } = req.body;
+    if (!id || !requesterCommanderId)
+        return res.status(400).json({ success: false, error: 'Fehlende Parameter' });
+    if (!Array.isArray(rankIds) || rankIds.length === 0)
+        return res.status(400).json({ success: false, error: 'Bitte mindestens einen Rang auswählen.' });
+    if (!message || !String(message).trim())
+        return res.status(400).json({ success: false, error: 'Bitte einen Text eingeben.' });
+
+    try {
+        if (!(await allianceHasPermission(requesterCommanderId, id, 'can_send_broadcast_mail')))
+            return res.status(403).json({ success: false, error: 'Keine Berechtigung, Rundmails zu senden.' });
+
+        const sanitized = sanitizeRichText(message);
+        if (sanitized.length > ALLIANCE_DESCRIPTION_MAX)
+            return res.status(400).json({ success: false, error: `Text zu lang (max. ${ALLIANCE_DESCRIPTION_MAX} Zeichen).` });
+
+        const allianceResult = await pool.query('SELECT name, tag, last_broadcast_mail_at FROM alliances WHERE id = $1', [id]);
+        if (allianceResult.rows.length === 0)
+            return res.status(404).json({ success: false, error: 'Allianz nicht gefunden.' });
+        const alliance = allianceResult.rows[0];
+
+        if (alliance.last_broadcast_mail_at) {
+            const minutesSince = (Date.now() - new Date(alliance.last_broadcast_mail_at).getTime()) / 60000;
+            if (minutesSince < BROADCAST_MAIL_COOLDOWN_MINUTES) {
+                const waitMinutes = Math.ceil(BROADCAST_MAIL_COOLDOWN_MINUTES - minutesSince);
+                return res.status(429).json({ success: false, error: `Die Allianz hat gerade erst eine Rundmail verschickt. Bitte noch ${waitMinutes} Min. warten.` });
+            }
+        }
+
+        // Nur Raenge zulassen, die WIRKLICH zu dieser Allianz gehoeren (sonst koennte eine fremde
+        // Rang-ID aus einer anderen Allianz untergeschoben werden).
+        const rankCheck = await pool.query(
+            'SELECT id, name FROM alliance_ranks WHERE alliance_id = $1 AND id = ANY($2::int[])',
+            [id, rankIds]
+        );
+        if (rankCheck.rows.length === 0)
+            return res.status(400).json({ success: false, error: 'Keiner der gewählten Ränge gehört zu dieser Allianz.' });
+        const validRankIds = rankCheck.rows.map(r => r.id);
+
+        const membersResult = await pool.query(
+            'SELECT commander_id, commander_coord FROM alliance_members WHERE alliance_id = $1 AND rank_id = ANY($2::int[])',
+            [id, validRankIds]
+        );
+
+        const subject = `Rundmail: ${alliance.name} [${alliance.tag}]`; // LOCALIZE
+        for (const member of membersResult.rows) {
+            await sendAllianceMail(member.commander_id, member.commander_coord, subject, sanitized);
+        }
+
+        await pool.query('UPDATE alliances SET last_broadcast_mail_at = now() WHERE id = $1', [id]);
+
+        res.json({ success: true, recipientCount: membersResult.rows.length });
+    } catch (error) {
+        console.error('[Server] alliances/:id/broadcast-mail Fehler:', error.message);
         res.status(500).json({ success: false, error: error.message });
     }
 });
@@ -2824,7 +2910,8 @@ const ALLIANCE_PERMISSION_COLUMNS = [
     'can_manage_relationships',
     'can_edit_alliance_info',
     'can_kick_members',
-    'can_promote_members'
+    'can_promote_members',
+    'can_send_broadcast_mail' // NEU 28.09.2026
 ];
 
 // Generische Rechte-Prüfung — EINE Stelle für alle künftigen
@@ -2882,15 +2969,15 @@ async function getMemberRankInfo(commanderId, allianceId) {
 async function createDefaultAllianceRanks(allianceId) {
     const defaultRanks = [
         { name: 'Gründer', rank_order: 0, is_founder_rank: true, is_default_rank: false,
-          can_manage_applications: true, can_manage_relationships: true, can_edit_alliance_info: true, can_kick_members: true, can_promote_members: true },
+          can_manage_applications: true, can_manage_relationships: true, can_edit_alliance_info: true, can_kick_members: true, can_promote_members: true, can_send_broadcast_mail: true },
         { name: 'Kriegsminister', rank_order: 10, is_founder_rank: false, is_default_rank: false,
-          can_manage_applications: false, can_manage_relationships: true, can_edit_alliance_info: false, can_kick_members: false, can_promote_members: false },
+          can_manage_applications: false, can_manage_relationships: true, can_edit_alliance_info: false, can_kick_members: false, can_promote_members: false, can_send_broadcast_mail: false },
         { name: 'Außenminister', rank_order: 10, is_founder_rank: false, is_default_rank: false,
-          can_manage_applications: false, can_manage_relationships: true, can_edit_alliance_info: false, can_kick_members: false, can_promote_members: false },
+          can_manage_applications: false, can_manage_relationships: true, can_edit_alliance_info: false, can_kick_members: false, can_promote_members: false, can_send_broadcast_mail: false },
         { name: 'Innenminister', rank_order: 10, is_founder_rank: false, is_default_rank: false,
-          can_manage_applications: true, can_manage_relationships: false, can_edit_alliance_info: false, can_kick_members: true, can_promote_members: true },
+          can_manage_applications: true, can_manage_relationships: false, can_edit_alliance_info: false, can_kick_members: true, can_promote_members: true, can_send_broadcast_mail: false },
         { name: 'Mitglied', rank_order: 100, is_founder_rank: false, is_default_rank: true,
-          can_manage_applications: false, can_manage_relationships: false, can_edit_alliance_info: false, can_kick_members: false, can_promote_members: false }
+          can_manage_applications: false, can_manage_relationships: false, can_edit_alliance_info: false, can_kick_members: false, can_promote_members: false, can_send_broadcast_mail: false }
     ];
 
     const rankIds = {};
@@ -2900,12 +2987,13 @@ async function createDefaultAllianceRanks(allianceId) {
         const result = await pool.query(
             `INSERT INTO alliance_ranks
                 (alliance_id, name, rank_order, is_founder_rank, is_default_rank,
-                 can_manage_applications, can_manage_relationships, can_edit_alliance_info, can_kick_members, can_promote_members, show_in_profile)
-             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)
+                 can_manage_applications, can_manage_relationships, can_edit_alliance_info, can_kick_members, can_promote_members, show_in_profile,
+                 can_send_broadcast_mail)
+             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12)
              RETURNING id, name`,
             [allianceId, rank.name, rank.rank_order, rank.is_founder_rank, rank.is_default_rank,
              rank.can_manage_applications, rank.can_manage_relationships, rank.can_edit_alliance_info, rank.can_kick_members, rank.can_promote_members,
-             showInProfile]
+             showInProfile, rank.can_send_broadcast_mail]
         );
         rankIds[rank.name] = result.rows[0].id;
     }
