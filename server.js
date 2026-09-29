@@ -6049,6 +6049,25 @@ async function buildPlayerInspectionReport(rawQuery) {
         }
     }
 
+    // ---- Aktive Flotten (29.09.2026, Fund "Flotte F-153-R blieb stecken"):
+    // Bisher konnte niemand - auch kein Admin - direkt nachsehen, WAS genau
+    // in commander.activeFleets steht, wenn ein Spieler eine "verschwundene"
+    // Flotte meldet. Jetzt roh mit ausgegeben, damit sich jede kuenftige
+    // Meldung dieser Art SOFORT nachpruefen laesst, statt auf Theorien
+    // angewiesen zu sein.
+    add('');
+    add('=== AKTIVE FLOTTEN (commander_data.activeFleets) ===');
+    if (!commanderData) {
+        add('Nicht pruefbar (commander_data nicht geladen/lesbar).');
+    } else {
+        const fleets = Array.isArray(commanderData.activeFleets) ? commanderData.activeFleets : [];
+        if (fleets.length === 0) add('Keine aktiven Flotten.');
+        for (const f of fleets) {
+            add(`- ${f.fleetId}  Mission=${f.mission}  ${f.originCoord} -> ${f.destinationCoord}`);
+            add(`    arrivalUtc=${f.arrivalUtc}  hasArrived=${f.hasArrived}  isReturnFlight=${!!f.isReturnFlight}`);
+        }
+    }
+
     // ---- PlayFab: interne Daten ----
     add('');
     add('=== PLAYFAB: INTERNE DATEN (UserInternalData) ===');
