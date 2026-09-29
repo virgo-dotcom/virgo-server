@@ -968,12 +968,34 @@ initDatabase();
 // Versucht, eine Flotte exklusiv "zu beanspruchen", bevor sie verarbeitet
 // wird. Gibt true zurück, wenn dieser Aufruf die Flotte verarbeiten darf;
 // false, wenn ein anderer Prozess sie bereits (zeitgleich) übernommen hat.
+//
+// NEU (29.09.2026, Fund "Flotte F-1000000-153-R blieb 23+ Std. stecken"):
+// Ein reiner PRIMARY-KEY-INSERT macht den Claim für IMMER exklusiv, auch
+// wenn die eigentliche Verarbeitung danach mit einer Exception abbricht
+// (z.B. sendMail() in processReturn() scheitert kurz nach einem
+// Render-Kaltstart) — der äußere try/catch in serverTickHandler fängt
+// das ab und speichert den Commander dann NICHT, die Flotte bleibt also
+// unverändert in activeFleets stehen, aber ihre fleetId ist in
+// processed_fleets schon für immer "vergeben": jeder künftige Tick
+// scheitert am claim und überspringt die Flotte lautlos, für immer.
+// Fix: der Claim ist nur noch 5 Minuten lang exklusiv (mehr als genug
+// gegen echte Gleichzeitigkeit, da der Tick selbst nur alle 5 Minuten
+// läuft) — danach gilt er als verwaist und ist automatisch neu
+// beanspruchbar. Eine WIRKLICH fertig verarbeitete Flotte wird nie
+// erneut geclaimt, weil sie dann längst nicht mehr in activeFleets
+// steht (der Tick iteriert nur über activeFleets, s.o.) — die Zeitgrenze
+// betrifft also ausschließlich verwaiste/abgebrochene Claims.
 async function claimFleetForProcessing(fleetId) {
     try {
-        await pool.query('INSERT INTO processed_fleets (fleet_id) VALUES ($1)', [fleetId]);
-        return true;
+        const result = await pool.query(
+            `INSERT INTO processed_fleets (fleet_id) VALUES ($1)
+             ON CONFLICT (fleet_id) DO UPDATE SET processed_at = now()
+             WHERE processed_fleets.processed_at < now() - interval '5 minutes'
+             RETURNING fleet_id`,
+            [fleetId]
+        );
+        return result.rows.length > 0;
     } catch (e) {
-        // Unique-Constraint-Verletzung = bereits vergeben
         return false;
     }
 }
