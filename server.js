@@ -6806,6 +6806,55 @@ app.post('/planet/claim', async (req, res) => {
     }
 });
 
+// Selbstheilung (NEU, 01.10.2026): Ein Client, der ueber seine EIGENE commander.colonies-Liste
+// (die einzige garantiert korrekte Quelle, siehe GalaxyRegistrySync.cs) sicher weiss, dass eine
+// Koordinate ihm gehoert, das Register aber einen anderen/veralteten Besitzer nennt, meldet das
+// hier automatisch — ohne Admin-Eingriff. Haeufigster Ausloeser: Startplaneten-Zuweisung traf eine
+// Koordinate, die im Register noch einen alten (z.B. zurueckgesetzten Test-)Account als Besitzer
+// fuehrte, weil der Best-Effort-Claim bei der Zuweisung mit 409 fehlschlug (siehe SessionManager.cs).
+// Gleiche Identitaetspruefung wie /planet/claim; ANDERS als dort: ueberschreibt einen bestehenden
+// Eintrag (ON CONFLICT ... DO UPDATE), weil hier ausdruecklich eine bereits bestaetigte EIGENE
+// Kolonie gemeldet wird, nicht ein neuer "wer zuerst kommt"-Anspruch auf einen fremden Planeten.
+app.post('/planet/reassert', async (req, res) => {
+    const commanderId = parseInt(req.body?.commanderId, 10);
+    const coord = normalizeRegistryCoord(req.body?.coord);
+    const ownerName = String(req.body?.ownerName || '').slice(0, 32);
+    if (!commanderId || commanderId < 1000000)
+        return res.status(400).json({ success: false, error: 'Ungültige Commander-ID.' });
+    if (!coord || !coordInGalaxyLimits(coord))
+        return res.status(400).json({ success: false, error: 'Ungültige Koordinate.' });
+
+    // Identitaet: nur bei DEFINITIVEM Widerspruch zwischen Ticket und Body ablehnen (Uebergangsphase AUTH_MODE=log)
+    try {
+        const ticket = req.get('X-Session-Ticket');
+        if (ticket) {
+            const pf = await authenticateTicket(ticket);
+            const proven = pf ? await authCommanderIdFor(pf) : null;
+            if (proven !== null && Number(proven) !== commanderId)
+                return res.status(403).json({ success: false, error: 'Commander-ID passt nicht zum Login.' });
+        }
+    } catch (e) { /* Pruefung nicht moeglich -> wie Uebergangsmodus */ }
+
+    try {
+        const [g, s, sys, n] = coord.split(':').map(Number);
+        const upd = await pool.query(
+            `INSERT INTO planet_registry (coord, galaxy_id, sector_id, system_id, planet_number, owner_commander_id, kind, owner_name, planet_name)
+             VALUES ($1, $2, $3, $4, $5, $6, 'player', $7, '')
+             ON CONFLICT (coord) DO UPDATE SET
+                owner_commander_id = EXCLUDED.owner_commander_id,
+                kind = 'player',
+                owner_name = EXCLUDED.owner_name,
+                updated_at = now()
+             WHERE planet_registry.owner_commander_id IS DISTINCT FROM EXCLUDED.owner_commander_id
+             RETURNING coord`,
+            [coord, g, s, sys, n, commanderId, ownerName]);
+        res.json({ success: true, coord, corrected: upd.rows.length > 0 });
+    } catch (error) {
+        console.error('[Server] planet/reassert Fehler:', error.message);
+        res.status(500).json({ success: false, error: 'Korrektur gerade nicht möglich.' });
+    }
+});
+
 // Register aus den oeffentlichen Systemdaten (Title Data sys_1_<sektor>_<system>) befuellen.
 // Standard: nur FEHLENDE Eintraege nachtragen, abweichende NICHT ueberschreiben (nur melden).
 // force = abweichende Eintraege mit den sys_*-Daten ueberschreiben.
