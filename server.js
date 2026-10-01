@@ -5472,26 +5472,35 @@ async function sendCombatMail(commander, report, isAttackerMail) {
 // -------------------------------------------------------
 // Rückflug landen
 // -------------------------------------------------------
+// NEU (01.10.2026, Fund "Flotte F-1000000-153-R ist nie auf dem Planeten angekommen"):
+// Fruehere Fassung schluckte JEDEN Fehler beim Gutschreiben still (catch(e){}) - egal
+// ob GetUserData/UpdateUserData scheiterte oder die Zielplaneten-Daten fehlten, die
+// Flotte wurde TROTZDEM als "gelandet" verbucht, eine Mail "ist gelandet" verschickt
+// und aus activeFleets entfernt. Schiffe/Ressourcen waren dann einfach weg, einzige
+// Spur ein leicht uebersehbares return_success:false in Postgres.
+// Jetzt: KEIN stilles Schlucken mehr. Schlaegt das Gutschreiben fehl, wirft diese
+// Funktion - keine Luege-Mail, keine Markierung als verarbeitet, die Flotte bleibt in
+// activeFleets stehen. Dank des zeitlich begrenzten Claims (claimFleetForProcessing,
+// 29.09.2026er Fix) wird automatisch beim naechsten Tick neu versucht, statt die
+// Fracht fuer immer zu verlieren - ein echter Fehler wird jetzt laut geloggt statt
+// lautlos verschluckt.
 async function processReturn(playFabId, commander, fleet, log) {
-    // Schiffe auf Heimatplanet gutschreiben
     const planetKey = `planet_${fleet.destinationCoord.replace(/:/g, '_')}`;
-    let creditSuccess = false;
-    try {
-        const pData = await playfabServer('/Server/GetUserData', {
-            PlayFabId: playFabId, Keys: [planetKey]
-        });
-        if (pData.Data?.[planetKey]) {
-            const planet = JSON.parse(pData.Data[planetKey].Value);
-            fleet.warships.forEach((n, i) => { planet.warships[i] = (planet.warships[i] || 0) + n; });
-            fleet.ressources.forEach((n, i) => { planet.ressources[i] = (planet.ressources[i] || 0) + n; });
-            await playfabServer('/Server/UpdateUserData', {
-                PlayFabId: playFabId,
-                Data: { [planetKey]: JSON.stringify(planet) },
-                Permission: 'Private'
-            });
-            creditSuccess = true;
-        }
-    } catch(e) {}
+    const pData = await playfabServer('/Server/GetUserData', {
+        PlayFabId: playFabId, Keys: [planetKey]
+    });
+    if (!pData.Data?.[planetKey]) {
+        console.error(`[Rueckflug] Zielplanet-Daten fehlen fuer ${fleet.fleetId} (Ziel ${fleet.destinationCoord}, PlayFabId ${playFabId}) - Rueckflug wird NICHT verbucht, naechster Tick versucht es erneut.`);
+        throw new Error(`Zielplanet-Daten fehlen: ${planetKey}`);
+    }
+    const planet = JSON.parse(pData.Data[planetKey].Value);
+    fleet.warships.forEach((n, i) => { planet.warships[i] = (planet.warships[i] || 0) + n; });
+    fleet.ressources.forEach((n, i) => { planet.ressources[i] = (planet.ressources[i] || 0) + n; });
+    await playfabServer('/Server/UpdateUserData', {
+        PlayFabId: playFabId,
+        Data: { [planetKey]: JSON.stringify(planet) },
+        Permission: 'Private'
+    });
 
     await sendMail(commander, 'Flotte zurückgekehrt',
         `Flotte ${fleet.fleetId} ist auf ${fleet.destinationCoord} gelandet.`, 1);
@@ -5506,7 +5515,7 @@ async function processReturn(playFabId, commander, fleet, log) {
         : fleet.fleetId;
     await upsertAttackTrace(baseFleetId, {
         return_processed_at: new Date(),
-        return_success: creditSuccess
+        return_success: true
     });
 }
 
