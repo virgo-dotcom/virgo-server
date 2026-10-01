@@ -4668,11 +4668,22 @@ function getCapacityMultiplier(level) {
     }
     return mult;
 }
+// NEU (01.10.2026, Fund "Metall-Vorrat pendelt zwischen 192.000 und 195.561"):
+// Unity (BuildingDefinition.storageSafetyMargin, seit 02.09.2026) multipliziert
+// die Lagerkapazität zusaetzlich mit 1.5, damit sie an den Sprungstufen
+// (4/9/14/19/20) nie unter die Baukosten der naechsten Stufe faellt. Diese
+// Marge fehlte hier im Server komplett - der Server (die eigentlich
+// massgebliche Quelle, siehe Fairplay-Regel) deckelte also stillschweigend
+// auf dem ALTEN, niedrigeren Stand von vor dem 02.09.-Fix, waehrend der
+// Client zwischen den periodischen Server-Syncs mit der hoeheren,
+// margenbehafteten Kapazitaet weiterproduzierte - daher das Pendeln beim
+// naechsten Sync zurueck auf den (zu niedrigen) Server-Wert.
+const STORAGE_SAFETY_MARGIN = 1.5;
 function getStorageCapacity(buildingIndex, level) {
     const config = BUILDING_ECONOMY[buildingIndex];
     if (!config) return 0;
-    if (level <= 0) return config.baseStorageCapacity;
-    return config.baseStorageCapacity * getCapacityMultiplier(level);
+    if (level <= 0) return config.baseStorageCapacity * STORAGE_SAFETY_MARGIN;
+    return config.baseStorageCapacity * getCapacityMultiplier(level) * STORAGE_SAFETY_MARGIN;
 }
 
 // Ressourcenproduktion für einen Planeten nachrechnen — läuft jetzt mit
