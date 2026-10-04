@@ -720,16 +720,17 @@ async function initDatabase() {
             ['ress02', '10.000 Metalle',      'ressourcen', 100, 'resource', 2, 10000],
             ['ress03', '7.500 Werkzeuge',     'ressourcen', 100, 'resource', 3, 7500],
             ['ress04', '2.500 Credits',       'ressourcen', 100, 'resource', 4, 2500],
-            // Schiffspreise (NEU 04.10.2026, Nutzer-Vorgabe): ICC-Wert = Baukosten (Summe Ress x Wertgewicht) / 1.200 Wertpunkte je ICC
-            // x 10 (Aufschlag: der Spieler spart sich Bauzeit, ICC ist Pay-to-Accelerate), dann wie im Einzelhandel auf eine 9 am Ende
-            // aufgerundet (shopShipIccPrice, §28). Frueher pauschal 250 ICC je Paket.
-            ['fleet_warship01', '100x Orbitaljaeger (Warship01)', 'flotten',    shopShipIccPrice('warship', 0, 100),  'warship',  0, 100],
-            ['fleet_warship02', '50x Raumjaeger (Warship02)',     'flotten',    shopShipIccPrice('warship', 1, 50),   'warship',  1, 50],
-            ['fleet_warship03', '10x Kosmosjaeger (Warship03)',   'flotten',    shopShipIccPrice('warship', 2, 10),   'warship',  2, 10],
+            // Schiffe (Kampfschiffe UND zivile Schiffe) gibt es im Shop immer als EINZELPREIS fuer 1 Stueck (Nutzer-Vorgabe 04.10.2026; mehr
+            // Stueck ueber das Mengenfeld im Shop). ICC-Wert = Baukosten (Summe Ress x Wertgewicht) / 1.200 Wertpunkte je ICC x 10 (Aufschlag:
+            // der Spieler spart sich Bauzeit, ICC ist Pay-to-Accelerate), dann wie im Einzelhandel auf eine 9 am Ende aufgerundet
+            // (shopShipIccPrice, §28). Frueher pauschal 250 ICC je Paket mit 1-100 Schiffen.
+            ['fleet_warship01', '1x Orbitaljaeger (Warship01)',   'flotten',    shopShipIccPrice('warship', 0, 1),    'warship',  0, 1],
+            ['fleet_warship02', '1x Raumjaeger (Warship02)',      'flotten',    shopShipIccPrice('warship', 1, 1),    'warship',  1, 1],
+            ['fleet_warship03', '1x Kosmosjaeger (Warship03)',    'flotten',    shopShipIccPrice('warship', 2, 1),    'warship',  2, 1],
             ['fleet_warship04', '1x Sternkreuzer (Warship04)',    'flotten',    shopShipIccPrice('warship', 3, 1),    'warship',  3, 1],
-            ['fleet_ship01',    '10x Containerschiff (Ship01)',   'flotten',    shopShipIccPrice('ship', 1, 10),      'ship',     1, 10],
+            ['fleet_ship01',    '1x Containerschiff (Ship01)',    'flotten',    shopShipIccPrice('ship', 1, 1),       'ship',     1, 1],
             ['fleet_ship03',    '1x Kolonisationsschiff (Ship03)','flotten',    shopShipIccPrice('ship', 3, 1),       'ship',     3, 1],
-            ['item_ship05',     '1x Kernbombe (Ship05)',          'gegenstaende', 1000, 'ship',   5, 1],
+            ['item_ship05',     '1x Kernbombe (Ship05)',          'gegenstaende', 100000, 'ship', 5, 1],   // Nutzer-Vorgabe 04.10.2026: 100.000 ICC (vorher 1.000)
             // NEU (04.10.2026): KISTEN fuer das Inventar (§28). reward_kind 'inventory': item_id = Inventar-Gegenstand, reward_amount =
             // Anzahl Kisten je Kauf; sie landen im Inventar des Kaeufers (nicht auf einem Planeten). "Kleine Kiste" (erste Serie, Nutzer-Vorgabe):
             // Inhalt = Ressourcenpaket des Shops (Energie 5.000, Wasserstoff 7.500, Metalle 10.000, Werkzeuge 7.500, Credits 2.500) fuer
@@ -759,7 +760,9 @@ async function initDatabase() {
         // NEU (04.10.2026): Preise der Flotten-Pakete und Kisten (siehe Seeds oben). Bestehende Zeilen werden NUR aktualisiert, wenn sie noch
         // einen frueheren Standardpreis dieses Artikels haben - spaetere manuelle Aenderungen in der Datenbank bleiben erhalten.
         const shopPreviousSeedCosts = {
-            fleet_warship01: [250], fleet_warship02: [250], fleet_warship03: [250], fleet_warship04: [250], fleet_ship01: [250], fleet_ship03: [250],
+            // Flotten-Angebote: frueher pauschal 250 ICC, danach (gleicher Tag) die Paketpreise 14.569 / 31.339 / 24.209 / 6.469 / 26.479 / 10.819
+            fleet_warship01: [250, 14569], fleet_warship02: [250, 31339], fleet_warship03: [250, 24209], fleet_warship04: [250, 6469], fleet_ship01: [250, 26479], fleet_ship03: [250, 10819],
+            item_ship05: [1000],
             crate_res_0: [200], crate_res_1: [134], crate_res_2: [100], crate_res_3: [134], crate_res_4: [400],
             crate_warship_0: [15], crate_warship_1: [63], crate_warship_2: [242], crate_warship_3: [647], crate_ship_1: [265], crate_ship_3: [1082]
         };
@@ -767,8 +770,8 @@ async function initDatabase() {
             const previous = shopPreviousSeedCosts[row[0]];
             if (!previous) continue;
             await pool.query(
-                `UPDATE shop_items SET cost_icc = $2, display_name = $3 WHERE item_id = $1 AND cost_icc = ANY($4::int[])`,
-                [row[0], row[3], row[1], previous]
+                `UPDATE shop_items SET cost_icc = $2, display_name = $3, reward_amount = $5 WHERE item_id = $1 AND cost_icc = ANY($4::int[])`,
+                [row[0], row[3], row[1], previous, row[6]]
             );
         }
 
