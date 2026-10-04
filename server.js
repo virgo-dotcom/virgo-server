@@ -53,6 +53,7 @@
 //  §24  Admin-Spieler-Info (/admin/inspectPlayer)
 //  §25  KAMPF V2 (Rundenkampf, Mischbonus, Zivile in letzter Reihe): steht VOR §21; aktiv nur bei COMBAT_ENGINE=shadow|v2
 //  §26  GALAXIE-REGISTER (planet_registry): serverautoritative Belegung, Schritt 1 (nur lesen/befuellen); steht VOR §21
+//  §27  SPIELERHANDEL (market_offers): Angebote Spieler -> Spieler fuer Ress01-05, Bezahlung in ICC, 25 % Steuer; steht VOR §21
 //
 //  WICHTIGE ARBEITSREGELN FUER DIESE DATEI
 //  - Laufendes System: NICHT umsortieren, nichts loeschen ohne Pruefung.
@@ -967,6 +968,37 @@ async function initDatabase() {
                 console.error('[Registry] Erstbefuellung fehlgeschlagen:', e.message);
             }
         }, 10000);
+
+        // NEU 04.10.2026: Spielerhandel (§27) — Angebote Spieler -> Spieler, Bezahlung in ICC.
+        // Die Ware liegt ab Erstellung in "Verwahrung" (vom Planeten abgezogen); settled=false heisst:
+        // dem Verkaeufer steht noch etwas zu (Erloes bei 'sold', Rueckgabe der Ware bei abgelaufen) und
+        // wird erst beim Abholen (POST /market/claim) in seinen Spielstand geschrieben. SERIAL (int4)
+        // statt BIGSERIAL, damit die Id als JSON-Zahl (nicht als String) beim Client ankommt.
+        await pool.query(`
+            CREATE TABLE IF NOT EXISTS market_offers (
+                id SERIAL PRIMARY KEY,
+                seller_playfab_id TEXT NOT NULL,
+                seller_commander_id INTEGER NOT NULL,
+                seller_name TEXT NOT NULL DEFAULT '',
+                seller_coord TEXT NOT NULL,
+                resource_index INTEGER NOT NULL,
+                amount INTEGER NOT NULL,
+                price_icc INTEGER NOT NULL,
+                status TEXT NOT NULL DEFAULT 'active',
+                created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+                expires_at TIMESTAMPTZ NOT NULL,
+                buyer_commander_id INTEGER,
+                buyer_name TEXT,
+                sold_at TIMESTAMPTZ,
+                payout_icc INTEGER NOT NULL DEFAULT 0,
+                tax_icc INTEGER NOT NULL DEFAULT 0,
+                settled BOOLEAN NOT NULL DEFAULT false,
+                settled_at TIMESTAMPTZ
+            );
+        `);
+        await pool.query(`CREATE INDEX IF NOT EXISTS idx_market_offers_open ON market_offers (status, expires_at);`);
+        await pool.query(`CREATE INDEX IF NOT EXISTS idx_market_offers_seller ON market_offers (seller_commander_id, created_at DESC);`);
+        await pool.query(`CREATE INDEX IF NOT EXISTS idx_market_offers_buyer ON market_offers (buyer_commander_id, sold_at DESC);`);
 
         console.log('[DB] Tabelle combat_reports + Sequenz + Flotten-Sperre + Angriffs-Verfolgung bereit.');
     } catch (e) {
@@ -7022,6 +7054,515 @@ async function buildRegistryAdminReport(query) {
     }
     return out.join('\n');
 }
+
+// #####################################################################
+// §27  SPIELERHANDEL (market_offers) — NEU 04.10.2026
+//      Angebote von Spieler zu Spieler fuer Ress01-05 (Index 0-4), bezahlt in ICC (Ress10,
+//      commander.accountResources[4]). Ein Angebot bleibt 48 h stehen und kann von jedem anderen
+//      Spieler SOFORT gekauft werden. Der Verkaeufer bekommt 75 % des Preises, 25 % sind Steuern
+//      (verschwinden vorerst ersatzlos, werden aber pro Angebot in tax_icc festgehalten).
+//
+//      Grundprinzipien (wie beim Virgo-Shop: Server ist Autoritaet, der Client schickt nur Absichten):
+//      - Identitaet NUR aus dem Anmelde-Ticket (marketIdentity), nie aus dem Body.
+//      - Die Ware wird beim Erstellen sofort vom Planeten abgezogen ("Verwahrung"). Preis, Menge, Steuer
+//        und Gueltigkeit stehen in Postgres; der Client kann daran nichts aendern.
+//      - Der Verkaeufer bekommt Erloes (ICC) bzw. bei Ablauf seine Ware NICHT live in den Spielstand
+//        geschrieben, sondern erst auf eigene Anfrage (POST /market/claim). Grund: Der Client speichert
+//        seinen Spielstand alle 60 s komplett nach PlayFab - eine fremd ausgeloeste Gutschrift in den
+//        Spielstand eines gerade eingeloggten Verkaeufers wuerde dabei ueberschrieben und ginge verloren.
+//        Der Aufrufer von claim/create/buy/cancel ist dagegen selbst der Handelnde und uebernimmt das
+//        Ergebnis sofort lokal (als Differenz).
+//      - Pro Spieler laufen Handels-Schreibzugriffe nacheinander (withMarketLock), sonst koennten zwei
+//        gleichzeitige Anfragen denselben Vorrat/dasselbe ICC doppelt ausgeben.
+//      - Reihenfolge bei jedem Schreibvorgang so gewaehlt, dass ein Fehler eher zu "nichts passiert"/
+//        "Spieler verliert vorerst etwas" fuehrt als zu doppelter Ware (siehe Kommentare je Endpunkt).
+//
+//      BEKANNTE GRENZE (Fairplay): Ressourcen/ICC liegen weiterhin im vom Client geschriebenen Spielstand
+//      (siehe Fairplay-Liste). Der Handel prueft gegen den zuletzt gespeicherten Stand - der Client
+//      speichert deshalb vor jeder Handelsaktion. Ein manipulierter Client bleibt ein bekanntes Risiko.
+// #####################################################################
+
+const MARKET_DURATION_HOURS    = 48;
+const MARKET_TAX_PERCENT       = 25;          // Verkaeufer bekommt 100 - 25 = 75 %
+const MARKET_MAX_ACTIVE_OFFERS = 10;          // gleichzeitig laufende Angebote pro Spieler
+const MARKET_MIN_AMOUNT        = 100;
+const MARKET_MAX_AMOUNT        = 1000000000;
+const MARKET_MIN_PRICE         = 4;           // bei 4 ICC bekommt der Verkaeufer mindestens 3
+const MARKET_MAX_PRICE         = 1000000;
+const MARKET_MAX_RESOURCE      = 4;           // handelbar: Index 0-4 (Energie, Wasserstoff, Metalle, Gold, Werkzeug)
+const MARKET_ICC_INDEX         = 4;           // commander.accountResources[4] = ICC (Ress10)
+const MARKET_RESOURCE_CAP      = 2000000000;  // Unity speichert Ressourcen als int
+// Ein verkauftes Angebot wird erst nach dieser Frist abholbar. Grund: Schlaegt beim KAEUFER direkt nach dem
+// Verkauf das Speichern nach PlayFab fehl, wird das Angebot wieder freigegeben - bis dahin darf der Verkaeufer
+// den Erloes nicht schon abgeholt haben (sonst waere ICC aus dem Nichts entstanden).
+const MARKET_SETTLE_DELAY_SECONDS = 15;
+
+const marketLocks = new Map();
+function withMarketLock(key, fn) {
+    const previous = marketLocks.get(key) || Promise.resolve();
+    const next = previous.catch(() => {}).then(fn);
+    marketLocks.set(key, next);
+    next.finally(() => { if (marketLocks.get(key) === next) marketLocks.delete(key); }).catch(() => {});
+    return next;
+}
+
+// Identitaet ausschliesslich aus dem Ticket (unabhaengig von AUTH_MODE). null = nicht angemeldet.
+async function marketIdentity(req) {
+    let playFabId = req.auth && req.auth.playFabId;
+    if (!playFabId) {
+        const ticket = req.get('X-Session-Ticket');
+        if (ticket) playFabId = await authenticateTicket(ticket);
+    }
+    if (!playFabId) return null;
+    const commanderId = await authCommanderIdFor(playFabId);
+    if (commanderId === null || commanderId === undefined) return null;
+    return { playFabId, commanderId: Number(commanderId) };
+}
+
+function marketPlanetKey(coord) { return 'planet_' + String(coord).replace(/:/g, '_'); }
+
+function marketNormalizePlanet(planet) {
+    if (!Array.isArray(planet.ressources)) planet.ressources = [0, 0, 0, 0, 0];
+    while (planet.ressources.length < 5) planet.ressources.push(0);
+    return planet;
+}
+
+// Laedt commander_data (+ optional die genannten Planeten) eines Spielers aus PlayFab.
+async function marketLoadPlayer(playFabId, coords) {
+    const keys = ['commander_data', ...coords.map(marketPlanetKey)];
+    const result = await playfabServer('/Server/GetUserData', { PlayFabId: playFabId, Keys: keys });
+    const data = result && result.Data ? result.Data : {};
+    if (!data['commander_data']) return null;
+    const commander = JSON.parse(data['commander_data'].Value);
+    if (!Array.isArray(commander.accountResources)) commander.accountResources = [0, 0, 0, 0, 0];
+    while (commander.accountResources.length < 5) commander.accountResources.push(0);
+    if (!Array.isArray(commander.colonies)) commander.colonies = [];
+    const planets = {};
+    for (const c of coords) {
+        const entry = data[marketPlanetKey(c)];
+        if (entry) planets[c] = marketNormalizePlanet(JSON.parse(entry.Value));
+    }
+    return { commander, planets };
+}
+
+async function marketLoadPlanets(playFabId, coords) {
+    if (coords.length === 0) return {};
+    const result = await playfabServer('/Server/GetUserData', { PlayFabId: playFabId, Keys: coords.map(marketPlanetKey) });
+    const data = result && result.Data ? result.Data : {};
+    const planets = {};
+    for (const c of coords) {
+        const entry = data[marketPlanetKey(c)];
+        if (entry) planets[c] = marketNormalizePlanet(JSON.parse(entry.Value));
+    }
+    return planets;
+}
+
+// entries: { 'commander_data': obj, 'planet_1_2_3_4': obj, ... } - PlayFab erlaubt max. 10 Keys je Aufruf.
+async function marketSaveEntries(playFabId, entries) {
+    const keys = Object.keys(entries);
+    for (let i = 0; i < keys.length; i += 9) {
+        const Data = {};
+        for (const k of keys.slice(i, i + 9)) Data[k] = JSON.stringify(entries[k]);
+        await playfabServer('/Server/UpdateUserData', { PlayFabId: playFabId, Data, Permission: 'Private' });
+    }
+}
+
+// Zielplanet fuer Rueckgaben: bevorzugt der Herkunftsplanet, sonst Hauptplanet, sonst erste Kolonie.
+function marketReturnCoord(commander, preferredCoord) {
+    const colonies = commander.colonies || [];
+    if (colonies.includes(preferredCoord)) return preferredCoord;
+    if (commander.mainPlanetCoord && colonies.includes(commander.mainPlanetCoord)) return commander.mainPlanetCoord;
+    return colonies.length > 0 ? colonies[0] : null;
+}
+
+function marketAddResource(planet, index, amount) {
+    planet.ressources[index] = Math.min(MARKET_RESOURCE_CAP, (planet.ressources[index] || 0) + amount);
+}
+
+function marketStrictInt(value) {
+    const n = typeof value === 'string' && value.trim() !== '' ? Number(value) : value;
+    return Number.isInteger(n) ? n : NaN;
+}
+
+function marketFail(res, status, error, extra) {
+    return res.status(status).json(Object.assign({ success: false, error }, extra || {}));
+}
+
+// -------------------------------------------------------
+// GET /market/offers?resource=-1..4&exclude=<commanderId>&limit=100
+// Alle aktuell laufenden Angebote (guenstigster Stueckpreis zuerst). Enthaelt nur oeffentliche Angaben
+// (Verkaeufername, Ware, Menge, Preis, Restzeit) - nie PlayFab-Ids.
+// -------------------------------------------------------
+app.get('/market/offers', async (req, res) => {
+    try {
+        const resource = marketStrictInt(req.query.resource);
+        const exclude  = marketStrictInt(req.query.exclude);
+        const limit    = Math.min(Math.max(parseInt(req.query.limit, 10) || 100, 1), 200);
+
+        const params = [];
+        let where = `status = 'active' AND expires_at > now()`;
+        if (Number.isInteger(resource) && resource >= 0 && resource <= MARKET_MAX_RESOURCE) {
+            params.push(resource);
+            where += ` AND resource_index = $${params.length}`;
+        }
+        if (Number.isInteger(exclude) && exclude > 0) {
+            params.push(exclude);
+            where += ` AND seller_commander_id <> $${params.length}`;
+        }
+        params.push(limit);
+
+        const result = await pool.query(
+            `SELECT id, seller_name, seller_commander_id, resource_index, amount, price_icc,
+                    GREATEST(0, EXTRACT(EPOCH FROM (expires_at - now())))::int AS seconds_left
+             FROM market_offers
+             WHERE ${where}
+             ORDER BY (price_icc::float8 / amount) ASC, created_at ASC
+             LIMIT $${params.length}`, params);
+
+        res.json({
+            success: true,
+            offers: result.rows.map(r => ({
+                id: r.id, sellerName: r.seller_name, sellerCommanderId: r.seller_commander_id,
+                resourceIndex: r.resource_index, amount: r.amount, priceIcc: r.price_icc, secondsLeft: r.seconds_left
+            }))
+        });
+    } catch (error) {
+        console.error('[Handel] offers GET Fehler:', error.message);
+        marketFail(res, 500, 'Angebote konnten nicht geladen werden.');
+    }
+});
+
+// -------------------------------------------------------
+// GET /market/mine - meine Angebote (letzte 30), meine Einkaeufe (letzte 15) und was noch zum Abholen bereitliegt.
+// -------------------------------------------------------
+app.get('/market/mine', async (req, res) => {
+    const who = await marketIdentity(req);
+    if (!who) return marketFail(res, 401, 'Nicht angemeldet.');
+    try {
+        const offers = await pool.query(
+            `SELECT id, resource_index, amount, price_icc,
+                    CASE WHEN status = 'active' AND expires_at <= now() THEN 'expired' ELSE status END AS status,
+                    GREATEST(0, EXTRACT(EPOCH FROM (expires_at - now())))::int AS seconds_left,
+                    buyer_name, payout_icc, tax_icc, settled
+             FROM market_offers WHERE seller_commander_id = $1
+             ORDER BY created_at DESC LIMIT 30`, [who.commanderId]);
+        const purchases = await pool.query(
+            `SELECT id, resource_index, amount, price_icc, seller_name,
+                    EXTRACT(EPOCH FROM (now() - sold_at))::int AS ago_seconds
+             FROM market_offers WHERE buyer_commander_id = $1 AND status = 'sold'
+             ORDER BY sold_at DESC LIMIT 15`, [who.commanderId]);
+        const pending = await pool.query(
+            `SELECT COUNT(*)::int AS n,
+                    COALESCE(SUM(payout_icc) FILTER (WHERE status = 'sold'), 0)::int AS payout,
+                    (COUNT(*) FILTER (WHERE status = 'active'))::int AS returns
+             FROM market_offers
+             WHERE seller_commander_id = $1 AND settled = false
+               AND ((status = 'sold' AND sold_at <= now() - make_interval(secs => ${MARKET_SETTLE_DELAY_SECONDS}))
+                    OR (status = 'active' AND expires_at <= now()))`, [who.commanderId]);
+        const activeCount = await pool.query(
+            `SELECT COUNT(*)::int AS n FROM market_offers
+             WHERE seller_commander_id = $1 AND status = 'active' AND expires_at > now()`, [who.commanderId]);
+
+        res.json({
+            success: true,
+            maxActive: MARKET_MAX_ACTIVE_OFFERS,
+            taxPercent: MARKET_TAX_PERCENT,
+            activeCount: activeCount.rows[0].n,
+            offers: offers.rows.map(r => ({
+                id: r.id, resourceIndex: r.resource_index, amount: r.amount, priceIcc: r.price_icc, status: r.status,
+                secondsLeft: r.seconds_left, buyerName: r.buyer_name || '', payoutIcc: r.payout_icc, taxIcc: r.tax_icc, settled: r.settled
+            })),
+            purchases: purchases.rows.map(r => ({
+                id: r.id, resourceIndex: r.resource_index, amount: r.amount, priceIcc: r.price_icc,
+                sellerName: r.seller_name, agoSeconds: r.ago_seconds
+            })),
+            pending: { count: pending.rows[0].n, payoutIcc: pending.rows[0].payout, returnCount: pending.rows[0].returns }
+        });
+    } catch (error) {
+        console.error('[Handel] mine GET Fehler:', error.message);
+        marketFail(res, 500, 'Deine Angebote konnten nicht geladen werden.');
+    }
+});
+
+// -------------------------------------------------------
+// POST /market/create { sellerCoord, resourceIndex, amount, priceIcc }
+// Zieht die Ware vom Planeten ab (zuerst PlayFab, dann Angebot anlegen: schlaegt das Anlegen fehl, wird
+// zurueckgebucht - im Fehlerfall lieber kurz "weg" als doppelt vorhanden).
+// -------------------------------------------------------
+app.post('/market/create', async (req, res) => {
+    const who = await marketIdentity(req);
+    if (!who) return marketFail(res, 401, 'Nicht angemeldet.');
+
+    const coord         = normalizeRegistryCoord(req.body && req.body.sellerCoord);
+    const resourceIndex = marketStrictInt(req.body && req.body.resourceIndex);
+    const amount        = marketStrictInt(req.body && req.body.amount);
+    const price         = marketStrictInt(req.body && req.body.priceIcc);
+
+    if (!coord) return marketFail(res, 400, 'Ungültige Kolonie.');
+    if (!(resourceIndex >= 0 && resourceIndex <= MARKET_MAX_RESOURCE)) return marketFail(res, 400, 'Diese Ware kann nicht gehandelt werden.');
+    if (!(amount >= MARKET_MIN_AMOUNT && amount <= MARKET_MAX_AMOUNT)) return marketFail(res, 400, `Menge muss zwischen ${MARKET_MIN_AMOUNT} und ${MARKET_MAX_AMOUNT} liegen.`);
+    if (!(price >= MARKET_MIN_PRICE && price <= MARKET_MAX_PRICE)) return marketFail(res, 400, `Preis muss zwischen ${MARKET_MIN_PRICE} und ${MARKET_MAX_PRICE} ICC liegen.`);
+
+    try {
+        const outcome = await withMarketLock(who.playFabId, async () => {
+            const active = await pool.query(
+                `SELECT COUNT(*)::int AS n FROM market_offers
+                 WHERE seller_commander_id = $1 AND status = 'active' AND expires_at > now()`, [who.commanderId]);
+            if (active.rows[0].n >= MARKET_MAX_ACTIVE_OFFERS)
+                return { status: 400, body: { success: false, error: `Du kannst höchstens ${MARKET_MAX_ACTIVE_OFFERS} Angebote gleichzeitig haben.` } };
+
+            const player = await marketLoadPlayer(who.playFabId, [coord]);
+            if (!player) return { status: 404, body: { success: false, error: 'Commander nicht gefunden.' } };
+            const { commander, planets } = player;
+            if (!commander.colonies.includes(coord)) return { status: 403, body: { success: false, error: 'Diese Kolonie gehört dir nicht.' } };
+            const planet = planets[coord];
+            if (!planet) return { status: 404, body: { success: false, error: 'Planet nicht gefunden.' } };
+
+            if ((planet.ressources[resourceIndex] || 0) < amount)
+                return { status: 400, body: { success: false, error: 'Nicht genug Vorrat auf dieser Kolonie.' } };
+
+            planet.ressources[resourceIndex] -= amount;
+            await marketSaveEntries(who.playFabId, { [marketPlanetKey(coord)]: planet });
+
+            let offerId;
+            try {
+                const sellerName = String(commander.visibleName || ('Commander ' + who.commanderId)).slice(0, 32);
+                const ins = await pool.query(
+                    `INSERT INTO market_offers (seller_playfab_id, seller_commander_id, seller_name, seller_coord, resource_index, amount, price_icc, expires_at)
+                     VALUES ($1, $2, $3, $4, $5, $6, $7, now() + make_interval(hours => $8::int))
+                     RETURNING id`,
+                    [who.playFabId, who.commanderId, sellerName, coord, resourceIndex, amount, price, MARKET_DURATION_HOURS]);
+                offerId = ins.rows[0].id;
+            } catch (insertError) {
+                console.error('[Handel] create: Angebot anlegen fehlgeschlagen, buche Ware zurueck:', insertError.message);
+                try {
+                    marketAddResource(planet, resourceIndex, amount);
+                    await marketSaveEntries(who.playFabId, { [marketPlanetKey(coord)]: planet });
+                } catch (refundError) {
+                    console.error('[Handel] create: RUECKBUCHUNG FEHLGESCHLAGEN (Commander ' + who.commanderId + ', ' + amount + 'x Ress' + (resourceIndex + 1) + '):', refundError.message);
+                }
+                throw insertError;
+            }
+
+            console.log(`[Handel] Angebot ${offerId}: Commander ${who.commanderId} bietet ${amount}x Ress${resourceIndex + 1} fuer ${price} ICC`);
+            return { status: 200, body: { success: true, offerId, coord, resourceIndex, amount } };
+        });
+        res.status(outcome.status).json(outcome.body);
+    } catch (error) {
+        console.error('[Handel] create Fehler:', error.message);
+        marketFail(res, 500, 'Angebot konnte nicht erstellt werden.');
+    }
+});
+
+// -------------------------------------------------------
+// POST /market/buy { offerId, targetCoord }
+// Kauf sofort. Reihenfolge: pruefen -> Angebot atomar auf 'sold' setzen (nur einer gewinnt) -> Kaeufer
+// belasten/beliefern. Schlaegt das Schreiben nach PlayFab fehl, wird das Angebot wieder freigegeben.
+// -------------------------------------------------------
+app.post('/market/buy', async (req, res) => {
+    const who = await marketIdentity(req);
+    if (!who) return marketFail(res, 401, 'Nicht angemeldet.');
+
+    const offerId = marketStrictInt(req.body && req.body.offerId);
+    const target  = normalizeRegistryCoord(req.body && req.body.targetCoord);
+    if (!(offerId > 0)) return marketFail(res, 400, 'Ungültiges Angebot.');
+    if (!target) return marketFail(res, 400, 'Bitte eine Zielkolonie wählen.');
+
+    try {
+        const outcome = await withMarketLock(who.playFabId, async () => {
+            const found = await pool.query(
+                `SELECT id, seller_commander_id, resource_index, amount, price_icc FROM market_offers
+                 WHERE id = $1 AND status = 'active' AND expires_at > now()`, [offerId]);
+            if (found.rows.length === 0) return { status: 409, body: { success: false, error: 'Dieses Angebot ist nicht mehr verfügbar.' } };
+            const offer = found.rows[0];
+            if (offer.seller_commander_id === who.commanderId)
+                return { status: 400, body: { success: false, error: 'Du kannst dein eigenes Angebot nicht kaufen.' } };
+
+            const player = await marketLoadPlayer(who.playFabId, [target]);
+            if (!player) return { status: 404, body: { success: false, error: 'Commander nicht gefunden.' } };
+            const { commander, planets } = player;
+            if (!commander.colonies.includes(target)) return { status: 403, body: { success: false, error: 'Die Zielkolonie gehört dir nicht.' } };
+            const planet = planets[target];
+            if (!planet) return { status: 404, body: { success: false, error: 'Zielplanet nicht gefunden.' } };
+            if (commander.accountResources[MARKET_ICC_INDEX] < offer.price_icc)
+                return { status: 400, body: { success: false, error: 'Nicht genug ICC.', iccBalance: commander.accountResources[MARKET_ICC_INDEX] } };
+
+            const payout = Math.floor(offer.price_icc * (100 - MARKET_TAX_PERCENT) / 100);
+            const tax = offer.price_icc - payout;
+            const buyerName = String(commander.visibleName || ('Commander ' + who.commanderId)).slice(0, 32);
+
+            // Nur EIN gleichzeitiger Kaeufer gewinnt (Bedingung steckt im UPDATE selbst).
+            const claimed = await pool.query(
+                `UPDATE market_offers
+                 SET status = 'sold', sold_at = now(), buyer_commander_id = $2, buyer_name = $3, payout_icc = $4, tax_icc = $5
+                 WHERE id = $1 AND status = 'active' AND expires_at > now() AND seller_commander_id <> $2
+                 RETURNING id`, [offerId, who.commanderId, buyerName, payout, tax]);
+            if (claimed.rows.length === 0)
+                return { status: 409, body: { success: false, error: 'Dieses Angebot ist nicht mehr verfügbar.' } };
+
+            try {
+                commander.accountResources[MARKET_ICC_INDEX] -= offer.price_icc;
+                marketAddResource(planet, offer.resource_index, offer.amount);
+                await marketSaveEntries(who.playFabId, { commander_data: commander, [marketPlanetKey(target)]: planet });
+            } catch (saveError) {
+                console.error('[Handel] buy: Speichern fehlgeschlagen, gebe Angebot ' + offerId + ' wieder frei:', saveError.message);
+                try {
+                    await pool.query(
+                        `UPDATE market_offers
+                         SET status = 'active', sold_at = NULL, buyer_commander_id = NULL, buyer_name = NULL, payout_icc = 0, tax_icc = 0
+                         WHERE id = $1 AND status = 'sold' AND settled = false`, [offerId]);
+                } catch (revertError) {
+                    console.error('[Handel] buy: FREIGABE FEHLGESCHLAGEN (Angebot ' + offerId + '):', revertError.message);
+                }
+                throw saveError;
+            }
+
+            console.log(`[Handel] Verkauf ${offerId}: Commander ${who.commanderId} kauft ${offer.amount}x Ress${offer.resource_index + 1} fuer ${offer.price_icc} ICC (Verkaeufer ${payout}, Steuer ${tax})`);
+            return { status: 200, body: { success: true, offerId, resourceIndex: offer.resource_index, amount: offer.amount, priceIcc: offer.price_icc, targetCoord: target } };
+        });
+        res.status(outcome.status).json(outcome.body);
+    } catch (error) {
+        console.error('[Handel] buy Fehler:', error.message);
+        marketFail(res, 500, 'Kauf konnte nicht abgeschlossen werden.');
+    }
+});
+
+// -------------------------------------------------------
+// POST /market/cancel { offerId } - eigenes laufendes Angebot zurueckziehen, Ware kommt sofort zurueck.
+// (Ein bereits abgelaufenes Angebot wird stattdessen ueber /market/claim zurueckgegeben.)
+// -------------------------------------------------------
+app.post('/market/cancel', async (req, res) => {
+    const who = await marketIdentity(req);
+    if (!who) return marketFail(res, 401, 'Nicht angemeldet.');
+
+    const offerId = marketStrictInt(req.body && req.body.offerId);
+    if (!(offerId > 0)) return marketFail(res, 400, 'Ungültiges Angebot.');
+
+    try {
+        const outcome = await withMarketLock(who.playFabId, async () => {
+            const claimed = await pool.query(
+                `UPDATE market_offers SET status = 'cancelled', settled = true, settled_at = now()
+                 WHERE id = $1 AND seller_commander_id = $2 AND status = 'active' AND expires_at > now()
+                 RETURNING id, seller_coord, resource_index, amount`, [offerId, who.commanderId]);
+            if (claimed.rows.length === 0)
+                return { status: 409, body: { success: false, error: 'Dieses Angebot läuft nicht mehr (verkauft oder abgelaufen).' } };
+            const offer = claimed.rows[0];
+
+            const revert = async () => {
+                try {
+                    await pool.query(
+                        `UPDATE market_offers SET status = 'active', settled = false, settled_at = NULL
+                         WHERE id = $1 AND status = 'cancelled'`, [offerId]);
+                } catch (e) { console.error('[Handel] cancel: FREIGABE FEHLGESCHLAGEN (Angebot ' + offerId + '):', e.message); }
+            };
+
+            try {
+                const player = await marketLoadPlayer(who.playFabId, []);
+                if (!player) { await revert(); return { status: 404, body: { success: false, error: 'Commander nicht gefunden.' } }; }
+                const returnCoord = marketReturnCoord(player.commander, offer.seller_coord);
+                if (!returnCoord) { await revert(); return { status: 400, body: { success: false, error: 'Keine Kolonie für die Rückgabe gefunden.' } }; }
+                const planets = await marketLoadPlanets(who.playFabId, [returnCoord]);
+                const planet = planets[returnCoord];
+                if (!planet) { await revert(); return { status: 404, body: { success: false, error: 'Planet nicht gefunden.' } }; }
+
+                marketAddResource(planet, offer.resource_index, offer.amount);
+                await marketSaveEntries(who.playFabId, { [marketPlanetKey(returnCoord)]: planet });
+
+                console.log(`[Handel] Angebot ${offerId} von Commander ${who.commanderId} zurueckgezogen`);
+                return { status: 200, body: { success: true, offerId, returned: { coord: returnCoord, resourceIndex: offer.resource_index, amount: offer.amount } } };
+            } catch (error) {
+                await revert();
+                throw error;
+            }
+        });
+        res.status(outcome.status).json(outcome.body);
+    } catch (error) {
+        console.error('[Handel] cancel Fehler:', error.message);
+        marketFail(res, 500, 'Angebot konnte nicht zurückgezogen werden.');
+    }
+});
+
+// -------------------------------------------------------
+// POST /market/claim {} - Abholen: ICC-Erloes verkaufter Angebote + Ware abgelaufener Angebote.
+// Der Aufrufer ist der Verkaeufer selbst und uebernimmt das Ergebnis sofort lokal.
+// -------------------------------------------------------
+app.post('/market/claim', async (req, res) => {
+    const who = await marketIdentity(req);
+    if (!who) return marketFail(res, 401, 'Nicht angemeldet.');
+
+    try {
+        const outcome = await withMarketLock(who.playFabId, async () => {
+            // Atomar abholbereite Angebote "einsammeln" (abgelaufene laufende werden dabei zu 'expired').
+            const rows = await pool.query(
+                `UPDATE market_offers
+                 SET settled = true, settled_at = now(),
+                     status = CASE WHEN status = 'active' THEN 'expired' ELSE status END
+                 WHERE seller_commander_id = $1 AND settled = false
+                   AND ((status = 'sold' AND sold_at <= now() - make_interval(secs => ${MARKET_SETTLE_DELAY_SECONDS}))
+                        OR (status = 'active' AND expires_at <= now()))
+                 RETURNING id, status, seller_coord, resource_index, amount, payout_icc`, [who.commanderId]);
+            if (rows.rows.length === 0)
+                return { status: 200, body: { success: true, payoutIcc: 0, returns: [], settledCount: 0 } };
+
+            const soldIds = rows.rows.filter(r => r.status === 'sold').map(r => r.id);
+            const expiredIds = rows.rows.filter(r => r.status === 'expired').map(r => r.id);
+
+            const revert = async () => {
+                try {
+                    if (soldIds.length > 0)
+                        await pool.query(`UPDATE market_offers SET settled = false, settled_at = NULL WHERE id = ANY($1::int[])`, [soldIds]);
+                    if (expiredIds.length > 0)
+                        await pool.query(`UPDATE market_offers SET settled = false, settled_at = NULL, status = 'active' WHERE id = ANY($1::int[])`, [expiredIds]);
+                } catch (e) { console.error('[Handel] claim: FREIGABE FEHLGESCHLAGEN (Commander ' + who.commanderId + '):', e.message); }
+            };
+
+            try {
+                const player = await marketLoadPlayer(who.playFabId, []);
+                if (!player) { await revert(); return { status: 404, body: { success: false, error: 'Commander nicht gefunden.' } }; }
+                const commander = player.commander;
+
+                // Ware abgelaufener Angebote je Zielplanet bündeln.
+                const returnsByCoord = new Map(); // coord -> [ { resourceIndex, amount } ]
+                for (const r of rows.rows.filter(x => x.status === 'expired')) {
+                    const coord = marketReturnCoord(commander, r.seller_coord);
+                    if (!coord) { await revert(); return { status: 400, body: { success: false, error: 'Keine Kolonie für die Rückgabe gefunden.' } }; }
+                    if (!returnsByCoord.has(coord)) returnsByCoord.set(coord, []);
+                    returnsByCoord.get(coord).push({ resourceIndex: r.resource_index, amount: r.amount });
+                }
+                const planets = await marketLoadPlanets(who.playFabId, Array.from(returnsByCoord.keys()));
+
+                const entries = {};
+                const returnsOut = [];
+                for (const [coord, list] of returnsByCoord) {
+                    const planet = planets[coord];
+                    if (!planet) { await revert(); return { status: 404, body: { success: false, error: 'Planet nicht gefunden.' } }; }
+                    for (const item of list) {
+                        marketAddResource(planet, item.resourceIndex, item.amount);
+                        returnsOut.push({ coord, resourceIndex: item.resourceIndex, amount: item.amount });
+                    }
+                    entries[marketPlanetKey(coord)] = planet;
+                }
+
+                const payoutIcc = rows.rows.filter(r => r.status === 'sold').reduce((sum, r) => sum + r.payout_icc, 0);
+                if (payoutIcc > 0) {
+                    commander.accountResources[MARKET_ICC_INDEX] = Math.min(MARKET_RESOURCE_CAP, commander.accountResources[MARKET_ICC_INDEX] + payoutIcc);
+                    entries.commander_data = commander;
+                }
+
+                await marketSaveEntries(who.playFabId, entries);
+                console.log(`[Handel] Abholung Commander ${who.commanderId}: ${soldIds.length} verkauft (+${payoutIcc} ICC), ${expiredIds.length} abgelaufen zurueck`);
+                return { status: 200, body: { success: true, payoutIcc, returns: returnsOut, settledCount: rows.rows.length } };
+            } catch (error) {
+                await revert();
+                throw error;
+            }
+        });
+        res.status(outcome.status).json(outcome.body);
+    } catch (error) {
+        console.error('[Handel] claim Fehler:', error.message);
+        marketFail(res, 500, 'Abholen ist gerade nicht möglich.');
+    }
+});
 
 // #####################################################################
 // §21  SERVERSTART (app.listen)
