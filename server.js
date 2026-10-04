@@ -715,8 +715,8 @@ async function initDatabase() {
             ['ress00', '100.000 Energie',     'ressourcen', 100, 'resource', 0, 100000],
             ['ress01', '100.000 Wasserstoff', 'ressourcen', 100, 'resource', 1, 100000],
             ['ress02', '100.000 Metalle',     'ressourcen', 100, 'resource', 2, 100000],
-            ['ress03', '100.000 Werkzeug',    'ressourcen', 100, 'resource', 3, 100000],
-            ['ress04', '100.000 Daten',       'ressourcen', 100, 'resource', 4, 100000],
+            ['ress03', '100.000 Gold',        'ressourcen', 100, 'resource', 3, 100000],
+            ['ress04', '100.000 Werkzeug',    'ressourcen', 100, 'resource', 4, 100000],
             ['fleet_warship01', '100x Orbitaljaeger (Warship01)', 'flotten',    250,  'warship',  0, 100],
             ['fleet_warship02', '50x Raumjaeger (Warship02)',     'flotten',    250,  'warship',  1, 50],
             ['fleet_warship03', '10x Kosmosjaeger (Warship03)',   'flotten',    250,  'warship',  2, 10],
@@ -733,6 +733,13 @@ async function initDatabase() {
                 row
             );
         }
+
+        // NEU (04.10.2026): Ressourcen umbenannt (Index 3 = Gold, Index 4 = Werkzeug, vorher Werkzeug/Daten).
+        // display_name ist reine Server-Doku (der Client baut den Namen aus ResourceNames.cs), wird hier aber
+        // nachgezogen, damit Admin-Ansichten/Logs nicht den alten Namen zeigen. Idempotent; Preise und
+        // reward_index bleiben bewusst unveraendert.
+        await pool.query(`UPDATE shop_items SET display_name = '100.000 Gold' WHERE item_id = 'ress03' AND display_name <> '100.000 Gold'`);
+        await pool.query(`UPDATE shop_items SET display_name = '100.000 Werkzeug' WHERE item_id = 'ress04' AND display_name <> '100.000 Werkzeug'`);
 
         // -------------------------------------------------------
         // NEU (17.09.): ICC-Geschenkkiste. Einzige bisherige ICC-Quelle
@@ -4323,7 +4330,7 @@ const BUILDING_ECONOMY = {
         tierStepCounts: [4, 4, 7],
         baseStorageCapacity: 1000
     },
-    4: { // Ress04-Gebäude (Werkzeuge) — Produktionswerte noch offen,
+    4: { // Ress04-Gebäude (Gold — Edelmetall-Raffinerie, bis 04.10.2026 "Werkzeuge") — Produktionswerte noch offen,
          // gleicher Kapazitäts-Fix wie bei Ress03
         productionEarly: [[], [], [], [], []],
         scalesWithLevel: true,
