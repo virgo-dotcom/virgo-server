@@ -715,18 +715,33 @@ async function initDatabase() {
         );
 
         const defaultShopItems = [
-            ['ress00', '10.000 Energie',      'ressourcen', 100, 'resource', 0, 10000],
-            ['ress01', '10.000 Wasserstoff',  'ressourcen', 100, 'resource', 1, 10000],
+            ['ress00', '5.000 Energie',       'ressourcen', 100, 'resource', 0, 5000],
+            ['ress01', '7.500 Wasserstoff',   'ressourcen', 100, 'resource', 1, 7500],
             ['ress02', '10.000 Metalle',      'ressourcen', 100, 'resource', 2, 10000],
-            ['ress03', '10.000 Werkzeuge',     'ressourcen', 100, 'resource', 3, 10000],
-            ['ress04', '10.000 Credits',       'ressourcen', 100, 'resource', 4, 10000],
+            ['ress03', '7.500 Werkzeuge',     'ressourcen', 100, 'resource', 3, 7500],
+            ['ress04', '2.500 Credits',       'ressourcen', 100, 'resource', 4, 2500],
             ['fleet_warship01', '100x Orbitaljaeger (Warship01)', 'flotten',    250,  'warship',  0, 100],
             ['fleet_warship02', '50x Raumjaeger (Warship02)',     'flotten',    250,  'warship',  1, 50],
             ['fleet_warship03', '10x Kosmosjaeger (Warship03)',   'flotten',    250,  'warship',  2, 10],
             ['fleet_warship04', '1x Sternkreuzer (Warship04)',    'flotten',    250,  'warship',  3, 1],
             ['fleet_ship01',    '10x Containerschiff (Ship01)',   'flotten',    250,  'ship',     1, 10],
             ['fleet_ship03',    '1x Kolonisationsschiff (Ship03)','flotten',    250,  'ship',     3, 1],
-            ['item_ship05',     '1x Kernbombe (Ship05)',          'gegenstaende', 1000, 'ship',   5, 1]
+            ['item_ship05',     '1x Kernbombe (Ship05)',          'gegenstaende', 1000, 'ship',   5, 1],
+            // NEU (04.10.2026): KISTEN fuer das Inventar (§28). reward_kind 'inventory': item_id = Inventar-Gegenstand, reward_amount =
+            // Anzahl Kisten je Kauf; sie landen im Inventar des Kaeufers (nicht auf einem Planeten). Preis wie bei den Ressourcenpaketen
+            // wertbezogen: 100 ICC = 120.000 Wertpunkte (MARKET_VALUE_WEIGHT, §27); Rohstoffkiste = 10.000 Einheiten, Schiffskiste = Baukosten
+            // des Schiffs, jeweils aufgerundet. Kisten fuer Ress06-10 gibt es bewusst NICHT im Shop (ICC kauft man nicht mit ICC).
+            ['crate_res_0',     'Rohstoffkiste Energie (10.000)',      'gegenstaende', 200,  'inventory', 0, 1],
+            ['crate_res_1',     'Rohstoffkiste Wasserstoff (10.000)',  'gegenstaende', 134,  'inventory', 0, 1],
+            ['crate_res_2',     'Rohstoffkiste Metalle (10.000)',      'gegenstaende', 100,  'inventory', 0, 1],
+            ['crate_res_3',     'Rohstoffkiste Werkzeuge (10.000)',    'gegenstaende', 134,  'inventory', 0, 1],
+            ['crate_res_4',     'Rohstoffkiste Credits (10.000)',      'gegenstaende', 400,  'inventory', 0, 1],
+            ['crate_warship_0', 'Schiffskiste Orbitaljaeger (Warship01)', 'gegenstaende', 15,   'inventory', 0, 1],
+            ['crate_warship_1', 'Schiffskiste Raumjaeger (Warship02)',    'gegenstaende', 63,   'inventory', 0, 1],
+            ['crate_warship_2', 'Schiffskiste Kosmosjaeger (Warship03)',  'gegenstaende', 242,  'inventory', 0, 1],
+            ['crate_warship_3', 'Schiffskiste Sternkreuzer (Warship04)',  'gegenstaende', 647,  'inventory', 0, 1],
+            ['crate_ship_1',    'Schiffskiste Containerschiff (Ship01)',  'gegenstaende', 265,  'inventory', 0, 1],
+            ['crate_ship_3',    'Schiffskiste Kolonisationsschiff (Ship03)', 'gegenstaende', 1082, 'inventory', 0, 1]
         ];
         for (const row of defaultShopItems) {
             await pool.query(
@@ -751,6 +766,18 @@ async function initDatabase() {
                 `UPDATE shop_items SET reward_amount = 10000, display_name = $2
                  WHERE item_id = $1 AND reward_kind = 'resource' AND reward_amount = 100000`,
                 [itemId, `10.000 ${resName}`]
+            );
+        }
+
+        // NEU (04.10.2026): Ressourcenpakete im Shop WERTBEZOGEN (Nutzer-Vorgabe): 100 ICC = 10.000 Metalle; die anderen
+        // Ressourcen bekommen fuer dieselben 100 ICC gleich viel WERT (Gewichte aus §27: Metalle 12, Wasserstoff/Werkzeuge 16, Energie 24,
+        // Credits 48): 7.500 Wasserstoff / 7.500 Werkzeuge / 5.000 Energie / 2.500 Credits. Idempotent und nur fuer Zeilen, die noch den
+        // Standard 10.000 haben - spaetere manuelle Aenderungen in der Datenbank werden NICHT ueberschrieben.
+        for (const [itemId, amount, resName] of [['ress00', 5000, 'Energie'], ['ress01', 7500, 'Wasserstoff'], ['ress03', 7500, 'Werkzeuge'], ['ress04', 2500, 'Credits']]) {
+            await pool.query(
+                `UPDATE shop_items SET reward_amount = $2, display_name = $3
+                 WHERE item_id = $1 AND reward_kind = 'resource' AND reward_amount = 10000`,
+                [itemId, amount, `${amount.toLocaleString('de-DE')} ${resName}`]
             );
         }
 
@@ -3607,6 +3634,10 @@ app.post('/shop/purchase', async (req, res) => {
         if (itemResult.rows.length === 0)
             return res.status(404).json({ success: false, error: 'Unbekannter Artikel' });
         const item = itemResult.rows[0];
+
+        // NEU (04.10.2026): Kisten (reward_kind 'inventory') landen im Inventar des Kaeufers, nicht auf einem Planeten (§28).
+        if (item.reward_kind === 'inventory')
+            return await shopPurchaseInventoryItem(req, res, item, quantity);
 
         const planetKey = 'planet_' + targetCoord.replace(/:/g, '_');
 
@@ -7423,7 +7454,7 @@ app.get('/market/mine', async (req, res) => {
     if (!who) return marketFail(res, 401, 'Nicht angemeldet.');
     try {
         const offers = await pool.query(
-            `SELECT id, item_kind, resource_index, amount, price_resource, price_amount,
+            `SELECT id, seller_coord, item_kind, resource_index, amount, price_resource, price_amount,
                     CASE WHEN status = 'active' AND expires_at <= now() THEN 'expired' ELSE status END AS status,
                     GREATEST(0, EXTRACT(EPOCH FROM (expires_at - now())))::int AS seconds_left,
                     buyer_name, payout_amount, tax_amount, settled
@@ -7463,7 +7494,7 @@ app.get('/market/mine', async (req, res) => {
             activeCount: activeCount.rows[0].n,
             items,
             offers: offers.rows.map(r => ({
-                id: r.id, kind: r.item_kind, itemIndex: r.resource_index, amount: r.amount, priceResource: r.price_resource, priceAmount: r.price_amount,
+                id: r.id, coord: r.seller_coord, kind: r.item_kind, itemIndex: r.resource_index, amount: r.amount, priceResource: r.price_resource, priceAmount: r.price_amount,
                 status: r.status, secondsLeft: r.seconds_left, buyerName: r.buyer_name || '', payoutAmount: r.payout_amount, taxAmount: r.tax_amount, settled: r.settled
             })),
             purchases: purchases.rows.map(r => ({
@@ -7860,6 +7891,57 @@ async function inventoryGrant(playFabId, itemId, quantity) {
         console.log(`[Inventar] +${quantity}x ${itemId} fuer ${playFabId} (jetzt ${inv.items[itemId]})`);
         return inv.items[itemId];
     });
+}
+
+// -------------------------------------------------------
+// VIRGO-SHOP: Kisten kaufen (shop_items.reward_kind = 'inventory', item_id = Inventar-Gegenstand). Wird von
+// POST /shop/purchase aufgerufen. Bezahlt wird in ICC vom Konto (commander_data.accountResources[4]); die Kisten kommen ins
+// Inventar - egal welcher Planet gewaehlt ist (Kisten gehoeren dem Commander, nicht einer Koordinate). Das Ticket ist hier
+// PFLICHT (Identitaet nur aus dem Ticket, nicht aus dem Body). Reihenfolge: erst ICC abbuchen, dann Kisten gutschreiben; scheitert
+// das, wird das ICC zurueckgebucht (im Zweifel lieber kurz weniger ICC als Gratis-Kisten).
+// -------------------------------------------------------
+async function shopPurchaseInventoryItem(req, res, item, quantity) {
+    const who = await marketIdentity(req);
+    if (!who) return res.status(401).json({ success: false, error: 'Nicht angemeldet.' });
+    const def = INVENTORY_ITEMS[item.item_id];
+    if (!def || INVENTORY_ADMIN_ONLY_ITEMS.has(item.item_id))
+        return res.status(404).json({ success: false, error: 'Dieser Artikel ist nicht verfügbar.' });
+
+    const crates = item.reward_amount * quantity;
+    const totalCost = item.cost_icc * quantity;
+    const outcome = await withMarketLock(who.playFabId, async () => {
+        const data = await playfabServer('/Server/GetUserData', { PlayFabId: who.playFabId, Keys: ['commander_data'] });
+        if (!data.Data || !data.Data['commander_data']) return { status: 404, body: { success: false, error: 'Commander nicht gefunden' } };
+        const commander = JSON.parse(data.Data['commander_data'].Value);
+        if (!Array.isArray(commander.accountResources)) commander.accountResources = [0, 0, 0, 0, 0];
+        while (commander.accountResources.length < 5) commander.accountResources.push(0);
+        if (commander.accountResources[4] < totalCost)
+            return { status: 400, body: { success: false, error: 'Nicht genug ICC', iccBalance: commander.accountResources[4] } };
+
+        const inv = await inventoryLoad(who.playFabId);
+        const have = Number(inv.items[item.item_id]) || 0;
+        if (have + crates > INVENTORY_MAX_STACK)
+            return { status: 400, body: { success: false, error: `Dein Inventar kann nicht so viele davon halten (höchstens ${INVENTORY_MAX_STACK}).` } };
+
+        commander.accountResources[4] -= totalCost;
+        await playfabServer('/Server/UpdateUserData', { PlayFabId: who.playFabId, Data: { commander_data: JSON.stringify(commander) }, Permission: 'Private' });
+        try {
+            inv.items[item.item_id] = have + crates;
+            await inventorySave(who.playFabId, inv);
+        } catch (grantError) {
+            console.error('[Inventar] shop: Gutschrift der Kisten fehlgeschlagen, buche ICC zurueck:', grantError.message);
+            try {
+                commander.accountResources[4] += totalCost;
+                await playfabServer('/Server/UpdateUserData', { PlayFabId: who.playFabId, Data: { commander_data: JSON.stringify(commander) }, Permission: 'Private' });
+            } catch (refundError) {
+                console.error('[Inventar] shop: ICC-RUECKBUCHUNG FEHLGESCHLAGEN (Commander ' + who.commanderId + ', ' + totalCost + ' ICC):', refundError.message);
+            }
+            throw grantError;
+        }
+        console.log(`[Inventar] Shop: Commander ${who.commanderId} kauft ${crates}x ${item.item_id} fuer ${totalCost} ICC`);
+        return { status: 200, body: { success: true, newIccBalance: commander.accountResources[4], crates } };
+    });
+    return res.status(outcome.status).json(outcome.body);
 }
 
 // -------------------------------------------------------
