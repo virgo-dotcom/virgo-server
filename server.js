@@ -53,7 +53,7 @@
 //  §24  Admin-Spieler-Info (/admin/inspectPlayer)
 //  §25  KAMPF V2 (Rundenkampf, Mischbonus, Zivile in letzter Reihe): steht VOR §21; aktiv nur bei COMBAT_ENGINE=shadow|v2
 //  §26  GALAXIE-REGISTER (planet_registry): serverautoritative Belegung, Schritt 1 (nur lesen/befuellen); steht VOR §21
-//  §27  SPIELERHANDEL (market_offers): Angebote Spieler -> Spieler (Waren Ress01-04 + Schiffe), Bezahlung in Credits (Ress05, Planeten-Vorrat), 25 % Steuer; steht VOR §21
+//  §27  SPIELERHANDEL (market_offers): TAUSCHHANDEL Spieler -> Spieler (Ress01-05 + Schiffe gegen Ress01-05, Preisband 100-200 % des Werts), 20 % Steuer, Verkaufs-Mail; steht VOR §21
 //
 //  WICHTIGE ARBEITSREGELN FUER DIESE DATEI
 //  - Laufendes System: NICHT umsortieren, nichts loeschen ohne Pruefung.
@@ -972,7 +972,7 @@ async function initDatabase() {
             }
         }, 10000);
 
-        // NEU 04.10.2026: Spielerhandel (§27) — Angebote Spieler -> Spieler, Bezahlung in Credits (Ress05).
+        // NEU 04.10.2026: Spielerhandel (§27) — Tauschhandel Spieler -> Spieler (Preis = Menge einer waehlbaren Ressource Ress01-05).
         // Die Ware liegt ab Erstellung in "Verwahrung" (vom Planeten abgezogen); settled=false heisst:
         // dem Verkaeufer steht noch etwas zu (Credits-Erloes bei 'sold', Rueckgabe der Ware bei abgelaufen) und
         // wird erst beim Abholen (POST /market/claim) in seinen Spielstand geschrieben. SERIAL (int4)
@@ -987,15 +987,16 @@ async function initDatabase() {
                 item_kind TEXT NOT NULL DEFAULT 'resource',
                 resource_index INTEGER NOT NULL,
                 amount INTEGER NOT NULL,
-                price_credits INTEGER NOT NULL,
+                price_resource INTEGER NOT NULL DEFAULT 4,
+                price_amount INTEGER NOT NULL,
                 status TEXT NOT NULL DEFAULT 'active',
                 created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
                 expires_at TIMESTAMPTZ NOT NULL,
                 buyer_commander_id INTEGER,
                 buyer_name TEXT,
                 sold_at TIMESTAMPTZ,
-                payout_credits INTEGER NOT NULL DEFAULT 0,
-                tax_credits INTEGER NOT NULL DEFAULT 0,
+                payout_amount INTEGER NOT NULL DEFAULT 0,
+                tax_amount INTEGER NOT NULL DEFAULT 0,
                 settled BOOLEAN NOT NULL DEFAULT false,
                 settled_at TIMESTAMPTZ
             );
@@ -1015,6 +1016,22 @@ async function initDatabase() {
             END $$;
         `);
         await pool.query(`ALTER TABLE market_offers ADD COLUMN IF NOT EXISTS item_kind TEXT NOT NULL DEFAULT 'resource';`);
+        // Dritte Fassung am selben Tag (04.10.2026): TAUSCHHANDEL - der Preis ist eine Menge einer frei waehlbaren Ressource
+        // (price_resource, Index 0-4) statt fester Credits. Alte Spalten price_credits/payout_credits/tax_credits werden
+        // umbenannt (alte Angebote waren in Credits = Index 4 = Spalten-Default); noch laufende Angebote werden dabei
+        // sofort beendet (Ware kommt beim naechsten Abholen zurueck). Idempotent.
+        await pool.query(`
+            DO $$ BEGIN
+                IF EXISTS (SELECT 1 FROM information_schema.columns WHERE table_name = 'market_offers' AND column_name = 'price_credits') THEN
+                    ALTER TABLE market_offers RENAME COLUMN price_credits TO price_amount;
+                    ALTER TABLE market_offers RENAME COLUMN payout_credits TO payout_amount;
+                    ALTER TABLE market_offers RENAME COLUMN tax_credits TO tax_amount;
+                    ALTER TABLE market_offers ADD COLUMN IF NOT EXISTS price_resource INTEGER NOT NULL DEFAULT 4;
+                    UPDATE market_offers SET expires_at = now() WHERE status = 'active' AND expires_at > now();
+                END IF;
+            END $$;
+        `);
+        await pool.query(`ALTER TABLE market_offers ADD COLUMN IF NOT EXISTS price_resource INTEGER NOT NULL DEFAULT 4;`);
         await pool.query(`CREATE INDEX IF NOT EXISTS idx_market_offers_open ON market_offers (status, expires_at);`);
         await pool.query(`CREATE INDEX IF NOT EXISTS idx_market_offers_seller ON market_offers (seller_commander_id, created_at DESC);`);
         await pool.query(`CREATE INDEX IF NOT EXISTS idx_market_offers_buyer ON market_offers (buyer_commander_id, sold_at DESC);`);
@@ -7079,42 +7096,46 @@ async function buildRegistryAdminReport(query) {
 }
 
 // #####################################################################
-// §27  SPIELERHANDEL (market_offers) — NEU 04.10.2026, ueberarbeitet am selben Tag (Credits statt ICC)
-//      Angebote von Spieler zu Spieler. Gehandelt werden Waren (Ress01-04: Energie, Wasserstoff, Metalle,
-//      Werkzeuge) und Schiffe (Warship01-04, Ship01 Containerschiff, Ship03 Kolonisationsschiff).
-//      Bezahlt wird in CREDITS = Ress05 = planet.ressources[4] (Planeten-Vorrat, wird von der
-//      Kommandozentrale erzeugt). ICC (Ress10, Premium-Waehrung) hat im Spielerhandel NICHTS verloren:
-//      sie kann weder gehandelt noch durch Handel verdient werden.
+// §27  SPIELERHANDEL (market_offers) — NEU 04.10.2026, dritte Fassung am selben Tag (TAUSCHHANDEL)
+//      Commander tauschen untereinander Ware gegen Ware. Handelbar sind die Ressourcen Ress01-05 (Energie,
+//      Wasserstoff, Metalle, Werkzeuge, Credits) und Schiffe (Warship01-04, Containerschiff Ship01,
+//      Kolonisationsschiff Ship03). Ein Angebot sagt: "Ich gebe MENGE von WARE und verlange PREIS von
+//      GEGENLEISTUNG" - die Gegenleistung ist immer eine der Ressourcen Ress01-05, aber nie dieselbe Ressource
+//      wie die angebotene Ware (Metalle nicht gegen Metalle, Credits nicht gegen Credits).
+//
+//      ICC (Ress10, Premium-Waehrung) hat im Spielerhandel NICHTS verloren: nicht handelbar, nicht als
+//      Gegenleistung, nicht verdienbar. ICC gibt es nur im Virgo-Shop.
+//
+//      WERTE: Jede Ressource hat ein Wertgewicht (MARKET_VALUE_WEIGHT, Nutzer-Vorgabe 04.10.2026):
+//      1.000 Metalle = 750 Wasserstoff = 750 Werkzeuge = 500 Energie = 250 Credits.
+//      Schiffe werden aus ihren Baukosten bewertet (Summe Kosten x Gewicht). Der verlangte Preis muss zwischen
+//      100 % und 200 % des Warenwerts liegen (MARKET_BAND_*). Die Gewichte sind bewusst Konstanten, die
+//      sich im Laufe der Zeit (Inflation, Pluenderbarkeit) leicht anpassen lassen.
 //
 //      Ein Angebot bleibt 48 h stehen und kann von jedem anderen Spieler SOFORT gekauft werden. Der
-//      Verkaeufer bekommt 75 % des Preises, 25 % sind Steuern (verschwinden vorerst ersatzlos, werden aber
-//      pro Angebot in tax_credits festgehalten).
+//      Verkaeufer bekommt 80 % des Preises (20 % Steuer an das Virgo Dominion, verschwinden vorerst ersatzlos,
+//      werden aber pro Angebot in tax_amount festgehalten). Nach jedem Verkauf bekommt der Verkaeufer eine
+//      Mail mit Kaeufer, Preis, Steuer und Erloes.
 //
 //      PLANETEN-BEZUG: Verkauft wird von einem bestimmten Planeten (dort wird die Ware abgezogen), der
-//      Erloes (Credits) landet auf genau diesem Planeten. Beim Kauf bezahlt der Kaeufer von dem Planeten,
-//      auf den geliefert wird (Credits-Vorrat dort), die Ware landet ebenfalls dort.
+//      Erloes landet auf genau diesem Planeten. Beim Kauf bezahlt der Kaeufer von dem Planeten, auf den
+//      geliefert wird (Vorrat der Gegenleistung dort), die Ware landet ebenfalls dort.
 //
 //      LAGER: Die Lagerkapazitaet begrenzt nur die PRODUKTION (siehe produceResources / PlanetProductionManager).
 //      Handelsware und Erloese duerfen ueber die Kapazitaet hinaus ankommen und bleiben erhalten.
-//
-//      PREISE: Jede Ware hat einen RICHTWERT (Credits je Einheit), abgeleitet aus der Grundproduktion der
-//      Kommandozentrale (je schneller produzierbar, desto weniger wert: Metalle < Wasserstoff < Werkzeuge <
-//      Energie). Schiffe werden aus ihren Baukosten bewertet. Erlaubt sind Preise zwischen 25 % und 400 %
-//      des Richtwerts (MARKET_BAND_*). Spaeter koennen die Richtwerte dynamisch werden (Inflation durch
-//      Handelsvolumen) - dann wird nur marketRefPerUnit ersetzt.
 //
 //      Grundprinzipien (wie beim Virgo-Shop: Server ist Autoritaet, der Client schickt nur Absichten):
 //      - Identitaet NUR aus dem Anmelde-Ticket (marketIdentity), nie aus dem Body.
 //      - Die Ware wird beim Erstellen sofort vom Planeten abgezogen ("Verwahrung"). Preis, Menge, Steuer
 //        und Gueltigkeit stehen in Postgres; der Client kann daran nichts aendern.
-//      - Der Verkaeufer bekommt Erloes (Credits) bzw. bei Ablauf seine Ware NICHT live in den Spielstand
-//        geschrieben, sondern erst auf eigene Anfrage (POST /market/claim). Grund: Der Client speichert
-//        seinen Spielstand alle 60 s komplett nach PlayFab - eine fremd ausgeloeste Gutschrift in den
-//        Spielstand eines gerade eingeloggten Verkaeufers wuerde dabei ueberschrieben und ginge verloren.
-//        Der Aufrufer von claim/create/buy/cancel ist dagegen selbst der Handelnde und uebernimmt das
-//        Ergebnis sofort lokal (als Differenz).
+//      - Der Verkaeufer bekommt Erloes bzw. bei Ablauf seine Ware NICHT live in den Spielstand geschrieben,
+//        sondern erst auf eigene Anfrage (POST /market/claim; der Client ruft das beim Oeffnen des Handels und
+//        im Hintergrund automatisch auf). Grund: Der Client speichert seinen Spielstand alle 60 s komplett nach
+//        PlayFab - eine fremd ausgeloeste Gutschrift in den Spielstand eines gerade eingeloggten Verkaeufers
+//        wuerde dabei ueberschrieben und ginge verloren. Der Aufrufer von claim/create/buy/cancel ist dagegen
+//        selbst der Handelnde und uebernimmt das Ergebnis sofort lokal (als Differenz).
 //      - Pro Spieler laufen Handels-Schreibzugriffe nacheinander (withMarketLock), sonst koennten zwei
-//        gleichzeitige Anfragen denselben Vorrat/dieselben Credits doppelt ausgeben.
+//        gleichzeitige Anfragen denselben Vorrat doppelt ausgeben.
 //      - Reihenfolge bei jedem Schreibvorgang so gewaehlt, dass ein Fehler eher zu "nichts passiert"/
 //        "Spieler verliert vorerst etwas" fuehrt als zu doppelter Ware (siehe Kommentare je Endpunkt).
 //
@@ -7124,35 +7145,39 @@ async function buildRegistryAdminReport(query) {
 // #####################################################################
 
 const MARKET_DURATION_HOURS    = 48;
-const MARKET_TAX_PERCENT       = 25;          // Verkaeufer bekommt 100 - 25 = 75 %
+const MARKET_TAX_PERCENT       = 20;          // Verkaeufer bekommt 100 - 20 = 80 %
 const MARKET_MAX_ACTIVE_OFFERS = 10;          // gleichzeitig laufende Angebote pro Spieler
-const MARKET_MAX_PRICE         = 1000000000;
-const MARKET_CREDITS_INDEX     = 4;           // planet.ressources[4] = Credits (Ress05)
+const MARKET_MAX_PRICE         = 2000000000;  // Spalte ist INTEGER (int4)
 const MARKET_RESOURCE_CAP      = 2000000000;  // Unity speichert Bestaende als int
-const MARKET_BAND_MIN_PERCENT  = 25;          // erlaubter Preis: 25 % ...
-const MARKET_BAND_MAX_PERCENT  = 400;         // ... bis 400 % des Richtwerts
+const MARKET_BAND_MIN_PERCENT  = 100;         // verlangter Preis: mindestens 100 % des Warenwerts ...
+const MARKET_BAND_MAX_PERCENT  = 200;         // ... hoechstens 200 %
 // Ein verkauftes Angebot wird erst nach dieser Frist abholbar. Grund: Schlaegt beim KAEUFER direkt nach dem
 // Verkauf das Speichern nach PlayFab fehl, wird das Angebot wieder freigegeben - bis dahin darf der Verkaeufer
-// den Erloes nicht schon abgeholt haben (sonst waeren Credits aus dem Nichts entstanden).
+// den Erloes nicht schon abgeholt haben (sonst waere Ware aus dem Nichts entstanden).
 const MARKET_SETTLE_DELAY_SECONDS = 15;
 
-// Richtwert je Einheit in Credits fuer Waren (Index 0-3). Herleitung: Grundproduktion der Kommandozentrale pro
-// 5-s-Tick = [10, 20, 50, 25, 1] fuer Energie, Wasserstoff, Metalle, Werkzeuge, Credits. 1 Credit = 1 Tick
-// Produktion -> 1 Einheit Energie = 1/10 Credit, Wasserstoff 1/20, Metalle 1/50, Werkzeuge 1/25.
-const MARKET_RESOURCE_VALUE = [0.1, 0.05, 0.02, 0.04, 1];
+// Wertgewichte der Ressourcen (Index 0-4 = Energie, Wasserstoff, Metalle, Werkzeuge, Credits).
+// 1.000 Metalle (12 000) = 750 Wasserstoff (16) = 750 Werkzeuge (16) = 500 Energie (24) = 250 Credits (48).
+// Reihenfolge der Wertigkeit laut Nutzer: Credits > Energie > Wasserstoff/Werkzeuge > Metalle.
+const MARKET_VALUE_WEIGHT = [24, 16, 12, 16, 48];
+const MARKET_RESOURCE_NAMES = ['Energie', 'Wasserstoff', 'Metalle', 'Werkzeuge', 'Credits']; // wie ResourceNames.cs im Client
 
 // Baukosten (Ress01-05) der handelbaren Schiffe - MUSS manuell synchron mit den Unity-Assets gehalten werden
-// (Assets/Ship Assets/*.asset, Stand 04.10.2026), wie BUILDING_ECONOMY. Daraus wird der Richtwert berechnet.
+// (Assets/Ship Assets/*.asset, Stand 04.10.2026), wie BUILDING_ECONOMY. Daraus wird der Warenwert berechnet.
 const MARKET_SHIP_COSTS = {
     warship: { 0: [50, 50, 1050, 150, 10], 1: [250, 250, 4000, 1000, 25], 2: [1500, 750, 10000, 7500, 50], 3: [2500, 1200, 31000, 20000, 100] },
     ship:    { 1: [500, 350, 15000, 7500, 1], 3: [15000, 30000, 17500, 12500, 1000] }   // 1 = Containerschiff, 3 = Kolonisationsschiff
 };
+const MARKET_SHIP_NAMES = {
+    warship: { 0: 'Orbitaljäger', 1: 'Raumjäger', 2: 'Kosmosjäger', 3: 'Sternkreuzer' },
+    ship:    { 1: 'Containerschiff', 3: 'Kolonisationsschiff' }
+};
 
 // Handelbare Gueter: Art -> erlaubte Indizes, Mengengrenzen, Feld im Planeten.
 const MARKET_KINDS = {
-    resource: { indices: [0, 1, 2, 3], minAmount: 100, maxAmount: 1000000000, field: 'ressources', length: 5 },
-    warship:  { indices: [0, 1, 2, 3], minAmount: 1,   maxAmount: 1000000,    field: 'warships',   length: 10 },
-    ship:     { indices: [1, 3],       minAmount: 1,   maxAmount: 1000000,    field: 'ships',      length: 6 }
+    resource: { indices: [0, 1, 2, 3, 4], minAmount: 100, maxAmount: 1000000000, field: 'ressources', length: 5 },
+    warship:  { indices: [0, 1, 2, 3],    minAmount: 1,   maxAmount: 1000000,    field: 'warships',   length: 10 },
+    ship:     { indices: [1, 3],          minAmount: 1,   maxAmount: 1000000,    field: 'ships',      length: 6 }
 };
 
 function marketItemValid(kind, index) {
@@ -7160,22 +7185,31 @@ function marketItemValid(kind, index) {
     return !!def && Number.isInteger(index) && def.indices.includes(index);
 }
 
-// Richtwert in Credits JE EINHEIT (Kommazahl).
-function marketRefPerUnit(kind, index) {
-    if (kind === 'resource') return MARKET_RESOURCE_VALUE[index];
+// Wert EINER Einheit in Wertpunkten (Ressource: ihr Gewicht, Schiff: Summe Baukosten x Gewicht).
+function marketValuePerUnit(kind, index) {
+    if (kind === 'resource') return MARKET_VALUE_WEIGHT[index] || 0;
     const costs = MARKET_SHIP_COSTS[kind] && MARKET_SHIP_COSTS[kind][index];
     if (!costs) return 0;
     let total = 0;
-    for (let i = 0; i < costs.length; i++) total += costs[i] * MARKET_RESOURCE_VALUE[i];
+    for (let i = 0; i < costs.length; i++) total += costs[i] * MARKET_VALUE_WEIGHT[i];
     return total;
 }
 
-// Erlaubte Preisspanne fuer ein Angebot (Credits gesamt).
-function marketPriceBounds(kind, index, amount) {
-    const ref = marketRefPerUnit(kind, index) * amount;
-    const min = Math.max(1, Math.ceil(ref * MARKET_BAND_MIN_PERCENT / 100));
-    const max = Math.min(MARKET_MAX_PRICE, Math.max(min, Math.ceil(ref * MARKET_BAND_MAX_PERCENT / 100)));
-    return { ref: Math.round(ref), min, max };
+function marketItemName(kind, index) {
+    if (kind === 'resource') return MARKET_RESOURCE_NAMES[index] || ('Ress' + (index + 1));
+    return (MARKET_SHIP_NAMES[kind] && MARKET_SHIP_NAMES[kind][index]) || (kind + index);
+}
+
+// Erlaubte Preisspanne in der Gegenleistung priceResource (Menge dieser Ressource):
+// 100 % bis 200 % des Warenwerts. fair = der Preis bei genau 100 %.
+function marketPriceBounds(kind, index, amount, priceResource) {
+    const weight = MARKET_VALUE_WEIGHT[priceResource];
+    if (!(weight > 0)) return { fair: 0, min: 0, max: 0 };
+    const value = marketValuePerUnit(kind, index) * amount;
+    const fair = Math.max(1, Math.ceil(value / weight));
+    const min = Math.max(1, Math.ceil(value * MARKET_BAND_MIN_PERCENT / 100 / weight));
+    const max = Math.max(min, Math.floor(value * MARKET_BAND_MAX_PERCENT / 100 / weight));
+    return { fair, min, max };
 }
 
 const marketLocks = new Map();
@@ -7280,13 +7314,57 @@ function marketFail(res, status, error, extra) {
     return res.status(status).json(Object.assign({ success: false, error }, extra || {}));
 }
 
+function marketNum(n) { return Number(n).toLocaleString('de-DE'); }
+
 function marketOfferOut(r) {
-    const b = marketPriceBounds(r.item_kind, r.resource_index, r.amount);
+    const b = marketPriceBounds(r.item_kind, r.resource_index, r.amount, r.price_resource);
     return {
         id: r.id, sellerName: r.seller_name, sellerCommanderId: r.seller_commander_id,
-        kind: r.item_kind, itemIndex: r.resource_index, amount: r.amount, priceCredits: r.price_credits,
-        refCredits: b.ref, secondsLeft: r.seconds_left
+        kind: r.item_kind, itemIndex: r.resource_index, amount: r.amount,
+        priceResource: r.price_resource, priceAmount: r.price_amount, fairAmount: b.fair, secondsLeft: r.seconds_left
     };
+}
+
+// Mail an den Verkaeufer nach einem Verkauf (landet im Posteingang seines Spielstands, der Client holt ihn ueber den
+// Poller ab - gleicher Weg wie die Allianz-/Kampfmails). Ein Fehler hier darf den Handel NIE kippen.
+async function marketSendSaleMail(offer, buyerName, payout, tax) {
+    try {
+        const result = await playfabServer('/Server/GetUserData', { PlayFabId: offer.seller_playfab_id, Keys: ['commander_data'] });
+        const entry = result && result.Data && result.Data['commander_data'];
+        if (!entry) return;
+        const commander = JSON.parse(entry.Value);
+        if (!Array.isArray(commander.inbox)) commander.inbox = [];
+
+        const coord = marketReturnCoord(commander, offer.seller_coord) || offer.seller_coord;
+        const resName = marketItemName('resource', offer.price_resource);
+        const article = `${marketNum(offer.amount)} ${marketItemName(offer.item_kind, offer.resource_index)}`;
+        const body =
+            `Dein Angebot wurde verkauft!\n\n` +
+            `Artikel: ${article}\n` +
+            `Käufer: ${buyerName}\n` +
+            `Kaufpreis: ${marketNum(offer.price_amount)} ${resName}\n` +
+            `Steuern an das Virgo Dominion (${MARKET_TAX_PERCENT} %): ${marketNum(tax)} ${resName}\n` +
+            `Dein Erlös: ${marketNum(payout)} ${resName}\n\n` +
+            `Deine Kolonie ${coord} erhält: ${marketNum(payout)} ${resName}\n` +
+            `Die Gutschrift erfolgt automatisch, spätestens wenn du den Handel öffnest.`;
+
+        const mailSeq = await getNextMailSeq();
+        commander.inbox.push({
+            mailId: `M-${commander.commanderId}-${mailSeq}`,
+            category: 0, // System
+            subject: `Handel: ${article} verkauft`,
+            body,
+            senderName: 'Virgo Dominion', // LOCALIZE
+            senderId: 0,
+            isRead: false,
+            isFavorite: false,
+            timestamp: formatTimestamp(new Date()),
+            reportId: ''
+        });
+        await marketSaveEntries(offer.seller_playfab_id, { commander_data: commander });
+    } catch (e) {
+        console.error(`[Handel] Verkaufs-Mail fuer Angebot ${offer.id} fehlgeschlagen:`, e.message);
+    }
 }
 
 // -------------------------------------------------------
@@ -7316,11 +7394,11 @@ app.get('/market/offers', async (req, res) => {
         params.push(limit);
 
         const result = await pool.query(
-            `SELECT id, seller_name, seller_commander_id, item_kind, resource_index, amount, price_credits,
+            `SELECT id, seller_name, seller_commander_id, item_kind, resource_index, amount, price_resource, price_amount,
                     GREATEST(0, EXTRACT(EPOCH FROM (expires_at - now())))::int AS seconds_left
              FROM market_offers
              WHERE ${where}
-             ORDER BY item_kind, resource_index, (price_credits::float8 / amount) ASC, created_at ASC
+             ORDER BY item_kind, resource_index, price_resource, (price_amount::float8 / amount) ASC, created_at ASC
              LIMIT $${params.length}`, params);
 
         res.json({ success: true, offers: result.rows.map(marketOfferOut) });
@@ -7332,27 +7410,27 @@ app.get('/market/offers', async (req, res) => {
 
 // -------------------------------------------------------
 // GET /market/mine - meine Angebote (letzte 30), meine Einkaeufe (letzte 15), was noch zum Abholen bereitliegt
-// und die Handelsregeln samt Richtwerten (config), damit der Client keine Zahlen fest einbauen muss.
+// und die Handelsregeln samt Wertgewichten (damit der Client keine Zahlen fest einbauen muss).
 // -------------------------------------------------------
 app.get('/market/mine', async (req, res) => {
     const who = await marketIdentity(req);
     if (!who) return marketFail(res, 401, 'Nicht angemeldet.');
     try {
         const offers = await pool.query(
-            `SELECT id, item_kind, resource_index, amount, price_credits,
+            `SELECT id, item_kind, resource_index, amount, price_resource, price_amount,
                     CASE WHEN status = 'active' AND expires_at <= now() THEN 'expired' ELSE status END AS status,
                     GREATEST(0, EXTRACT(EPOCH FROM (expires_at - now())))::int AS seconds_left,
-                    buyer_name, payout_credits, tax_credits, settled
+                    buyer_name, payout_amount, tax_amount, settled
              FROM market_offers WHERE seller_commander_id = $1
              ORDER BY created_at DESC LIMIT 30`, [who.commanderId]);
         const purchases = await pool.query(
-            `SELECT id, item_kind, resource_index, amount, price_credits, seller_name,
+            `SELECT id, item_kind, resource_index, amount, price_resource, price_amount, seller_name,
                     EXTRACT(EPOCH FROM (now() - sold_at))::int AS ago_seconds
              FROM market_offers WHERE buyer_commander_id = $1 AND status = 'sold'
              ORDER BY sold_at DESC LIMIT 15`, [who.commanderId]);
         const pending = await pool.query(
             `SELECT COUNT(*)::int AS n,
-                    COALESCE(SUM(payout_credits) FILTER (WHERE status = 'sold'), 0)::int AS payout,
+                    (COUNT(*) FILTER (WHERE status = 'sold'))::int AS sold,
                     (COUNT(*) FILTER (WHERE status = 'active'))::int AS returns
              FROM market_offers
              WHERE seller_commander_id = $1 AND settled = false
@@ -7366,7 +7444,7 @@ app.get('/market/mine', async (req, res) => {
         for (const kind of Object.keys(MARKET_KINDS)) {
             const def = MARKET_KINDS[kind];
             for (const idx of def.indices)
-                items.push({ kind, index: idx, refPerUnit: marketRefPerUnit(kind, idx), minAmount: def.minAmount, maxAmount: def.maxAmount });
+                items.push({ kind, index: idx, valuePerUnit: marketValuePerUnit(kind, idx), minAmount: def.minAmount, maxAmount: def.maxAmount });
         }
 
         res.json({
@@ -7375,17 +7453,18 @@ app.get('/market/mine', async (req, res) => {
             taxPercent: MARKET_TAX_PERCENT,
             bandMinPercent: MARKET_BAND_MIN_PERCENT,
             bandMaxPercent: MARKET_BAND_MAX_PERCENT,
+            weights: MARKET_VALUE_WEIGHT,
             activeCount: activeCount.rows[0].n,
             items,
             offers: offers.rows.map(r => ({
-                id: r.id, kind: r.item_kind, itemIndex: r.resource_index, amount: r.amount, priceCredits: r.price_credits, status: r.status,
-                secondsLeft: r.seconds_left, buyerName: r.buyer_name || '', payoutCredits: r.payout_credits, taxCredits: r.tax_credits, settled: r.settled
+                id: r.id, kind: r.item_kind, itemIndex: r.resource_index, amount: r.amount, priceResource: r.price_resource, priceAmount: r.price_amount,
+                status: r.status, secondsLeft: r.seconds_left, buyerName: r.buyer_name || '', payoutAmount: r.payout_amount, taxAmount: r.tax_amount, settled: r.settled
             })),
             purchases: purchases.rows.map(r => ({
-                id: r.id, kind: r.item_kind, itemIndex: r.resource_index, amount: r.amount, priceCredits: r.price_credits,
+                id: r.id, kind: r.item_kind, itemIndex: r.resource_index, amount: r.amount, priceResource: r.price_resource, priceAmount: r.price_amount,
                 sellerName: r.seller_name, agoSeconds: r.ago_seconds
             })),
-            pending: { count: pending.rows[0].n, payoutCredits: pending.rows[0].payout, returnCount: pending.rows[0].returns }
+            pending: { count: pending.rows[0].n, soldCount: pending.rows[0].sold, returnCount: pending.rows[0].returns }
         });
     } catch (error) {
         console.error('[Handel] mine GET Fehler:', error.message);
@@ -7394,7 +7473,7 @@ app.get('/market/mine', async (req, res) => {
 });
 
 // -------------------------------------------------------
-// POST /market/create { sellerCoord, kind, itemIndex, amount, priceCredits }
+// POST /market/create { sellerCoord, kind, itemIndex, amount, priceResource, priceAmount }
 // Zieht die Ware vom Planeten ab (zuerst PlayFab, dann Angebot anlegen: schlaegt das Anlegen fehl, wird
 // zurueckgebucht - im Fehlerfall lieber kurz "weg" als doppelt vorhanden).
 // -------------------------------------------------------
@@ -7402,19 +7481,25 @@ app.post('/market/create', async (req, res) => {
     const who = await marketIdentity(req);
     if (!who) return marketFail(res, 401, 'Nicht angemeldet.');
 
-    const coord  = normalizeRegistryCoord(req.body && req.body.sellerCoord);
-    const kind   = req.body && typeof req.body.kind === 'string' ? req.body.kind : '';
-    const index  = marketStrictInt(req.body && req.body.itemIndex);
-    const amount = marketStrictInt(req.body && req.body.amount);
-    const price  = marketStrictInt(req.body && req.body.priceCredits);
+    const coord         = normalizeRegistryCoord(req.body && req.body.sellerCoord);
+    const kind          = req.body && typeof req.body.kind === 'string' ? req.body.kind : '';
+    const index         = marketStrictInt(req.body && req.body.itemIndex);
+    const amount        = marketStrictInt(req.body && req.body.amount);
+    const priceResource = marketStrictInt(req.body && req.body.priceResource);
+    const priceAmount   = marketStrictInt(req.body && req.body.priceAmount);
 
     if (!coord) return marketFail(res, 400, 'Ungültige Kolonie.');
     if (!marketItemValid(kind, index)) return marketFail(res, 400, 'Diese Ware kann nicht gehandelt werden.');
+    if (!(priceResource >= 0 && priceResource <= 4)) return marketFail(res, 400, 'Als Gegenleistung sind nur Energie, Wasserstoff, Metalle, Werkzeuge und Credits erlaubt.');
+    if (kind === 'resource' && priceResource === index)
+        return marketFail(res, 400, `${marketItemName('resource', index)} kann nicht gegen ${marketItemName('resource', index)} getauscht werden.`);
     const def = MARKET_KINDS[kind];
     if (!(amount >= def.minAmount && amount <= def.maxAmount)) return marketFail(res, 400, `Menge muss zwischen ${def.minAmount} und ${def.maxAmount} liegen.`);
-    const bounds = marketPriceBounds(kind, index, amount);
-    if (!(price >= bounds.min && price <= bounds.max))
-        return marketFail(res, 400, `Der Preis muss zwischen ${bounds.min} und ${bounds.max} Credits liegen (Richtwert ${bounds.ref}).`);
+    const bounds = marketPriceBounds(kind, index, amount, priceResource);
+    const resName = marketItemName('resource', priceResource);
+    if (bounds.min > MARKET_MAX_PRICE) return marketFail(res, 400, `Diese Menge ist für die Gegenleistung ${resName} zu groß.`);
+    if (!(priceAmount >= bounds.min && priceAmount <= Math.min(bounds.max, MARKET_MAX_PRICE)))
+        return marketFail(res, 400, `Der Preis muss zwischen ${marketNum(bounds.min)} und ${marketNum(Math.min(bounds.max, MARKET_MAX_PRICE))} ${resName} liegen.`);
 
     try {
         const outcome = await withMarketLock(who.playFabId, async () => {
@@ -7441,10 +7526,10 @@ app.post('/market/create', async (req, res) => {
             try {
                 const sellerName = String(commander.visibleName || ('Commander ' + who.commanderId)).slice(0, 32);
                 const ins = await pool.query(
-                    `INSERT INTO market_offers (seller_playfab_id, seller_commander_id, seller_name, seller_coord, item_kind, resource_index, amount, price_credits, expires_at)
-                     VALUES ($1, $2, $3, $4, $5, $6, $7, $8, now() + make_interval(hours => $9::int))
+                    `INSERT INTO market_offers (seller_playfab_id, seller_commander_id, seller_name, seller_coord, item_kind, resource_index, amount, price_resource, price_amount, expires_at)
+                     VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, now() + make_interval(hours => $10::int))
                      RETURNING id`,
-                    [who.playFabId, who.commanderId, sellerName, coord, kind, index, amount, price, MARKET_DURATION_HOURS]);
+                    [who.playFabId, who.commanderId, sellerName, coord, kind, index, amount, priceResource, priceAmount, MARKET_DURATION_HOURS]);
                 offerId = ins.rows[0].id;
             } catch (insertError) {
                 console.error('[Handel] create: Angebot anlegen fehlgeschlagen, buche Ware zurueck:', insertError.message);
@@ -7457,7 +7542,7 @@ app.post('/market/create', async (req, res) => {
                 throw insertError;
             }
 
-            console.log(`[Handel] Angebot ${offerId}: Commander ${who.commanderId} bietet ${amount}x ${kind}#${index} fuer ${price} Credits`);
+            console.log(`[Handel] Angebot ${offerId}: Commander ${who.commanderId} bietet ${amount}x ${kind}#${index} fuer ${priceAmount}x Ress${priceResource + 1}`);
             return { status: 200, body: { success: true, offerId, coord, kind, itemIndex: index, amount } };
         });
         res.status(outcome.status).json(outcome.body);
@@ -7469,9 +7554,10 @@ app.post('/market/create', async (req, res) => {
 
 // -------------------------------------------------------
 // POST /market/buy { offerId, targetCoord }
-// Kauf sofort. Der Kaeufer bezahlt mit den Credits des Zielplaneten und bekommt die Ware dorthin geliefert.
-// Reihenfolge: pruefen -> Angebot atomar auf 'sold' setzen (nur einer gewinnt) -> Kaeufer belasten/beliefern.
-// Schlaegt das Schreiben nach PlayFab fehl, wird das Angebot wieder freigegeben.
+// Kauf sofort. Der Kaeufer bezahlt mit dem Vorrat der Gegenleistung auf dem Zielplaneten und bekommt die Ware
+// dorthin geliefert. Reihenfolge: pruefen -> Angebot atomar auf 'sold' setzen (nur einer gewinnt) -> Kaeufer
+// belasten/beliefern. Schlaegt das Schreiben nach PlayFab fehl, wird das Angebot wieder freigegeben.
+// Danach bekommt der Verkaeufer eine Mail.
 // -------------------------------------------------------
 app.post('/market/buy', async (req, res) => {
     const who = await marketIdentity(req);
@@ -7483,9 +7569,10 @@ app.post('/market/buy', async (req, res) => {
     if (!target) return marketFail(res, 400, 'Bitte einen Planeten wählen.');
 
     try {
+        let mailJob = null;
         const outcome = await withMarketLock(who.playFabId, async () => {
             const found = await pool.query(
-                `SELECT id, seller_commander_id, item_kind, resource_index, amount, price_credits FROM market_offers
+                `SELECT id, seller_playfab_id, seller_commander_id, seller_coord, item_kind, resource_index, amount, price_resource, price_amount FROM market_offers
                  WHERE id = $1 AND status = 'active' AND expires_at > now()`, [offerId]);
             if (found.rows.length === 0) return { status: 409, body: { success: false, error: 'Dieses Angebot ist nicht mehr verfügbar.' } };
             const offer = found.rows[0];
@@ -7498,25 +7585,26 @@ app.post('/market/buy', async (req, res) => {
             if (!commander.colonies.includes(target)) return { status: 403, body: { success: false, error: 'Dieser Planet gehört dir nicht.' } };
             const planet = planets[target];
             if (!planet) return { status: 404, body: { success: false, error: 'Planet nicht gefunden.' } };
-            const credits = marketHave(planet, 'resource', MARKET_CREDITS_INDEX);
-            if (credits < offer.price_credits)
-                return { status: 400, body: { success: false, error: `Nicht genug Credits auf diesem Planeten (vorhanden: ${credits}, benötigt: ${offer.price_credits}).`, credits } };
+            const have = marketHave(planet, 'resource', offer.price_resource);
+            const resName = marketItemName('resource', offer.price_resource);
+            if (have < offer.price_amount)
+                return { status: 400, body: { success: false, error: `Nicht genug ${resName} auf diesem Planeten (vorhanden: ${marketNum(have)}, benötigt: ${marketNum(offer.price_amount)}).`, have } };
 
-            const payout = Math.floor(offer.price_credits * (100 - MARKET_TAX_PERCENT) / 100);
-            const tax = offer.price_credits - payout;
+            const payout = Math.floor(offer.price_amount * (100 - MARKET_TAX_PERCENT) / 100);
+            const tax = offer.price_amount - payout;
             const buyerName = String(commander.visibleName || ('Commander ' + who.commanderId)).slice(0, 32);
 
             // Nur EIN gleichzeitiger Kaeufer gewinnt (Bedingung steckt im UPDATE selbst).
             const claimed = await pool.query(
                 `UPDATE market_offers
-                 SET status = 'sold', sold_at = now(), buyer_commander_id = $2, buyer_name = $3, payout_credits = $4, tax_credits = $5
+                 SET status = 'sold', sold_at = now(), buyer_commander_id = $2, buyer_name = $3, payout_amount = $4, tax_amount = $5
                  WHERE id = $1 AND status = 'active' AND expires_at > now() AND seller_commander_id <> $2
                  RETURNING id`, [offerId, who.commanderId, buyerName, payout, tax]);
             if (claimed.rows.length === 0)
                 return { status: 409, body: { success: false, error: 'Dieses Angebot ist nicht mehr verfügbar.' } };
 
             try {
-                marketRemove(planet, 'resource', MARKET_CREDITS_INDEX, offer.price_credits);
+                marketRemove(planet, 'resource', offer.price_resource, offer.price_amount);
                 marketAdd(planet, offer.item_kind, offer.resource_index, offer.amount);
                 await marketSaveEntries(who.playFabId, { [marketPlanetKey(target)]: planet });
             } catch (saveError) {
@@ -7524,7 +7612,7 @@ app.post('/market/buy', async (req, res) => {
                 try {
                     await pool.query(
                         `UPDATE market_offers
-                         SET status = 'active', sold_at = NULL, buyer_commander_id = NULL, buyer_name = NULL, payout_credits = 0, tax_credits = 0
+                         SET status = 'active', sold_at = NULL, buyer_commander_id = NULL, buyer_name = NULL, payout_amount = 0, tax_amount = 0
                          WHERE id = $1 AND status = 'sold' AND settled = false`, [offerId]);
                 } catch (revertError) {
                     console.error('[Handel] buy: FREIGABE FEHLGESCHLAGEN (Angebot ' + offerId + '):', revertError.message);
@@ -7532,13 +7620,16 @@ app.post('/market/buy', async (req, res) => {
                 throw saveError;
             }
 
-            console.log(`[Handel] Verkauf ${offerId}: Commander ${who.commanderId} kauft ${offer.amount}x ${offer.item_kind}#${offer.resource_index} fuer ${offer.price_credits} Credits (Verkaeufer ${payout}, Steuer ${tax})`);
-            return { status: 200, body: { success: true, offerId, kind: offer.item_kind, itemIndex: offer.resource_index, amount: offer.amount, priceCredits: offer.price_credits, targetCoord: target } };
+            console.log(`[Handel] Verkauf ${offerId}: Commander ${who.commanderId} kauft ${offer.amount}x ${offer.item_kind}#${offer.resource_index} fuer ${offer.price_amount}x Ress${offer.price_resource + 1} (Verkaeufer ${payout}, Steuer ${tax})`);
+            mailJob = { offer, buyerName, payout, tax };
+            return { status: 200, body: { success: true, offerId, kind: offer.item_kind, itemIndex: offer.resource_index, amount: offer.amount, priceResource: offer.price_resource, priceAmount: offer.price_amount, targetCoord: target } };
         });
         res.status(outcome.status).json(outcome.body);
+        // Mail NACH der Antwort und ausserhalb des Kaeufer-Locks (der Kauf ist abgeschlossen; Mail-Fehler sind unkritisch).
+        if (mailJob) await marketSendSaleMail(mailJob.offer, mailJob.buyerName, mailJob.payout, mailJob.tax);
     } catch (error) {
         console.error('[Handel] buy Fehler:', error.message);
-        marketFail(res, 500, 'Kauf konnte nicht abgeschlossen werden.');
+        if (!res.headersSent) marketFail(res, 500, 'Kauf konnte nicht abgeschlossen werden.');
     }
 });
 
@@ -7598,8 +7689,8 @@ app.post('/market/cancel', async (req, res) => {
 });
 
 // -------------------------------------------------------
-// POST /market/claim {} - Abholen: Credits-Erloes verkaufter Angebote (auf den Herkunftsplaneten) + Ware
-// abgelaufener Angebote. Der Aufrufer ist der Verkaeufer selbst und uebernimmt das Ergebnis sofort lokal.
+// POST /market/claim {} - Abholen: Erloes verkaufter Angebote (in der verlangten Ressource, auf den Herkunftsplaneten)
+// + Ware abgelaufener Angebote. Der Aufrufer ist der Verkaeufer selbst und uebernimmt das Ergebnis sofort lokal.
 // -------------------------------------------------------
 app.post('/market/claim', async (req, res) => {
     const who = await marketIdentity(req);
@@ -7615,9 +7706,9 @@ app.post('/market/claim', async (req, res) => {
                  WHERE seller_commander_id = $1 AND settled = false
                    AND ((status = 'sold' AND sold_at <= now() - make_interval(secs => ${MARKET_SETTLE_DELAY_SECONDS}))
                         OR (status = 'active' AND expires_at <= now()))
-                 RETURNING id, status, seller_coord, item_kind, resource_index, amount, payout_credits`, [who.commanderId]);
+                 RETURNING id, status, seller_coord, item_kind, resource_index, amount, price_resource, payout_amount`, [who.commanderId]);
             if (rows.rows.length === 0)
-                return { status: 200, body: { success: true, payoutCredits: 0, payouts: [], returns: [], settledCount: 0 } };
+                return { status: 200, body: { success: true, payouts: [], returns: [], settledCount: 0 } };
 
             const soldIds = rows.rows.filter(r => r.status === 'sold').map(r => r.id);
             const expiredIds = rows.rows.filter(r => r.status === 'expired').map(r => r.id);
@@ -7636,40 +7727,41 @@ app.post('/market/claim', async (req, res) => {
                 if (!player) { await revert(); return { status: 404, body: { success: false, error: 'Commander nicht gefunden.' } }; }
                 const commander = player.commander;
 
-                // Gutschriften je Zielplanet buendeln: abgelaufene Ware -> zurueck, verkauft -> Credits-Erloes.
+                // Gutschriften je Zielplanet buendeln: abgelaufene Ware -> zurueck, verkauft -> Erloes in der verlangten Ressource.
                 const adds = new Map(); // coord -> [ { kind, itemIndex, amount, isPayout } ]
                 for (const r of rows.rows) {
                     const coord = marketReturnCoord(commander, r.seller_coord);
                     if (!coord) { await revert(); return { status: 400, body: { success: false, error: 'Keine Kolonie für die Rückgabe gefunden.' } }; }
                     if (!adds.has(coord)) adds.set(coord, []);
                     if (r.status === 'expired') adds.get(coord).push({ kind: r.item_kind, itemIndex: r.resource_index, amount: r.amount, isPayout: false });
-                    else if (r.payout_credits > 0) adds.get(coord).push({ kind: 'resource', itemIndex: MARKET_CREDITS_INDEX, amount: r.payout_credits, isPayout: true });
+                    else if (r.payout_amount > 0) adds.get(coord).push({ kind: 'resource', itemIndex: r.price_resource, amount: r.payout_amount, isPayout: true });
                 }
                 const planets = await marketLoadPlanets(who.playFabId, Array.from(adds.keys()));
 
                 const entries = {};
                 const returnsOut = [];
-                const payoutsByCoord = new Map();
-                let payoutCredits = 0;
+                const payoutsMap = new Map(); // "coord|resource" -> { coord, resourceIndex, amount }
                 for (const [coord, list] of adds) {
                     const planet = planets[coord];
                     if (!planet) { await revert(); return { status: 404, body: { success: false, error: 'Planet nicht gefunden.' } }; }
                     for (const item of list) {
                         marketAdd(planet, item.kind, item.itemIndex, item.amount);
                         if (item.isPayout) {
-                            payoutCredits += item.amount;
-                            payoutsByCoord.set(coord, (payoutsByCoord.get(coord) || 0) + item.amount);
+                            const key = coord + '|' + item.itemIndex;
+                            const prev = payoutsMap.get(key) || { coord, resourceIndex: item.itemIndex, amount: 0 };
+                            prev.amount += item.amount;
+                            payoutsMap.set(key, prev);
                         } else {
                             returnsOut.push({ coord, kind: item.kind, itemIndex: item.itemIndex, amount: item.amount });
                         }
                     }
                     entries[marketPlanetKey(coord)] = planet;
                 }
-                const payoutsOut = Array.from(payoutsByCoord, ([coord, amount]) => ({ coord, amount }));
+                const payoutsOut = Array.from(payoutsMap.values());
 
                 await marketSaveEntries(who.playFabId, entries);
-                console.log(`[Handel] Abholung Commander ${who.commanderId}: ${soldIds.length} verkauft (+${payoutCredits} Credits), ${expiredIds.length} abgelaufen zurueck`);
-                return { status: 200, body: { success: true, payoutCredits, payouts: payoutsOut, returns: returnsOut, settledCount: rows.rows.length } };
+                console.log(`[Handel] Abholung Commander ${who.commanderId}: ${soldIds.length} verkauft, ${expiredIds.length} abgelaufen zurueck`);
+                return { status: 200, body: { success: true, payouts: payoutsOut, returns: returnsOut, settledCount: rows.rows.length } };
             } catch (error) {
                 await revert();
                 throw error;
