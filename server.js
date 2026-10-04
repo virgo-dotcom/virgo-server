@@ -712,11 +712,11 @@ async function initDatabase() {
         );
 
         const defaultShopItems = [
-            ['ress00', '100.000 Energie',     'ressourcen', 100, 'resource', 0, 100000],
-            ['ress01', '100.000 Wasserstoff', 'ressourcen', 100, 'resource', 1, 100000],
-            ['ress02', '100.000 Metalle',     'ressourcen', 100, 'resource', 2, 100000],
-            ['ress03', '100.000 Gold',        'ressourcen', 100, 'resource', 3, 100000],
-            ['ress04', '100.000 Werkzeug',    'ressourcen', 100, 'resource', 4, 100000],
+            ['ress00', '10.000 Energie',      'ressourcen', 100, 'resource', 0, 10000],
+            ['ress01', '10.000 Wasserstoff',  'ressourcen', 100, 'resource', 1, 10000],
+            ['ress02', '10.000 Metalle',      'ressourcen', 100, 'resource', 2, 10000],
+            ['ress03', '10.000 Gold',         'ressourcen', 100, 'resource', 3, 10000],
+            ['ress04', '10.000 Werkzeug',     'ressourcen', 100, 'resource', 4, 10000],
             ['fleet_warship01', '100x Orbitaljaeger (Warship01)', 'flotten',    250,  'warship',  0, 100],
             ['fleet_warship02', '50x Raumjaeger (Warship02)',     'flotten',    250,  'warship',  1, 50],
             ['fleet_warship03', '10x Kosmosjaeger (Warship03)',   'flotten',    250,  'warship',  2, 10],
@@ -734,12 +734,19 @@ async function initDatabase() {
             );
         }
 
-        // NEU (04.10.2026): Ressourcen umbenannt (Index 3 = Gold, Index 4 = Werkzeug, vorher Werkzeug/Daten).
-        // display_name ist reine Server-Doku (der Client baut den Namen aus ResourceNames.cs), wird hier aber
-        // nachgezogen, damit Admin-Ansichten/Logs nicht den alten Namen zeigen. Idempotent; Preise und
-        // reward_index bleiben bewusst unveraendert.
-        await pool.query(`UPDATE shop_items SET display_name = '100.000 Gold' WHERE item_id = 'ress03' AND display_name <> '100.000 Gold'`);
-        await pool.query(`UPDATE shop_items SET display_name = '100.000 Werkzeug' WHERE item_id = 'ress04' AND display_name <> '100.000 Werkzeug'`);
+        // NEU (04.10.2026): Ressourcen umbenannt (Index 3 = Gold, Index 4 = Werkzeug, vorher Werkzeug/Daten) UND
+        // Standard-Paketgroesse von 100.000 auf 10.000 gesenkt (Preis bleibt 100 ICC; im Shop kann man jetzt
+        // eine Menge waehlen). display_name ist reine Server-Doku (der Client baut den Namen aus ResourceNames.cs).
+        // Idempotent und nur fuer Zeilen, die noch den alten Standardwert 100000 haben - spaetere manuelle
+        // Aenderungen an Menge/Preis in der Datenbank werden NICHT ueberschrieben.
+        const shopResourceNames = [['ress00', 'Energie'], ['ress01', 'Wasserstoff'], ['ress02', 'Metalle'], ['ress03', 'Gold'], ['ress04', 'Werkzeug']];
+        for (const [itemId, resName] of shopResourceNames) {
+            await pool.query(
+                `UPDATE shop_items SET reward_amount = 10000, display_name = $2
+                 WHERE item_id = $1 AND reward_kind = 'resource' AND reward_amount = 100000`,
+                [itemId, `10.000 ${resName}`]
+            );
+        }
 
         // -------------------------------------------------------
         // NEU (17.09.): ICC-Geschenkkiste. Einzige bisherige ICC-Quelle
@@ -3508,10 +3515,19 @@ app.get('/shop/items', async (req, res) => {
     }
 });
 
+// NEU (04.10.2026): Kaufmenge. Preis UND Belohnung werden serverseitig mit der Menge multipliziert; der
+// Client schickt nur die gewuenschte Anzahl. Fehlt "quantity" (aeltere Client-Version), gilt 1.
+const SHOP_MAX_QUANTITY = 999;
+const SHOP_RESOURCE_CAP = 2000000000; // Unity speichert Ressourcen als int (max. ~2,147 Mrd)
+
 app.post('/shop/purchase', async (req, res) => {
     const { playFabId, itemId, targetCoord } = req.body;
     if (!playFabId || !itemId || !targetCoord)
         return res.status(400).json({ success: false, error: 'Fehlende Parameter' });
+
+    let quantity = req.body.quantity === undefined ? 1 : parseInt(req.body.quantity, 10);
+    if (!Number.isInteger(quantity) || quantity < 1 || quantity > SHOP_MAX_QUANTITY)
+        return res.status(400).json({ success: false, error: `Ungültige Menge (1 bis ${SHOP_MAX_QUANTITY}).` });
 
     try {
         const itemResult = await pool.query(
@@ -3546,23 +3562,26 @@ app.post('/shop/purchase', async (req, res) => {
         if (!commander.accountResources || commander.accountResources.length < 5)
             commander.accountResources = [0, 0, 0, 0, 0];
 
-        if (commander.accountResources[4] < item.cost_icc)
+        const totalCost = item.cost_icc * quantity;
+        const totalReward = item.reward_amount * quantity;
+
+        if (commander.accountResources[4] < totalCost)
             return res.status(400).json({
                 success: false, error: 'Nicht genug ICC', iccBalance: commander.accountResources[4]
             });
 
         if (item.reward_kind === 'resource') {
             if (!planet.ressources || planet.ressources.length < 5) planet.ressources = [0, 0, 0, 0, 0];
-            planet.ressources[item.reward_index] += item.reward_amount;
+            planet.ressources[item.reward_index] = Math.min(SHOP_RESOURCE_CAP, planet.ressources[item.reward_index] + totalReward);
         } else if (item.reward_kind === 'warship') {
             if (!planet.warships || planet.warships.length < 10) planet.warships = new Array(10).fill(0);
-            planet.warships[item.reward_index] += item.reward_amount;
+            planet.warships[item.reward_index] += totalReward;
         } else if (item.reward_kind === 'ship') {
             if (!planet.ships || planet.ships.length < 6) planet.ships = new Array(6).fill(0);
-            planet.ships[item.reward_index] += item.reward_amount;
+            planet.ships[item.reward_index] += totalReward;
         }
 
-        commander.accountResources[4] -= item.cost_icc;
+        commander.accountResources[4] -= totalCost;
 
         await playfabServer('/Server/UpdateUserData', {
             PlayFabId: playFabId,
@@ -4614,6 +4633,32 @@ app.get('/highscore/commanders/:commanderId', async (req, res) => {
         res.json({ success: true, commander: result.rows[0] });
     } catch (error) {
         console.error('[Server] highscore/commanders/:id GET Fehler:', error.message);
+        res.status(500).json({ success: false, error: error.message });
+    }
+});
+
+// NEU (04.10.2026): Eigene Highscore-Platzierung fuer den Pokal in der Topbar. Nur die Platzierung
+// (1 = bester) und die Gesamtzahl - keine weiteren Daten. Gleichstand teilt sich den Platz
+// (Rang = Anzahl Commander mit MEHR Punkten + 1). Der Index auf total_points (siehe initDatabase)
+// macht das auch bei vielen Spielern guenstig; der Client fragt nur etwa einmal pro Minute.
+app.get('/highscore/rank/:commanderId', async (req, res) => {
+    try {
+        const commanderId = parseInt(req.params.commanderId, 10);
+        if (!commanderId) return res.status(400).json({ success: false, error: 'Ungültige commanderId' });
+
+        const result = await pool.query(
+            `SELECT
+                (SELECT COUNT(*) FROM commander_highscore WHERE total_points > me.total_points) + 1 AS rank,
+                (SELECT COUNT(*) FROM commander_highscore) AS total
+             FROM commander_highscore me WHERE me.commander_id = $1`,
+            [commanderId]
+        );
+        if (result.rows.length === 0)
+            return res.status(404).json({ success: false, error: 'Commander nicht gefunden' });
+
+        res.json({ success: true, rank: parseInt(result.rows[0].rank, 10), total: parseInt(result.rows[0].total, 10) });
+    } catch (error) {
+        console.error('[Server] highscore/rank GET Fehler:', error.message);
         res.status(500).json({ success: false, error: error.message });
     }
 });
