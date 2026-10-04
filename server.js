@@ -53,6 +53,7 @@
 //  §24  Admin-Spieler-Info (/admin/inspectPlayer)
 //  §25  KAMPF V2 (Rundenkampf, Mischbonus, Zivile in letzter Reihe): steht VOR §21; aktiv nur bei COMBAT_ENGINE=shadow|v2
 //  §26  GALAXIE-REGISTER (planet_registry): serverautoritative Belegung, Schritt 1 (nur lesen/befuellen); steht VOR §21
+//  §28  INVENTAR (PlayFab Internal Data "inventory"): Kisten (Rohstoffe Ress01-10, Schiffe), Oeffnen, Admin-Vergabe "#inv"; steht VOR §21
 //  §27  SPIELERHANDEL (market_offers): TAUSCHHANDEL Spieler -> Spieler (Ress01-05 + Schiffe gegen Ress01-05, Preisband 100-200 % des Werts), 20 % Steuer, Verkaufs-Mail; steht VOR §21
 //
 //  WICHTIGE ARBEITSREGELN FUER DIESE DATEI
@@ -139,6 +140,7 @@ const AUTH_POLICY = [
     ['GET',  /^\/admin\/reports$/,             'keyed'],    // eigener ADMIN_KEY
     ['POST', /^\/admin\/giveAccountResource$/, 'admin'],
     ['POST', /^\/admin\/inspectPlayer$/,       'admin'],
+    ['POST', /^\/admin\/inventory\/grant$/,    'admin'],
     ['*',    /^\/alliances\/admin\/.+/,        'admin'],
     ['PUT',  /^\/legal-texts\/.+/,             'admin'],
     ['GET',  /^\/supportMessages$/,            'admin'],
@@ -6077,12 +6079,16 @@ function inspectErrorText(error) {
 }
 
 async function buildPlayerInspectionReport(rawQuery) {
+    // NEU 04.10.2026: Inventar-Werkzeug (§28) — Befehle mit "#inv" am Anfang
+    if (/^\s*#inv\b/i.test(String(rawQuery || '')))
+        return await buildInventoryAdminReport(String(rawQuery).trim());
+
     // NEU 26.09.2026: Register-Werkzeug (§26) — Befehle mit "#register" am Anfang
     if (/^\s*#register\b/i.test(String(rawQuery || '')))
         return await buildRegistryAdminReport(String(rawQuery).trim());
 
     const parsed = parseInspectQuery(rawQuery);
-    if (!parsed) return 'Bitte etwas eingeben: Commander-ID (z.B. 1000005), Ingame-Name (z.B. Agnes) oder PlayFab-ID (z.B. 1405316AFCC3DEDE).\nOptional danach Koordinaten, z.B.: 1000005 1:1:1:1 1:1:1:2\nGalaxie-Register: #register (Status), #register rebuild, #register 1:1:1:1';
+    if (!parsed) return 'Bitte etwas eingeben: Commander-ID (z.B. 1000005), Ingame-Name (z.B. Agnes) oder PlayFab-ID (z.B. 1405316AFCC3DEDE).\nOptional danach Koordinaten, z.B.: 1000005 1:1:1:1 1:1:1:2\nGalaxie-Register: #register (Status), #register rebuild, #register 1:1:1:1\nInventar: #inv (Hilfe), #inv 1000005, #inv give 1000005 crate_res_0 5';
 
     const out = [];
     const add = (line = '') => out.push(line);
@@ -7773,6 +7779,255 @@ app.post('/market/claim', async (req, res) => {
         marketFail(res, 500, 'Abholen ist gerade nicht möglich.');
     }
 });
+
+// #####################################################################
+// §28  INVENTAR (Gegenstaende der Spieler) — NEU 04.10.2026
+//      Jeder Commander hat ein eigenes Inventar. Es liegt SERVERSEITIG in den PlayFab-"Internal Data" des Spielers
+//      (Key "inventory", JSON {"items":{"<itemId>":<Anzahl>}}): Spieler/Client koennen dort weder lesen noch schreiben,
+//      es ueberlebt einen Datenbank-Wechsel (Postgres wird nicht gebraucht) und ist damit fairplay-sicher.
+//
+//      Gegenstaende (Katalog INVENTORY_ITEMS, fuer den Anfang nur Kisten):
+//        crate_res_0 ... crate_res_9   Rohstoffkiste fuer Ress01 ... Ress10 mit je 10.000 Einheiten
+//                                      (Ress01-05 gehen auf einen Planeten, Ress06-10 auf das Konto des Commanders;
+//                                       die ICC-Kiste (Ress10) ist bewusst NUR per Admin vergebbar)
+//        crate_warship_0 ... _3        Kiste mit je 1x Warship01 ... Warship04
+//        crate_ship_1, crate_ship_3    Kiste mit je 1x Containerschiff (Ship01) / Kolonisationsschiff (Ship03)
+//      Spaetere Gegenstaende (Boni, Beschleuniger, ...) kommen als weitere Eintraege in INVENTORY_ITEMS.
+//
+//      WIE KOMMT ETWAS INS INVENTAR? Aktuell nur ueber Admin: Spieler-Info-Feld "#inv give <Commander-ID> <itemId> <Anzahl>"
+//      oder POST /admin/inventory/grant. Geplant: Virgo-Shop (ICC), Promocodes, Daily Quests, Beute, Belohnungen.
+//
+//      Oeffnen einer Kiste (POST /inventory/use): Der Server ZIEHT die Kiste zuerst aus dem Inventar ab, schreibt dann den
+//      Inhalt in den PlayFab-Spielstand und bucht die Kiste bei einem Fehler zurueck (im Zweifel lieber eine Kiste "zu
+//      wenig" als doppelter Inhalt). Alles laeuft unter demselben Spieler-Lock wie der Spielerhandel (withMarketLock), weil
+//      beide dieselben Planeten-Schluessel lesen/schreiben. Der Client speichert VOR dem Oeffnen seinen Stand und rechnet
+//      das Ergebnis danach als Differenz lokal ein (wie beim Handel/Shop).
+// #####################################################################
+
+const INVENTORY_KEY              = 'inventory';
+const INVENTORY_MAX_STACK        = 1000000;   // maximale Anzahl je Gegenstand im Inventar
+const INVENTORY_MAX_USE_QUANTITY = 999;       // so viele Kisten auf einmal oeffnen
+const INVENTORY_CRATE_AMOUNT     = 10000;     // Einheiten je Rohstoffkiste
+// Namen wie in ResourceNames.cs (Client) - nur fuer Admin-Texte; der Client baut die Anzeigenamen selbst.
+const INVENTORY_RESOURCE_NAMES = ['Energie', 'Wasserstoff', 'Metalle', 'Werkzeuge', 'Credits', 'Antimaterie', 'Kristalle', 'Chips', 'Daten', 'ICC'];
+const INVENTORY_ADMIN_ONLY_ITEMS = new Set(['crate_res_9']); // ICC-Kiste: Premium-Waehrung, nie per "all"/Shop/Quest
+
+const INVENTORY_ITEMS = (() => {
+    const items = {};
+    for (let i = 0; i < 10; i++)
+        items['crate_res_' + i] = { group: 'resource', kind: 'resource', index: i, amount: INVENTORY_CRATE_AMOUNT };
+    [0, 1, 2, 3].forEach(i => { items['crate_warship_' + i] = { group: 'ship', kind: 'warship', index: i, amount: 1 }; });
+    [1, 3].forEach(i => { items['crate_ship_' + i] = { group: 'ship', kind: 'ship', index: i, amount: 1 }; });
+    return items;
+})();
+
+function inventoryItemLabel(itemId) {
+    const def = INVENTORY_ITEMS[itemId];
+    if (!def) return itemId;
+    if (def.kind === 'resource') return `Rohstoffkiste ${INVENTORY_RESOURCE_NAMES[def.index]} (${marketNum(def.amount)})`;
+    return `Schiffskiste ${marketItemName(def.kind, def.index)}`;
+}
+
+// Braucht der Inhalt einen Zielplaneten? (Ress01-05 und Schiffe: ja; Ress06-10 gehoeren dem Konto: nein)
+function inventoryNeedsPlanet(def) {
+    return def.kind !== 'resource' || def.index <= 4;
+}
+
+async function inventoryLoad(playFabId) {
+    const result = await playfabServer('/Server/GetUserInternalData', { PlayFabId: playFabId, Keys: [INVENTORY_KEY] });
+    const raw = result && result.Data && result.Data[INVENTORY_KEY] && result.Data[INVENTORY_KEY].Value;
+    let inv = { items: {} };
+    if (raw) { try { inv = JSON.parse(raw); } catch (e) { console.error('[Inventar] Inventar von ' + playFabId + ' nicht lesbar - bleibt unveraendert in PlayFab, arbeite mit leerem:', e.message); inv = { items: {} }; } }
+    if (!inv || typeof inv !== 'object') inv = { items: {} };
+    if (!inv.items || typeof inv.items !== 'object') inv.items = {};
+    return inv;
+}
+
+async function inventorySave(playFabId, inv) {
+    await playfabServer('/Server/UpdateUserInternalData', { PlayFabId: playFabId, Data: { [INVENTORY_KEY]: JSON.stringify(inv) } });
+}
+
+// Gegenstaende gutschreiben (Admin, spaeter Shop/Quests/...). Gibt die neue Anzahl zurueck.
+async function inventoryGrant(playFabId, itemId, quantity) {
+    if (!INVENTORY_ITEMS[itemId]) throw new Error('Unbekannter Gegenstand: ' + itemId);
+    if (!Number.isInteger(quantity) || quantity < 1 || quantity > INVENTORY_MAX_STACK) throw new Error('Ungültige Anzahl (1 bis ' + INVENTORY_MAX_STACK + ').');
+    return await withMarketLock(playFabId, async () => {
+        const inv = await inventoryLoad(playFabId);
+        const now = Number(inv.items[itemId]) || 0;
+        if (now + quantity > INVENTORY_MAX_STACK) throw new Error(`Zu viele ${itemId} (Obergrenze ${INVENTORY_MAX_STACK}).`);
+        inv.items[itemId] = now + quantity;
+        await inventorySave(playFabId, inv);
+        console.log(`[Inventar] +${quantity}x ${itemId} fuer ${playFabId} (jetzt ${inv.items[itemId]})`);
+        return inv.items[itemId];
+    });
+}
+
+// -------------------------------------------------------
+// GET /inventory - mein Inventar (nur Gegenstaende mit Anzahl > 0) + der komplette Katalog
+// -------------------------------------------------------
+app.get('/inventory', async (req, res) => {
+    const who = await marketIdentity(req);
+    if (!who) return marketFail(res, 401, 'Nicht angemeldet.');
+    try {
+        const inv = await inventoryLoad(who.playFabId);
+        const items = Object.keys(inv.items)
+            .filter(id => INVENTORY_ITEMS[id] && Number(inv.items[id]) > 0)
+            .map(id => ({ itemId: id, count: Number(inv.items[id]) }));
+        const catalog = Object.keys(INVENTORY_ITEMS).map(id => {
+            const d = INVENTORY_ITEMS[id];
+            return { itemId: id, group: d.group, kind: d.kind, index: d.index, amount: d.amount, needsPlanet: inventoryNeedsPlanet(d) };
+        });
+        res.json({ success: true, items, catalog, maxUse: INVENTORY_MAX_USE_QUANTITY });
+    } catch (error) {
+        console.error('[Inventar] GET Fehler:', error.message);
+        marketFail(res, 500, 'Inventar konnte nicht geladen werden.');
+    }
+});
+
+// -------------------------------------------------------
+// POST /inventory/use { itemId, quantity, targetCoord }
+// Oeffnet quantity Kisten. targetCoord = eigener Planet (Pflicht fuer Ress01-05 und Schiffe, sonst ignoriert).
+// -------------------------------------------------------
+app.post('/inventory/use', async (req, res) => {
+    const who = await marketIdentity(req);
+    if (!who) return marketFail(res, 401, 'Nicht angemeldet.');
+
+    const itemId   = req.body && typeof req.body.itemId === 'string' ? req.body.itemId : '';
+    const quantity = req.body && req.body.quantity === undefined ? 1 : marketStrictInt(req.body && req.body.quantity);
+    const target   = normalizeRegistryCoord(req.body && req.body.targetCoord);
+    const def = INVENTORY_ITEMS[itemId];
+    if (!def) return marketFail(res, 404, 'Unbekannter Gegenstand.');
+    if (!Number.isInteger(quantity) || quantity < 1 || quantity > INVENTORY_MAX_USE_QUANTITY)
+        return marketFail(res, 400, `Ungültige Anzahl (1 bis ${INVENTORY_MAX_USE_QUANTITY}).`);
+    const needsPlanet = inventoryNeedsPlanet(def);
+    if (needsPlanet && !target) return marketFail(res, 400, 'Bitte einen Planeten wählen.');
+
+    try {
+        const outcome = await withMarketLock(who.playFabId, async () => {
+            const inv = await inventoryLoad(who.playFabId);
+            const have = Number(inv.items[itemId]) || 0;
+            if (have < quantity)
+                return { status: 400, body: { success: false, error: `Du hast nur ${have} davon.`, remaining: have } };
+
+            const player = await marketLoadPlayer(who.playFabId, needsPlanet ? [target] : []);
+            if (!player) return { status: 404, body: { success: false, error: 'Commander nicht gefunden.' } };
+            const { commander, planets } = player;
+            let planet = null;
+            if (needsPlanet) {
+                if (!commander.colonies.includes(target)) return { status: 403, body: { success: false, error: 'Dieser Planet gehört dir nicht.' } };
+                planet = planets[target];
+                if (!planet) return { status: 404, body: { success: false, error: 'Planet nicht gefunden.' } };
+            }
+
+            const total = def.amount * quantity;
+            const entries = {};
+            const effect = { type: needsPlanet ? 'planet' : 'account', coord: needsPlanet ? target : '', kind: def.kind, itemIndex: def.index, accountIndex: -1, amount: total };
+            if (needsPlanet) {
+                marketAdd(planet, def.kind, def.index, total);
+                entries[marketPlanetKey(target)] = planet;
+            } else {
+                if (!Array.isArray(commander.accountResources)) commander.accountResources = [0, 0, 0, 0, 0];
+                while (commander.accountResources.length < 5) commander.accountResources.push(0);
+                effect.accountIndex = def.index - 5; // Ress06..Ress10 = accountResources[0..4]
+                commander.accountResources[effect.accountIndex] = Math.min(MARKET_RESOURCE_CAP, (Number(commander.accountResources[effect.accountIndex]) || 0) + total);
+                entries.commander_data = commander;
+            }
+
+            // 1) Kiste(n) aus dem Inventar entfernen ...
+            const remaining = have - quantity;
+            if (remaining > 0) inv.items[itemId] = remaining; else delete inv.items[itemId];
+            await inventorySave(who.playFabId, inv);
+
+            // 2) ... dann den Inhalt gutschreiben; scheitert das, kommt die Kiste zurueck.
+            try {
+                await marketSaveEntries(who.playFabId, entries);
+            } catch (saveError) {
+                console.error('[Inventar] use: Gutschrift fehlgeschlagen, buche Kiste zurueck:', saveError.message);
+                try {
+                    inv.items[itemId] = have;
+                    await inventorySave(who.playFabId, inv);
+                } catch (revertError) {
+                    console.error('[Inventar] use: RUECKBUCHUNG FEHLGESCHLAGEN (Commander ' + who.commanderId + ', ' + quantity + 'x ' + itemId + '):', revertError.message);
+                }
+                throw saveError;
+            }
+
+            console.log(`[Inventar] Commander ${who.commanderId} oeffnet ${quantity}x ${itemId} (${effect.type} ${effect.coord || 'Konto'} +${total})`);
+            return { status: 200, body: { success: true, itemId, quantity, remaining, effect } };
+        });
+        res.status(outcome.status).json(outcome.body);
+    } catch (error) {
+        console.error('[Inventar] use Fehler:', error.message);
+        marketFail(res, 500, 'Kiste konnte nicht geöffnet werden.');
+    }
+});
+
+// -------------------------------------------------------
+// ADMIN: Gegenstaende vergeben. POST /admin/inventory/grant { targetCommanderId | targetPlayFabId, itemId, quantity }
+// (Route steht in AUTH_POLICY als 'admin'.) Dieselbe Logik steckt hinter dem Admin-Befehl "#inv" im Spieler-Info-Feld.
+// -------------------------------------------------------
+async function inventoryResolveTarget(term) {
+    const t = String(term || '').trim();
+    if (/^\d{1,8}$/.test(t)) {
+        const r = await pool.query('SELECT commander_id, commander_name, playfab_id FROM commander_highscore WHERE commander_id = $1', [parseInt(t, 10)]);
+        if (r.rows.length === 0 || !r.rows[0].playfab_id) return null;
+        return { playFabId: String(r.rows[0].playfab_id).toUpperCase(), commanderId: r.rows[0].commander_id, name: r.rows[0].commander_name };
+    }
+    if (/^[0-9A-Fa-f]{12,20}$/.test(t)) return { playFabId: t.toUpperCase(), commanderId: null, name: '' };
+    return null;
+}
+
+app.post('/admin/inventory/grant', async (req, res) => {
+    const itemId   = req.body && typeof req.body.itemId === 'string' ? req.body.itemId : '';
+    const quantity = marketStrictInt(req.body && req.body.quantity);
+    const term     = req.body && (req.body.targetPlayFabId || req.body.targetCommanderId);
+    try {
+        const target = await inventoryResolveTarget(term);
+        if (!target) return marketFail(res, 404, 'Spieler nicht gefunden.');
+        const count = await inventoryGrant(target.playFabId, itemId, quantity);
+        res.json({ success: true, itemId, count });
+    } catch (error) {
+        marketFail(res, 400, error.message);
+    }
+});
+
+async function buildInventoryAdminReport(rawQuery) {
+    const tokens = String(rawQuery || '').trim().split(/\s+/).slice(1); // ohne "#inv"
+    const itemList = () => Object.keys(INVENTORY_ITEMS).map(id => `  ${id}  =  ${inventoryItemLabel(id)}${INVENTORY_ADMIN_ONLY_ITEMS.has(id) ? '  [nur Admin]' : ''}`).join('\n');
+    const help =
+        'INVENTAR-Admin:\n' +
+        '  #inv <Commander-ID>                          Inventar anzeigen\n' +
+        '  #inv give <Commander-ID> <itemId> [Anzahl]   Gegenstaende vergeben (Standard 1)\n' +
+        '  #inv give <Commander-ID> all [Anzahl]        je Anzahl von JEDER Kiste (ohne ICC-Kiste)\n' +
+        '(statt der Commander-ID geht auch die PlayFab-ID)\n\nGegenstaende:\n' + itemList();
+    if (tokens.length === 0 || /^(help|hilfe|\?)$/i.test(tokens[0])) return help;
+
+    try {
+        if (/^give$/i.test(tokens[0])) {
+            if (tokens.length < 3) return 'Zu wenig Angaben.\n\n' + help;
+            const target = await inventoryResolveTarget(tokens[1]);
+            if (!target) return `Spieler "${tokens[1]}" nicht gefunden (Commander-IDs werden ueber den Highscore gesucht; sonst die PlayFab-ID nehmen).`;
+            const quantity = tokens[3] === undefined ? 1 : parseInt(tokens[3], 10);
+            if (!Number.isInteger(quantity) || quantity < 1) return 'Ungueltige Anzahl.';
+            const ids = tokens[2].toLowerCase() === 'all' ? Object.keys(INVENTORY_ITEMS).filter(id => !INVENTORY_ADMIN_ONLY_ITEMS.has(id)) : [tokens[2]];
+            const lines = [];
+            for (const id of ids) {
+                const count = await inventoryGrant(target.playFabId, id, quantity);
+                lines.push(`+${quantity}x ${inventoryItemLabel(id)}  ->  jetzt ${count}`);
+            }
+            return `Inventar von ${target.name || target.playFabId}${target.commanderId ? ' (' + target.commanderId + ')' : ''}:\n` + lines.join('\n');
+        }
+
+        const target = await inventoryResolveTarget(tokens[0]);
+        if (!target) return `Spieler "${tokens[0]}" nicht gefunden (Commander-IDs werden ueber den Highscore gesucht; sonst die PlayFab-ID nehmen).`;
+        const inv = await inventoryLoad(target.playFabId);
+        const ids = Object.keys(inv.items).filter(id => Number(inv.items[id]) > 0);
+        return `Inventar von ${target.name || target.playFabId}${target.commanderId ? ' (' + target.commanderId + ')' : ''}:\n` +
+            (ids.length === 0 ? '  (leer)' : ids.map(id => `  ${inv.items[id]}x ${inventoryItemLabel(id)}  [${id}]`).join('\n'));
+    } catch (error) {
+        return 'Fehler: ' + error.message;
+    }
+}
 
 // #####################################################################
 // §21  SERVERSTART (app.listen)
