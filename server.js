@@ -720,28 +720,32 @@ async function initDatabase() {
             ['ress02', '10.000 Metalle',      'ressourcen', 100, 'resource', 2, 10000],
             ['ress03', '7.500 Werkzeuge',     'ressourcen', 100, 'resource', 3, 7500],
             ['ress04', '2.500 Credits',       'ressourcen', 100, 'resource', 4, 2500],
-            ['fleet_warship01', '100x Orbitaljaeger (Warship01)', 'flotten',    250,  'warship',  0, 100],
-            ['fleet_warship02', '50x Raumjaeger (Warship02)',     'flotten',    250,  'warship',  1, 50],
-            ['fleet_warship03', '10x Kosmosjaeger (Warship03)',   'flotten',    250,  'warship',  2, 10],
-            ['fleet_warship04', '1x Sternkreuzer (Warship04)',    'flotten',    250,  'warship',  3, 1],
-            ['fleet_ship01',    '10x Containerschiff (Ship01)',   'flotten',    250,  'ship',     1, 10],
-            ['fleet_ship03',    '1x Kolonisationsschiff (Ship03)','flotten',    250,  'ship',     3, 1],
+            // Schiffspreise (NEU 04.10.2026, Nutzer-Vorgabe): ICC-Wert = Baukosten (Summe Ress x Wertgewicht) / 1.200 Wertpunkte je ICC
+            // x 10 (Aufschlag: der Spieler spart sich Bauzeit, ICC ist Pay-to-Accelerate), dann wie im Einzelhandel auf eine 9 am Ende
+            // aufgerundet (shopShipIccPrice, §28). Frueher pauschal 250 ICC je Paket.
+            ['fleet_warship01', '100x Orbitaljaeger (Warship01)', 'flotten',    shopShipIccPrice('warship', 0, 100),  'warship',  0, 100],
+            ['fleet_warship02', '50x Raumjaeger (Warship02)',     'flotten',    shopShipIccPrice('warship', 1, 50),   'warship',  1, 50],
+            ['fleet_warship03', '10x Kosmosjaeger (Warship03)',   'flotten',    shopShipIccPrice('warship', 2, 10),   'warship',  2, 10],
+            ['fleet_warship04', '1x Sternkreuzer (Warship04)',    'flotten',    shopShipIccPrice('warship', 3, 1),    'warship',  3, 1],
+            ['fleet_ship01',    '10x Containerschiff (Ship01)',   'flotten',    shopShipIccPrice('ship', 1, 10),      'ship',     1, 10],
+            ['fleet_ship03',    '1x Kolonisationsschiff (Ship03)','flotten',    shopShipIccPrice('ship', 3, 1),       'ship',     3, 1],
             ['item_ship05',     '1x Kernbombe (Ship05)',          'gegenstaende', 1000, 'ship',   5, 1],
             // NEU (04.10.2026): KISTEN fuer das Inventar (§28). reward_kind 'inventory': item_id = Inventar-Gegenstand, reward_amount =
-            // Anzahl Kisten je Kauf; sie landen im Inventar des Kaeufers (nicht auf einem Planeten). Preis wie bei den Ressourcenpaketen
-            // wertbezogen: 100 ICC = 120.000 Wertpunkte (MARKET_VALUE_WEIGHT, §27); Rohstoffkiste = 10.000 Einheiten, Schiffskiste = Baukosten
-            // des Schiffs, jeweils aufgerundet. Kisten fuer Ress06-10 gibt es bewusst NICHT im Shop (ICC kauft man nicht mit ICC).
-            ['crate_res_0',     'Rohstoffkiste Energie (10.000)',      'gegenstaende', 200,  'inventory', 0, 1],
-            ['crate_res_1',     'Rohstoffkiste Wasserstoff (10.000)',  'gegenstaende', 134,  'inventory', 0, 1],
-            ['crate_res_2',     'Rohstoffkiste Metalle (10.000)',      'gegenstaende', 100,  'inventory', 0, 1],
-            ['crate_res_3',     'Rohstoffkiste Werkzeuge (10.000)',    'gegenstaende', 134,  'inventory', 0, 1],
-            ['crate_res_4',     'Rohstoffkiste Credits (10.000)',      'gegenstaende', 400,  'inventory', 0, 1],
-            ['crate_warship_0', 'Schiffskiste Orbitaljaeger (Warship01)', 'gegenstaende', 15,   'inventory', 0, 1],
-            ['crate_warship_1', 'Schiffskiste Raumjaeger (Warship02)',    'gegenstaende', 63,   'inventory', 0, 1],
-            ['crate_warship_2', 'Schiffskiste Kosmosjaeger (Warship03)',  'gegenstaende', 242,  'inventory', 0, 1],
-            ['crate_warship_3', 'Schiffskiste Sternkreuzer (Warship04)',  'gegenstaende', 647,  'inventory', 0, 1],
-            ['crate_ship_1',    'Schiffskiste Containerschiff (Ship01)',  'gegenstaende', 265,  'inventory', 0, 1],
-            ['crate_ship_3',    'Schiffskiste Kolonisationsschiff (Ship03)', 'gegenstaende', 1082, 'inventory', 0, 1]
+            // Anzahl Kisten je Kauf; sie landen im Inventar des Kaeufers (nicht auf einem Planeten). "Kleine Kiste" (erste Serie, Nutzer-Vorgabe):
+            // Inhalt = Ressourcenpaket des Shops (Energie 5.000, Wasserstoff 7.500, Metalle 10.000, Werkzeuge 7.500, Credits 2.500) fuer
+            // dieselben 100 ICC. Schiffskisten (1 Schiff) kosten wie die Flotten-Pakete: Bauwert x 10, auf eine 9 aufgerundet.
+            // Kisten fuer Ress06-10 gibt es bewusst NICHT im Shop (ICC kauft man nicht mit ICC; Ress06-09 sind ungenutzt).
+            ['crate_res_0',     'Kleine Kiste: Energie (5.000)',       'gegenstaende', 100,  'inventory', 0, 1],
+            ['crate_res_1',     'Kleine Kiste: Wasserstoff (7.500)',   'gegenstaende', 100,  'inventory', 0, 1],
+            ['crate_res_2',     'Kleine Kiste: Metalle (10.000)',      'gegenstaende', 100,  'inventory', 0, 1],
+            ['crate_res_3',     'Kleine Kiste: Werkzeuge (7.500)',     'gegenstaende', 100,  'inventory', 0, 1],
+            ['crate_res_4',     'Kleine Kiste: Credits (2.500)',       'gegenstaende', 100,  'inventory', 0, 1],
+            ['crate_warship_0', 'Schiffskiste Orbitaljaeger (Warship01)', 'gegenstaende', shopShipIccPrice('warship', 0, 1), 'inventory', 0, 1],
+            ['crate_warship_1', 'Schiffskiste Raumjaeger (Warship02)',    'gegenstaende', shopShipIccPrice('warship', 1, 1), 'inventory', 0, 1],
+            ['crate_warship_2', 'Schiffskiste Kosmosjaeger (Warship03)',  'gegenstaende', shopShipIccPrice('warship', 2, 1), 'inventory', 0, 1],
+            ['crate_warship_3', 'Schiffskiste Sternkreuzer (Warship04)',  'gegenstaende', shopShipIccPrice('warship', 3, 1), 'inventory', 0, 1],
+            ['crate_ship_1',    'Schiffskiste Containerschiff (Ship01)',  'gegenstaende', shopShipIccPrice('ship', 1, 1),    'inventory', 0, 1],
+            ['crate_ship_3',    'Schiffskiste Kolonisationsschiff (Ship03)', 'gegenstaende', shopShipIccPrice('ship', 3, 1),   'inventory', 0, 1]
         ];
         for (const row of defaultShopItems) {
             await pool.query(
@@ -749,6 +753,22 @@ async function initDatabase() {
                  VALUES ($1, $2, $3, $4, $5, $6, $7)
                  ON CONFLICT (item_id) DO NOTHING`,
                 row
+            );
+        }
+
+        // NEU (04.10.2026): Preise der Flotten-Pakete und Kisten (siehe Seeds oben). Bestehende Zeilen werden NUR aktualisiert, wenn sie noch
+        // einen frueheren Standardpreis dieses Artikels haben - spaetere manuelle Aenderungen in der Datenbank bleiben erhalten.
+        const shopPreviousSeedCosts = {
+            fleet_warship01: [250], fleet_warship02: [250], fleet_warship03: [250], fleet_warship04: [250], fleet_ship01: [250], fleet_ship03: [250],
+            crate_res_0: [200], crate_res_1: [134], crate_res_2: [100], crate_res_3: [134], crate_res_4: [400],
+            crate_warship_0: [15], crate_warship_1: [63], crate_warship_2: [242], crate_warship_3: [647], crate_ship_1: [265], crate_ship_3: [1082]
+        };
+        for (const row of defaultShopItems) {
+            const previous = shopPreviousSeedCosts[row[0]];
+            if (!previous) continue;
+            await pool.query(
+                `UPDATE shop_items SET cost_icc = $2, display_name = $3 WHERE item_id = $1 AND cost_icc = ANY($4::int[])`,
+                [row[0], row[3], row[1], previous]
             );
         }
 
@@ -7818,9 +7838,11 @@ app.post('/market/claim', async (req, res) => {
 //      es ueberlebt einen Datenbank-Wechsel (Postgres wird nicht gebraucht) und ist damit fairplay-sicher.
 //
 //      Gegenstaende (Katalog INVENTORY_ITEMS, fuer den Anfang nur Kisten):
-//        crate_res_0 ... crate_res_9   Rohstoffkiste fuer Ress01 ... Ress10 mit je 10.000 Einheiten
-//                                      (Ress01-05 gehen auf einen Planeten, Ress06-10 auf das Konto des Commanders;
-//                                       die ICC-Kiste (Ress10) ist bewusst NUR per Admin vergebbar)
+//        crate_res_0 ... crate_res_4   "Kleine Kiste" fuer Ress01 ... Ress05 (erste Serie): Energie 5.000, Wasserstoff 7.500,
+//                                      Metalle 10.000, Werkzeuge 7.500, Credits 2.500 - exakt der Inhalt eines Ressourcenpakets
+//                                      im Virgo-Shop (je 100 ICC), landen auf dem gewaehlten Planeten
+//        crate_res_5 ... crate_res_9   Rohstoffkiste fuer Ress06 ... Ress10 mit je 10.000 Einheiten, gehen auf das Konto des
+//                                      Commanders (nur Admin; die ICC-Kiste (Ress10) ist bewusst NUR per Admin vergebbar)
 //        crate_warship_0 ... _3        Kiste mit je 1x Warship01 ... Warship04
 //        crate_ship_1, crate_ship_3    Kiste mit je 1x Containerschiff (Ship01) / Kolonisationsschiff (Ship03)
 //      Spaetere Gegenstaende (Boni, Beschleuniger, ...) kommen als weitere Eintraege in INVENTORY_ITEMS.
@@ -7838,7 +7860,8 @@ app.post('/market/claim', async (req, res) => {
 const INVENTORY_KEY              = 'inventory';
 const INVENTORY_MAX_STACK        = 1000000;   // maximale Anzahl je Gegenstand im Inventar
 const INVENTORY_MAX_USE_QUANTITY = 999;       // so viele Kisten auf einmal oeffnen
-const INVENTORY_CRATE_AMOUNT     = 10000;     // Einheiten je Rohstoffkiste
+// Einheiten je Rohstoffkiste, Index = Ress-Index. MUSS zu CrateItems.CrateAmount (Client, CrateItems.cs) passen - ein Test vergleicht beide.
+const INVENTORY_CRATE_AMOUNTS    = [5000, 7500, 10000, 7500, 2500, 10000, 10000, 10000, 10000, 10000];
 // Namen wie in ResourceNames.cs (Client) - nur fuer Admin-Texte; der Client baut die Anzeigenamen selbst.
 const INVENTORY_RESOURCE_NAMES = ['Energie', 'Wasserstoff', 'Metalle', 'Werkzeuge', 'Credits', 'Antimaterie', 'Kristalle', 'Chips', 'Daten', 'ICC'];
 const INVENTORY_ADMIN_ONLY_ITEMS = new Set(['crate_res_9']); // ICC-Kiste: Premium-Waehrung, nie per "all"/Shop/Quest
@@ -7846,16 +7869,36 @@ const INVENTORY_ADMIN_ONLY_ITEMS = new Set(['crate_res_9']); // ICC-Kiste: Premi
 const INVENTORY_ITEMS = (() => {
     const items = {};
     for (let i = 0; i < 10; i++)
-        items['crate_res_' + i] = { group: 'resource', kind: 'resource', index: i, amount: INVENTORY_CRATE_AMOUNT };
+        items['crate_res_' + i] = { group: 'resource', kind: 'resource', index: i, amount: INVENTORY_CRATE_AMOUNTS[i] };
     [0, 1, 2, 3].forEach(i => { items['crate_warship_' + i] = { group: 'ship', kind: 'warship', index: i, amount: 1 }; });
     [1, 3].forEach(i => { items['crate_ship_' + i] = { group: 'ship', kind: 'ship', index: i, amount: 1 }; });
     return items;
 })();
 
+// -------------------------------------------------------
+// VIRGO-SHOP: ICC-Preise fuer Schiffe (Flotten-Pakete und Schiffskisten) - Nutzer-Vorgabe 04.10.2026:
+//   1) Wert in Punkten = Summe(Baukosten Ress01-05 x Wertgewicht) x Stueckzahl (marketValuePerUnit, §27)
+//   2) ICC = Punkte / 1.200 (100 ICC = 10.000 Metalle = 120.000 Punkte, wie bei den Ressourcenpaketen)
+//   3) x 10 Aufschlag: ICC ist Pay-to-Win UND Pay-to-Accelerate - die gesparte Bauzeit wird mitbezahlt
+//   4) wie im Einzelhandel auf eine 9 am Ende AUFgerundet (1.453 -> 1.459; 83 -> 89; 91 -> 99)
+// -------------------------------------------------------
+const SHOP_SHIP_ICC_MARKUP   = 10;
+const SHOP_ICC_VALUE_POINTS  = 1200;
+
+function shopRetailRoundUp9(value) {
+    const n = Math.ceil(value - 1e-9);
+    if (n <= 9) return 9;
+    return Math.ceil((n - 9) / 10) * 10 + 9;
+}
+
+function shopShipIccPrice(kind, index, count) {
+    return shopRetailRoundUp9(marketValuePerUnit(kind, index) * count / SHOP_ICC_VALUE_POINTS * SHOP_SHIP_ICC_MARKUP);
+}
+
 function inventoryItemLabel(itemId) {
     const def = INVENTORY_ITEMS[itemId];
     if (!def) return itemId;
-    if (def.kind === 'resource') return `Rohstoffkiste ${INVENTORY_RESOURCE_NAMES[def.index]} (${marketNum(def.amount)})`;
+    if (def.kind === 'resource') return `${def.index <= 4 ? 'Kleine Kiste' : 'Rohstoffkiste'}: ${INVENTORY_RESOURCE_NAMES[def.index]} (${marketNum(def.amount)})`;
     return `Schiffskiste ${marketItemName(def.kind, def.index)}`;
 }
 
