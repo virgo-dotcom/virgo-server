@@ -4436,6 +4436,11 @@ app.get('/serverTick', serverTickHandler);
 // (BuildingDefinition.cs) — es gibt keine automatische Übertragung.
 // Nur Gebäude mit echten Werten sind eingetragen; alle anderen
 // produzieren einfach nichts (result bleibt 0).
+// NEU 05.10.2026: Ertraege der Farm-Gebaeude 1-4 (Energie, Wasserstoff, Metalle, Werkzeuge) = explizite Werte je Stufe 1-20 (Einheiten
+// je 5-s-Takt, Nutzer-Vorgabe: Metalle ~10.000/Tag auf Stufe 5, ~100.000 auf Stufe 10, ~1.000.000 auf Stufe 15; Wasserstoff/Werkzeuge
+// 0,75 und Energie 0,5 davon, entsprechend dem Wertverhaeltnis 1.000 Metalle = 750 Wasserstoff = 750 Werkzeuge = 500 Energie).
+// Gebaeude 2-4 hatten hier bisher KEINE Werte (nur der Client produzierte) - jetzt sind alle vier mit den Unity-Assets abgeglichen.
+// Brueche sind gewollt: produceResources rundet unverzerrt (siehe dort).
 // =========================================================
 const BUILDING_ECONOMY = {
     0: { // Kommandozentrale — feste Grundproduktion, wächst NICHT mit Stufe.
@@ -4445,10 +4450,10 @@ const BUILDING_ECONOMY = {
         scalesWithLevel: false,
         tierGrowthFactors: [],
         tierStepCounts: [],
-        baseStorageCapacity: 10
+        baseStorageCapacity: 1000   // NEU 05.10.2026 (vorher 10): Lager fuer Credits (Ress05), wie bei den Ressourcen-Gebaeuden; muss zu Building00.asset passen
     },
     1: { // Ress01-Gebäude (Energie)
-        productionEarly: [[0, 2, 4, 8, 10], [], [], [], []],
+        productionEarly: [[0.0458592, 0.0726819, 0.115193, 0.182569, 0.289352, 0.458592, 0.726819, 1.15193, 1.82569, 2.89352, 4.58592, 7.26819, 11.5193, 18.2569, 28.9352, 45.8592, 72.6819, 115.193, 182.569, 289.352], [], [], [], []],
         scalesWithLevel: true,
         tierGrowthFactors: [1.535, 1.62, 1.7],
         tierStepCounts: [4, 4, 7],
@@ -4456,7 +4461,7 @@ const BUILDING_ECONOMY = {
     },
     2: { // Ress02-Gebäude (Wasserstoff) — Produktionswerte noch offen,
          // hier vorerst leer bis sie feststehen (siehe Chat-Verlauf)
-        productionEarly: [[], [], [], [], []],
+        productionEarly: [[], [0.0687888, 0.109023, 0.17279, 0.273853, 0.434028, 0.687888, 1.09023, 1.7279, 2.73853, 4.34028, 6.87888, 10.9023, 17.279, 27.3853, 43.4028, 68.7888, 109.023, 172.79, 273.853, 434.028], [], [], []],
         scalesWithLevel: true,
         tierGrowthFactors: [1.535, 1.62, 1.7],
         tierStepCounts: [4, 4, 7],
@@ -4467,7 +4472,7 @@ const BUILDING_ECONOMY = {
          // sonst deckelt der Server die Ressource bei jedem Tick auf 0
          // (siehe Bug-Fund im Chat: fehlender Eintrag hier hat Ress03/04
          // bei jedem Server-Tick auf 0 zurückgesetzt)
-        productionEarly: [[], [], [], [], []],
+        productionEarly: [[], [], [0.0917184, 0.145364, 0.230386, 0.365137, 0.578704, 0.917184, 1.45364, 2.30386, 3.65137, 5.78704, 9.17184, 14.5364, 23.0386, 36.5137, 57.8704, 91.7184, 145.364, 230.386, 365.137, 578.704], [], []],
         scalesWithLevel: true,
         tierGrowthFactors: [1.535, 1.62, 1.7],
         tierStepCounts: [4, 4, 7],
@@ -4475,7 +4480,7 @@ const BUILDING_ECONOMY = {
     },
     4: { // Ress04-Gebäude (Werkzeuge) — Produktionswerte noch offen,
          // gleicher Kapazitäts-Fix wie bei Ress03
-        productionEarly: [[], [], [], [], []],
+        productionEarly: [[], [], [], [0.0687888, 0.109023, 0.17279, 0.273853, 0.434028, 0.687888, 1.09023, 1.7279, 2.73853, 4.34028, 6.87888, 10.9023, 17.279, 27.3853, 43.4028, 68.7888, 109.023, 172.79, 273.853, 434.028], []],
         scalesWithLevel: true,
         tierGrowthFactors: [1.535, 1.62, 1.7],
         tierStepCounts: [4, 4, 7],
@@ -4914,10 +4919,12 @@ function produceResources(planet, elapsedSeconds, commander) {
             // der Kapazitaet (Handel, Shop, Beute), bleibt er erhalten - es wird nur nichts dazuproduziert.
             // (Gleiche Regel im Client: PlanetProductionManager.ResourceLoop.)
             if ((planet.ressources[r] || 0) >= caps[r]) continue;
-            planet.ressources[r] = Math.min(
-                (planet.ressources[r] || 0) + (perTick[r] * bonusMultiplier) * ticks,
-                caps[r]
-            );
+            // NEU 05.10.2026: Ertraege sind jetzt oft Bruchteile je Takt (z.B. 0,09 je 5 s). Ganze Einheiten gutschreiben, der Rest
+            // wird zufaellig, aber UNVERZERRT auf-/abgerundet (im Schnitt exakt der echte Ertrag; PlayFab-Bestaende bleiben ganzzahlig).
+            const exactAdd = (perTick[r] * bonusMultiplier) * ticks;
+            let wholeAdd = Math.floor(exactAdd);
+            if (Math.random() < exactAdd - wholeAdd) wholeAdd += 1;
+            planet.ressources[r] = Math.min((planet.ressources[r] || 0) + wholeAdd, caps[r]);
         }
     }
 
