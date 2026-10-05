@@ -824,6 +824,17 @@ async function initDatabase() {
             );
         `);
 
+        // NEU (05.10.): "Goldene" Tageskiste - je Spieler und "Geschenk-Tag" (Wechsel 12:00 Uhr Europe/Berlin) genau
+        // einmal; gleiches Primary-Key-Prinzip. day_key = 'YYYY-MM-DD' des Geschenk-Tages.
+        await pool.query(`
+            CREATE TABLE IF NOT EXISTS giftbox_golden_claims (
+                playfab_id TEXT NOT NULL,
+                day_key TEXT NOT NULL,
+                claimed_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+                PRIMARY KEY (playfab_id, day_key)
+            );
+        `);
+
         // -------------------------------------------------------
         // NEU (18.09.): Echte Promocodes fuer ALLE Spieler (Social-Media-
         // Aktionen), NICHT zu verwechseln mit den Admin-Cheatcodes in
@@ -3486,6 +3497,7 @@ app.post('/admin/giveAccountResource', async (req, res) => {
         if (!commander.accountResources || commander.accountResources.length < 5)
             commander.accountResources = [0, 0, 0, 0, 0];
 
+        if (ressIndex === 4) await iccGuard(targetPlayFabId, commander); // ICC-Waechter (§28)
         commander.accountResources[ressIndex] = Math.max(0, commander.accountResources[ressIndex] + amount);
 
         await playfabServer('/Server/UpdateUserData', {
@@ -3493,6 +3505,7 @@ app.post('/admin/giveAccountResource', async (req, res) => {
             Data: { commander_data: JSON.stringify(commander) },
             Permission: 'Private'
         });
+        if (ressIndex === 4) await iccTrustSet(targetPlayFabId, commander.accountResources[4]);
 
         res.json({ success: true, newBalance: commander.accountResources[ressIndex] });
     } catch (error) {
@@ -3686,6 +3699,8 @@ app.post('/shop/purchase', async (req, res) => {
         if (!commander.accountResources || commander.accountResources.length < 5)
             commander.accountResources = [0, 0, 0, 0, 0];
 
+        await iccGuard(playFabId, commander); // ICC-Waechter (§28): unerklaerte ICC-Erhoehung verwerfen
+
         const totalCost = item.cost_icc * quantity;
         const totalReward = item.reward_amount * quantity;
 
@@ -3716,6 +3731,8 @@ app.post('/shop/purchase', async (req, res) => {
             Permission: 'Private'
         });
 
+        await iccTrustSet(playFabId, commander.accountResources[4]);
+
         res.json({ success: true, newIccBalance: commander.accountResources[4] });
     } catch (error) {
         console.error('[Server] shop/purchase Fehler:', error.message);
@@ -3724,7 +3741,7 @@ app.post('/shop/purchase', async (req, res) => {
 });
 
 // =========================================================
-// ICC-GESCHENKKISTE (17.09.) — einzige bisherige ICC-Quelle. Pro
+// ICC-GESCHENKKISTE (17.09., goldene Tageskiste 05.10.) — einzige bisherige ICC-Quelle. Pro
 // 30-Minuten-Fenster (UTC, :00/:30) einmal oeffenbar, Belohnung =
 // 5 ICC je eigener Kolonie. Siehe giftbox_claims-Tabelle in
 // initDatabase() fuer das Anti-Doppelklick-Prinzip.
@@ -3741,6 +3758,25 @@ function currentGiftBoxWindow() {
     return { windowStart, nextResetUtc };
 }
 
+// NEU (05.10.): "Goldene" Tageskiste. Einmal pro "Geschenk-Tag" ist die Kiste golden: mehr ICC
+// (GIFTBOX_GOLDEN_MULTIPLIER) und eine zufaellige "Kleine Kiste" (Ress01-05) im Inventar. Der Geschenk-Tag wechselt um
+// 12:00 Uhr Europe/Berlin (Sommer-/Winterzeit wird automatisch beachtet). Pro Spieler und Geschenk-Tag genau einmal
+// (Tabelle giftbox_golden_claims, Primary Key = atomar).
+const GIFTBOX_GOLDEN_MULTIPLIER = 3;
+const GIFTBOX_GOLDEN_CRATES = ['crate_res_0', 'crate_res_1', 'crate_res_2', 'crate_res_3', 'crate_res_4'];
+const GIFTBOX_RESET_HOUR_BERLIN = 12;
+
+function giftBoxGoldenDayKey(now) {
+    const parts = {};
+    new Intl.DateTimeFormat('en-GB', {
+        timeZone: 'Europe/Berlin', year: 'numeric', month: '2-digit', day: '2-digit', hour: '2-digit', hourCycle: 'h23'
+    }).formatToParts(now || new Date()).forEach(p => { parts[p.type] = p.value; });
+    // Vor 12:00 gehoert der Zeitpunkt noch zum Geschenk-Tag von gestern.
+    const base = new Date(Date.UTC(Number(parts.year), Number(parts.month) - 1, Number(parts.day)));
+    if (Number(parts.hour) < GIFTBOX_RESET_HOUR_BERLIN) base.setUTCDate(base.getUTCDate() - 1);
+    return base.toISOString().slice(0, 10);
+}
+
 app.get('/giftbox/status', async (req, res) => {
     const { playFabId } = req.query;
     if (!playFabId)
@@ -3752,9 +3788,15 @@ app.get('/giftbox/status', async (req, res) => {
             'SELECT 1 FROM giftbox_claims WHERE playfab_id = $1 AND window_start = $2',
             [playFabId, windowStart]
         );
+        const goldenResult = await pool.query(
+            'SELECT 1 FROM giftbox_golden_claims WHERE playfab_id = $1 AND day_key = $2',
+            [playFabId, giftBoxGoldenDayKey()]
+        );
+        const canClaim = result.rows.length === 0;
         res.json({
             success: true,
-            canClaim: result.rows.length === 0,
+            canClaim,
+            golden: canClaim && goldenResult.rows.length === 0,
             nextResetUtc: nextResetUtc.toISOString()
         });
     } catch (error) {
@@ -3790,6 +3832,15 @@ app.post('/giftbox/claim', async (req, res) => {
             });
         }
 
+        // Goldene Tageskiste? Ebenfalls atomar: nur der erste INSERT je (Spieler, Geschenk-Tag) ist golden.
+        const goldenResult = await pool.query(
+            `INSERT INTO giftbox_golden_claims (playfab_id, day_key) VALUES ($1, $2)
+             ON CONFLICT (playfab_id, day_key) DO NOTHING
+             RETURNING *`,
+            [playFabId, giftBoxGoldenDayKey()]
+        );
+        const golden = goldenResult.rowCount === 1;
+
         const dataResult = await playfabServer('/Server/GetUserData', {
             PlayFabId: playFabId,
             Keys: ['commander_data']
@@ -3802,8 +3853,11 @@ app.post('/giftbox/claim', async (req, res) => {
         if (!commander.accountResources || commander.accountResources.length < 5)
             commander.accountResources = [0, 0, 0, 0, 0];
 
+        // ICC-Waechter (siehe §28): unerklaerte Erhoehungen des ICC-Standes werden vor der Gutschrift verworfen.
+        await iccGuard(playFabId, commander);
+
         const colonyCount = commander.colonies ? commander.colonies.length : 0;
-        const iccReward = colonyCount * 5;
+        const iccReward = colonyCount * 5 * (golden ? GIFTBOX_GOLDEN_MULTIPLIER : 1);
         commander.accountResources[4] += iccReward;
 
         await playfabServer('/Server/UpdateUserData', {
@@ -3811,10 +3865,29 @@ app.post('/giftbox/claim', async (req, res) => {
             Data: { commander_data: JSON.stringify(commander) },
             Permission: 'Private'
         });
+        await iccTrustSet(playFabId, commander.accountResources[4]);
+
+        // Goldene Kiste: zusaetzlich eine zufaellige Kleine Kiste (Ress01-05) ins Inventar. Scheitert das, bleibt das ICC
+        // trotzdem gutgeschrieben (Fehler nur im Log) - die Kiste ist ein Bonus, kein Grund, das Geschenk zu verwerfen.
+        let crateItemId = '';
+        let crateName = '';
+        if (golden) {
+            try {
+                const pick = GIFTBOX_GOLDEN_CRATES[Math.floor(Math.random() * GIFTBOX_GOLDEN_CRATES.length)];
+                await inventoryGrant(playFabId, pick, 1);
+                crateItemId = pick;
+                crateName = inventoryItemLabel(pick);
+            } catch (crateError) {
+                console.error('[Server] giftbox/claim: Bonus-Kiste fehlgeschlagen:', crateError.message);
+            }
+        }
 
         res.json({
             success: true,
             iccReward,
+            golden,
+            crateItemId,
+            crateName,
             newIccBalance: commander.accountResources[4],
             nextResetUtc: nextResetUtc.toISOString()
         });
@@ -3872,6 +3945,7 @@ app.post('/promo/redeem', async (req, res) => {
         if (!commander.accountResources || commander.accountResources.length < 5)
             commander.accountResources = [0, 0, 0, 0, 0];
 
+        if (promo.reward_index === 4) await iccGuard(playFabId, commander); // ICC-Waechter (§28)
         commander.accountResources[promo.reward_index] += promo.reward_amount;
 
         await playfabServer('/Server/UpdateUserData', {
@@ -3879,6 +3953,7 @@ app.post('/promo/redeem', async (req, res) => {
             Data: { commander_data: JSON.stringify(commander) },
             Permission: 'Private'
         });
+        if (promo.reward_index === 4) await iccTrustSet(playFabId, commander.accountResources[4]);
 
         res.json({
             success: true,
@@ -5967,6 +6042,8 @@ async function deleteAccountDataFor(playFabId, commanderId) {
 
         const giftbox = await client.query('DELETE FROM giftbox_claims WHERE playfab_id = $1', [playFabId]);
         summary.giftboxClaims = giftbox.rowCount;
+        const giftboxGolden = await client.query('DELETE FROM giftbox_golden_claims WHERE playfab_id = $1', [playFabId]);
+        summary.giftboxGoldenClaims = giftboxGolden.rowCount;
 
         await client.query('COMMIT');
         return { summary };
@@ -7931,6 +8008,46 @@ async function inventorySave(playFabId, inv) {
     await playfabServer('/Server/UpdateUserInternalData', { PlayFabId: playFabId, Data: { [INVENTORY_KEY]: JSON.stringify(inv) } });
 }
 
+// -------------------------------------------------------
+// ICC-WAECHTER (05.10.2026). Der ICC-Stand steht in commander_data.accountResources[4] - und commander_data schreibt der
+// CLIENT (alle 60 s komplett). Ein manipulierter Client koennte sich dort beliebig viel ICC eintragen und damit im Shop
+// Kisten/Pakete kaufen. Gegenmassnahme: Der Server merkt sich in PlayFab "Internal Data" (nur Server) den zuletzt von IHM
+// bestaetigten ICC-Stand (Key icc_trust). ICC darf nur durch Server-Vorgaenge STEIGEN (Geschenkkiste, Promocode, Admin,
+// ICC-Kiste; Erfolge geben nie ICC) - jeder dieser Vorgaenge ruft iccGuard() VOR und iccTrustSet() NACH der Aenderung.
+//   iccGuard: Stand im Spielstand > bestaetigter Stand  -> Manipulation: Stand wird auf den bestaetigten Wert zurueck-
+//             gesetzt (im Objekt; der Aufrufer schreibt es ohnehin zurueck) und laut ins Log geschrieben.
+//             Stand < bestaetigt (Spieler hat z.B. im Client einen Avatar gekauft) -> bestaetigter Stand sinkt mit.
+//             Noch kein Eintrag (Erstkontakt) -> aktueller Stand wird uebernommen (Altbestand, nicht pruefbar).
+// Grenze: Wer VOR dem Erstkontakt schon geschummelt hat, ist nicht erkennbar; jede Erhoehung danach schon.
+// -------------------------------------------------------
+const ICC_TRUST_KEY = 'icc_trust';
+
+async function iccTrustLoad(playFabId) {
+    const result = await playfabServer('/Server/GetUserInternalData', { PlayFabId: playFabId, Keys: [ICC_TRUST_KEY] });
+    const raw = result && result.Data && result.Data[ICC_TRUST_KEY] && result.Data[ICC_TRUST_KEY].Value;
+    if (!raw) return null;
+    try { const v = Number(JSON.parse(raw).bal); return Number.isFinite(v) && v >= 0 ? v : null; } catch (e) { return null; }
+}
+
+async function iccTrustSet(playFabId, balance) {
+    await playfabServer('/Server/UpdateUserInternalData', { PlayFabId: playFabId, Data: { [ICC_TRUST_KEY]: JSON.stringify({ bal: Math.max(0, Math.floor(Number(balance) || 0)) }) } });
+}
+
+async function iccGuard(playFabId, commander) {
+    if (!Array.isArray(commander.accountResources)) commander.accountResources = [0, 0, 0, 0, 0];
+    while (commander.accountResources.length < 5) commander.accountResources.push(0);
+    const actual = Number(commander.accountResources[4]) || 0;
+    const trusted = await iccTrustLoad(playFabId);
+    if (trusted === null) { await iccTrustSet(playFabId, actual); return actual; }
+    if (actual > trusted) {
+        console.error(`[ICC-Waechter] ${playFabId}: ICC-Stand im Spielstand ${actual} liegt ueber dem bestaetigten Stand ${trusted} - Differenz ${actual - trusted} verworfen.`);
+        commander.accountResources[4] = trusted;
+        return trusted;
+    }
+    if (actual < trusted) await iccTrustSet(playFabId, actual);
+    return actual;
+}
+
 // Gegenstaende gutschreiben (Admin, spaeter Shop/Quests/...). Gibt die neue Anzahl zurueck.
 async function inventoryGrant(playFabId, itemId, quantity) {
     if (!INVENTORY_ITEMS[itemId]) throw new Error('Unbekannter Gegenstand: ' + itemId);
@@ -7968,6 +8085,7 @@ async function shopPurchaseInventoryItem(req, res, item, quantity) {
         const commander = JSON.parse(data.Data['commander_data'].Value);
         if (!Array.isArray(commander.accountResources)) commander.accountResources = [0, 0, 0, 0, 0];
         while (commander.accountResources.length < 5) commander.accountResources.push(0);
+        await iccGuard(who.playFabId, commander); // ICC-Waechter (§28): unerklaerte ICC-Erhoehung verwerfen
         if (commander.accountResources[4] < totalCost)
             return { status: 400, body: { success: false, error: 'Nicht genug ICC', iccBalance: commander.accountResources[4] } };
 
@@ -7986,11 +8104,13 @@ async function shopPurchaseInventoryItem(req, res, item, quantity) {
             try {
                 commander.accountResources[4] += totalCost;
                 await playfabServer('/Server/UpdateUserData', { PlayFabId: who.playFabId, Data: { commander_data: JSON.stringify(commander) }, Permission: 'Private' });
+                await iccTrustSet(who.playFabId, commander.accountResources[4]);
             } catch (refundError) {
                 console.error('[Inventar] shop: ICC-RUECKBUCHUNG FEHLGESCHLAGEN (Commander ' + who.commanderId + ', ' + totalCost + ' ICC):', refundError.message);
             }
             throw grantError;
         }
+        await iccTrustSet(who.playFabId, commander.accountResources[4]);
         console.log(`[Inventar] Shop: Commander ${who.commanderId} kauft ${crates}x ${item.item_id} fuer ${totalCost} ICC`);
         return { status: 200, body: { success: true, newIccBalance: commander.accountResources[4], crates } };
     });
@@ -8087,6 +8207,7 @@ app.post('/inventory/use', async (req, res) => {
                 throw saveError;
             }
 
+            if (effect.type === 'account' && effect.accountIndex === 4) await iccTrustSet(who.playFabId, commander.accountResources[4]);
             console.log(`[Inventar] Commander ${who.commanderId} oeffnet ${quantity}x ${itemId} (${effect.type} ${effect.coord || 'Konto'} +${total})`);
             return { status: 200, body: { success: true, itemId, quantity, remaining, effect } };
         });
