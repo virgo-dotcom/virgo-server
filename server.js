@@ -70,6 +70,7 @@ const express = require('express');
 const axios   = require('axios');
 const { Pool } = require('pg');
 const app     = express();
+app.disable('x-powered-by'); // NEU 07.10.2026: Framework-Kennung nicht verraten
 
 app.use(express.json());
 
@@ -216,7 +217,7 @@ async function authCommanderIdFor(playFabId) {
 }
 
 const AUTH_PLAYFABID_FIELDS   = ['playFabId', 'playfabId', 'senderPlayFabId'];
-const AUTH_COMMANDERID_FIELDS = ['commanderId', 'requesterCommanderId', 'senderCommanderId', 'founderCommanderId', 'requesterId'];
+const AUTH_COMMANDERID_FIELDS = ['commanderId', 'requesterCommanderId', 'senderCommanderId', 'founderCommanderId', 'requesterId', 'attackerCommanderId', 'reporterCommanderId'];
 
 // Gibt null zurueck, wenn alles passt, sonst { reason, detail }.
 async function authCheckClaims(req, playFabId, group) {
@@ -284,6 +285,135 @@ app.use(async (req, res, next) => {
         .json({ success: false, error: 'Nicht autorisiert.', code: problem.reason });
 });
 console.log(`[Auth] Modus: ${AUTH_MODE}, erzwungene Gruppen: ${AUTH_ENFORCE_GROUPS.length ? AUTH_ENFORCE_GROUPS.join(',') : '(keine)'}`);
+
+// #####################################################################
+// §02b  SICHERHEITS-HELFER (NEU 07.10.2026, Sicherheitsrunde)
+//       - Sicherheits-Header, Rate-Limits (OHNE IP-Adressen: Schluessel = per Ticket bewiesene PlayFabId,
+//         sonst ein gemeinsamer Eimer 'anon' - es wird keine IP gelesen, gespeichert oder geloggt)
+//       - requireCaller(): Identitaet NUR aus dem geprueften Ticket, unabhaengig von AUTH_MODE/AUTH_ENFORCE
+//       - verifiedProfile(): Anzeigename/Koordinate nicht dem Client glauben
+//       - pushInbox(): Postfach-Obergrenze (sonst koennte jemand fremde Spielstaende per Mail-Flut aufblaehen)
+// #####################################################################
+app.use((req, res, next) => {
+    res.setHeader('X-Content-Type-Options', 'nosniff');
+    res.setHeader('Referrer-Policy', 'no-referrer');
+    res.setHeader('Cache-Control', 'no-store');
+    next();
+});
+
+const rateBuckets = new Map(); // schluessel -> { count, resetAt }
+function rateLimited(key, limit, windowMs) {
+    const now = Date.now();
+    let bucket = rateBuckets.get(key);
+    if (!bucket || bucket.resetAt <= now) {
+        bucket = { count: 0, resetAt: now + windowMs };
+        rateBuckets.set(key, bucket);
+    }
+    bucket.count++;
+    return bucket.count > limit;
+}
+setInterval(() => {
+    const now = Date.now();
+    for (const [key, bucket] of rateBuckets) if (bucket.resetAt <= now) rateBuckets.delete(key);
+}, 5 * 60 * 1000).unref();
+
+// [Methode, Pfad, Name, Anzahl, Zeitfenster ms] - der ERSTE passende Eintrag gewinnt zusaetzlich zur allgemeinen Grenze.
+const RATE_RULES = [
+    ['POST', /^\/reportBug$/,                          'bug',       5,  3600000],
+    ['POST', /^\/report-player$/,                      'reportpl', 10,  3600000],
+    ['POST', /^\/supportMessage$/,                     'support',  30,  3600000],
+    ['POST', /^\/notifyAttack$/,                       'notify',   60,  3600000],
+    ['POST', /^\/promo\/redeem$/,                      'promo',    20,  3600000],
+    ['POST', /^\/planet\/claim$/,                      'pclaim',   40,  3600000],
+    ['POST', /^\/planet\/reassert$/,                   'preassert',60,  3600000],
+    ['POST', /^\/relationships\/friend-request$/,      'friendreq',30,  3600000],
+    ['POST', /^\/alliances\/[0-9]+\/apply$/,           'apply',    20,  3600000],
+    ['POST', /^\/alliances\/charter$/,                 'charter',  10,  3600000],
+    ['POST', /^\/shop\/purchase$/,                     'shop',     60,    60000],
+    ['POST', /^\/giftbox\/claim$/,                     'gift',     20,    60000],
+    ['POST', /^\/market\/(create|buy|cancel)$/,        'market',   60,    60000],
+    ['POST', /^\/inventory\/use$/,                     'inv',      60,    60000],
+    ['*',    /^\/(devtodos|admin\/reports)/,           'adminkey', 300, 3600000]
+];
+app.use((req, res, next) => {
+    if (req.method === 'OPTIONS' || req.path === '/serverTick') return next();
+    const who = req.auth && req.auth.playFabId ? 'p:' + req.auth.playFabId : 'anon';
+    let blocked = rateLimited(`general|${who}`, who === 'anon' ? 600 : 900, 60000);
+    if (!blocked) {
+        for (const [method, pattern, name, limit, windowMs] of RATE_RULES) {
+            if ((method === '*' || method === req.method) && pattern.test(req.path)) {
+                blocked = rateLimited(`${name}|${who}`, limit, windowMs);
+                break;
+            }
+        }
+    }
+    if (blocked) {
+        res.setHeader('Retry-After', '60');
+        return res.status(429).json({ success: false, error: 'Zu viele Anfragen. Bitte warte einen Moment.' });
+    }
+    next();
+});
+
+function adminKeyOk(provided) {
+    const expected = process.env.ADMIN_KEY;
+    if (!expected || typeof provided !== 'string') return false;
+    const a = Buffer.from(provided), b = Buffer.from(expected);
+    return a.length === b.length && require('crypto').timingSafeEqual(a, b);
+}
+
+// Identitaet NUR aus dem Ticket. Antwortet bei Fehlern selbst (401/403) und gibt dann null zurueck.
+// claimed: { playFabId?, commanderId? } - Angaben aus dem Body, die zum Ticket passen MUESSEN.
+async function requireCaller(req, res, claimed = {}) {
+    const caller = await marketIdentity(req);
+    if (!caller) {
+        res.status(401).json({ success: false, error: 'Nicht angemeldet.', code: 'KEIN-TICKET' });
+        return null;
+    }
+    const wrongPf  = claimed.playFabId && claimed.playFabId !== caller.playFabId;
+    const hasCmd   = claimed.commanderId !== undefined && claimed.commanderId !== null && claimed.commanderId !== '';
+    const wrongCmd = hasCmd && Number(claimed.commanderId) !== caller.commanderId;
+    if (wrongPf || wrongCmd) {
+        res.status(403).json({ success: false, error: 'Angaben passen nicht zum Login.', code: 'IDENTITAET-ABWEICHUNG' });
+        return null;
+    }
+    return caller;
+}
+
+// Anzeigename + (geprueftes) Koordinatenfeld eines angemeldeten Spielers. Der Name kommt aus unserer Highscore-Tabelle
+// (vom Server geschrieben), nicht aus dem Body; die Koordinate wird nur uebernommen, wenn sie dem Spieler laut
+// oeffentlichen Systemdaten wirklich gehoert (sonst null -> es gehen keine Mails dorthin).
+function cleanDisplayName(raw) {
+    return String(raw == null ? '' : raw).replace(/[<>\u0000-\u001F​-‏‪-‮⁦-⁩]/g, '').trim().slice(0, 32);
+}
+async function verifiedProfile(caller, claimedName, claimedCoord) {
+    let name = '';
+    try {
+        const r = await pool.query('SELECT commander_name FROM commander_highscore WHERE commander_id = $1', [caller.commanderId]);
+        if (r.rows.length > 0) name = r.rows[0].commander_name;
+    } catch (e) { /* Rueckfall unten */ }
+    name = cleanDisplayName(name) || cleanDisplayName(claimedName) || 'Unbekannt';
+    let coord = null;
+    if (claimedCoord && /^\d{1,5}:\d{1,5}:\d{1,5}:\d{1,5}$/.test(String(claimedCoord))) {
+        try {
+            const info = await getPlanetOwnerInfo(String(claimedCoord));
+            if (info && Number(info.ownerCommanderId) === caller.commanderId) coord = String(claimedCoord);
+        } catch (e) { /* coord bleibt null */ }
+    }
+    return { name, coord };
+}
+
+// Postfach-Obergrenze: aelteste NICHT markierte Mails zuerst entfernen.
+const MAX_INBOX_MAILS = 500;
+function pushInbox(commander, mail) {
+    if (!Array.isArray(commander.inbox)) commander.inbox = [];
+    commander.inbox.push(mail);
+    while (commander.inbox.length > MAX_INBOX_MAILS) {
+        let idx = commander.inbox.findIndex(m => !m || !m.isFavorite);
+        if (idx < 0) idx = 0;
+        commander.inbox.splice(idx, 1);
+    }
+}
+
 
 // #####################################################################
 // §03  DATENBANK-SETUP (initDatabase)
@@ -1294,6 +1424,12 @@ app.get('/report/:reportId', async (req, res) => {
 app.get('/attackTrace/:fleetId', async (req, res) => {
     const trace = await getAttackTrace(req.params.fleetId);
     if (!trace) return res.status(404).json({ success: false, error: 'Keine Akte gefunden' });
+    // NEU 07.10.2026: nur Angreifer, Verteidiger oder Admin duerfen die Akte sehen (verraet sonst fremde Angriffe)
+    const traceCaller = await requireCaller(req, res);
+    if (!traceCaller) return;
+    if (!ADMIN_COMMANDER_IDS.includes(traceCaller.commanderId) &&
+        Number(trace.attacker_commander_id) !== traceCaller.commanderId && Number(trace.defender_commander_id) !== traceCaller.commanderId)
+        return res.status(403).json({ success: false, error: 'Keine Berechtigung.' });
     res.json({ success: true, trace });
 });
 
@@ -1314,6 +1450,9 @@ app.get('/attackTraces/recent', async (req, res) => {
 // saveReportToDatabase(), ohne den Umweg über HTTP)
 // -------------------------------------------------------
 app.post('/saveReport', async (req, res) => {
+    // 07.10.2026 ABGESCHALTET: Kein Client ruft das auf (Kaempfe laufen serverseitig). Offen waere es ein Weg gewesen,
+    // Berichts-IDs vorab zu belegen (ON CONFLICT DO NOTHING) oder gefaelschte Berichte abzulegen.
+    return res.status(410).json({ success: false, error: 'Nicht mehr verfuegbar.' });
     const report = req.body;
     if (!report || !report.reportId)
         return res.status(400).json({ success: false, error: 'Ungueltiger Bericht' });
@@ -1332,7 +1471,7 @@ app.post('/saveReport', async (req, res) => {
 // wie /admin/reports weiter unten (bereits vorhandene ADMIN_KEY-
 // Umgebungsvariable, keine neue nötig).
 function checkAdminKey(req, res) {
-    if (!process.env.ADMIN_KEY || req.query.key !== process.env.ADMIN_KEY) {
+    if (!adminKeyOk(req.query.key)) {
         res.status(403).json({ success: false, error: 'Nicht autorisiert' });
         return false;
     }
@@ -1346,7 +1485,7 @@ app.get('/devtodos', async (req, res) => {
         res.json({ success: true, todos: result.rows });
     } catch (error) {
         console.error('[Server] devtodos GET Fehler:', error.message);
-        res.status(500).json({ success: false, error: error.message });
+        res.status(500).json({ success: false, error: 'Interner Serverfehler.' });
     }
 });
 
@@ -1364,7 +1503,7 @@ app.post('/devtodos', async (req, res) => {
         res.json({ success: true, todo: result.rows[0] });
     } catch (error) {
         console.error('[Server] devtodos POST Fehler:', error.message);
-        res.status(500).json({ success: false, error: error.message });
+        res.status(500).json({ success: false, error: 'Interner Serverfehler.' });
     }
 });
 
@@ -1389,7 +1528,7 @@ app.put('/devtodos/:id', async (req, res) => {
         res.json({ success: true, todo: result.rows[0] });
     } catch (error) {
         console.error('[Server] devtodos PUT Fehler:', error.message);
-        res.status(500).json({ success: false, error: error.message });
+        res.status(500).json({ success: false, error: 'Interner Serverfehler.' });
     }
 });
 
@@ -1403,7 +1542,7 @@ app.delete('/devtodos/:id', async (req, res) => {
         res.json({ success: true });
     } catch (error) {
         console.error('[Server] devtodos DELETE Fehler:', error.message);
-        res.status(500).json({ success: false, error: error.message });
+        res.status(500).json({ success: false, error: 'Interner Serverfehler.' });
     }
 });
 
@@ -1423,7 +1562,7 @@ app.get('/announcements', async (req, res) => {
         res.json({ success: true, announcements: result.rows.reverse() }); // älteste zuerst
     } catch (error) {
         console.error('[Server] announcements GET Fehler:', error.message);
-        res.status(500).json({ success: false, error: error.message });
+        res.status(500).json({ success: false, error: 'Interner Serverfehler.' });
     }
 });
 
@@ -1443,7 +1582,7 @@ app.post('/announcements', async (req, res) => {
         res.json({ success: true, announcement: result.rows[0] });
     } catch (error) {
         console.error('[Server] announcements POST Fehler:', error.message);
-        res.status(500).json({ success: false, error: error.message });
+        res.status(500).json({ success: false, error: 'Interner Serverfehler.' });
     }
 });
 
@@ -1466,7 +1605,7 @@ app.put('/announcements/:id/done', async (req, res) => {
         res.json({ success: true, announcement: result.rows[0] });
     } catch (error) {
         console.error('[Server] announcements PUT Fehler:', error.message);
-        res.status(500).json({ success: false, error: error.message });
+        res.status(500).json({ success: false, error: 'Interner Serverfehler.' });
     }
 });
 
@@ -1484,7 +1623,7 @@ app.get('/virgodom-messages', async (req, res) => {
         res.json({ success: true, messages: result.rows.reverse() }); // älteste zuerst
     } catch (error) {
         console.error('[Server] virgodom-messages GET Fehler:', error.message);
-        res.status(500).json({ success: false, error: error.message });
+        res.status(500).json({ success: false, error: 'Interner Serverfehler.' });
     }
 });
 
@@ -1504,7 +1643,7 @@ app.post('/virgodom-messages', async (req, res) => {
         res.json({ success: true, message: result.rows[0] });
     } catch (error) {
         console.error('[Server] virgodom-messages POST Fehler:', error.message);
-        res.status(500).json({ success: false, error: error.message });
+        res.status(500).json({ success: false, error: 'Interner Serverfehler.' });
     }
 });
 
@@ -1570,7 +1709,7 @@ async function sendAllianceMail(commanderId, coord, subject, body) {
         if (!commander.inbox) commander.inbox = [];
 
         const mailSeq = await getNextMailSeq();
-        commander.inbox.push({
+        pushInbox(commander, {
             mailId: `M-${commander.commanderId}-${mailSeq}`,
             category: 0, // System
             subject,
@@ -1651,7 +1790,7 @@ app.get('/alliances', async (req, res) => {
         res.json({ success: true, alliances: result.rows.map(withoutInternalFields) });
     } catch (error) {
         console.error('[Server] alliances GET Fehler:', error.message);
-        res.status(500).json({ success: false, error: error.message });
+        res.status(500).json({ success: false, error: 'Interner Serverfehler.' });
     }
 });
 
@@ -1670,7 +1809,7 @@ app.get('/alliances/:id', async (req, res) => {
         res.json({ success: true, alliance: withoutInternalFields(result.rows[0]) });
     } catch (error) {
         console.error('[Server] alliances/:id GET Fehler:', error.message);
-        res.status(500).json({ success: false, error: error.message });
+        res.status(500).json({ success: false, error: 'Interner Serverfehler.' });
     }
 });
 
@@ -1766,12 +1905,14 @@ app.get('/alliances/:id/members', async (req, res) => {
         res.json({ success: true, members: result.rows });
     } catch (error) {
         console.error('[Server] alliances/:id/members GET Fehler:', error.message);
-        res.status(500).json({ success: false, error: error.message });
+        res.status(500).json({ success: false, error: 'Interner Serverfehler.' });
     }
 });
 
 // Direkter Beitritt (Alpha-Vereinfachung, keine Bewerbung/Einladung nötig)
 app.post('/alliances/:id/join', async (req, res) => {
+    // 07.10.2026 ABGESCHALTET: kein Client nutzt den direkten Beitritt mehr; offen wuerde er das Bewerbungssystem umgehen.
+    return res.status(403).json({ success: false, error: 'Direkter Beitritt ist nicht moeglich. Bitte bewirb dich bei der Allianz.' });
     const id = parseInt(req.params.id, 10);
     const { commanderId, commanderName, commanderCoord } = req.body;
     if (!id || !commanderId) return res.status(400).json({ success: false, error: 'Fehlende Parameter' });
@@ -1799,7 +1940,7 @@ app.post('/alliances/:id/join', async (req, res) => {
         res.json({ success: true });
     } catch (error) {
         console.error('[Server] alliances/:id/join Fehler:', error.message);
-        res.status(500).json({ success: false, error: error.message });
+        res.status(500).json({ success: false, error: 'Interner Serverfehler.' });
     }
 });
 
@@ -1822,8 +1963,11 @@ app.post('/alliances/:id/apply', async (req, res) => {
     const id = parseInt(req.params.id, 10);
     const { commanderId, commanderName, commanderCoord, message } = req.body;
     if (!id || !commanderId) return res.status(400).json({ success: false, error: 'Fehlende Parameter' });
+    const applyCaller = await requireCaller(req, res, { commanderId });
+    if (!applyCaller) return;
+    const applyProf = await verifiedProfile(applyCaller, commanderName, commanderCoord);
 
-    const trimmedMessage = (message || '').trim().slice(0, 200); // Server-seitige Begrenzung, unabhängig vom Client
+    const trimmedMessage = String(message || '').replace(/[<>]/g, '').trim().slice(0, 200); // Server-seitige Begrenzung, unabhängig vom Client
 
     try {
         const existingAlliance = await getAllianceIdForCommander(commanderId);
@@ -1840,12 +1984,12 @@ app.post('/alliances/:id/apply', async (req, res) => {
              ON CONFLICT (alliance_id, commander_id)
              DO UPDATE SET commander_name = $3, commander_coord = $4, message = $5, created_at = now(), expires_at = now() + interval '24 hours'
              RETURNING *`,
-            [id, commanderId, commanderName || 'Unbekannt', commanderCoord || null, trimmedMessage]
+            [id, commanderId, applyProf.name, applyProf.coord, trimmedMessage]
         );
         res.json({ success: true, application: result.rows[0] });
     } catch (error) {
         console.error('[Server] alliances/:id/apply Fehler:', error.message);
-        res.status(500).json({ success: false, error: error.message });
+        res.status(500).json({ success: false, error: 'Interner Serverfehler.' });
     }
 });
 
@@ -1866,7 +2010,7 @@ app.get('/alliances/:id/applications', async (req, res) => {
         res.json({ success: true, applications: result.rows });
     } catch (error) {
         console.error('[Server] alliances/:id/applications GET Fehler:', error.message);
-        res.status(500).json({ success: false, error: error.message });
+        res.status(500).json({ success: false, error: 'Interner Serverfehler.' });
     }
 });
 
@@ -1888,7 +2032,7 @@ app.get('/commander/:id/applications', async (req, res) => {
         res.json({ success: true, applications: result.rows });
     } catch (error) {
         console.error('[Server] commander/:id/applications GET Fehler:', error.message);
-        res.status(500).json({ success: false, error: error.message });
+        res.status(500).json({ success: false, error: 'Interner Serverfehler.' });
     }
 });
 
@@ -1936,7 +2080,7 @@ app.post('/alliances/:id/applications/:appId/accept', async (req, res) => {
         res.json({ success: true });
     } catch (error) {
         console.error('[Server] applications/accept Fehler:', error.message);
-        res.status(500).json({ success: false, error: error.message });
+        res.status(500).json({ success: false, error: 'Interner Serverfehler.' });
     }
 });
 
@@ -1974,7 +2118,7 @@ app.post('/alliances/:id/applications/:appId/reject', async (req, res) => {
         res.json({ success: true });
     } catch (error) {
         console.error('[Server] applications/reject Fehler:', error.message);
-        res.status(500).json({ success: false, error: error.message });
+        res.status(500).json({ success: false, error: 'Interner Serverfehler.' });
     }
 });
 
@@ -2047,7 +2191,7 @@ app.post('/alliances/:id/leave', async (req, res) => {
         res.json({ success: true });
     } catch (error) {
         console.error('[Server] alliances/:id/leave Fehler:', error.message);
-        res.status(500).json({ success: false, error: error.message });
+        res.status(500).json({ success: false, error: 'Interner Serverfehler.' });
     }
 });
 
@@ -2098,7 +2242,7 @@ app.post('/alliances/:id/transfer-founder', async (req, res) => {
         res.json({ success: true });
     } catch (error) {
         console.error('[Server] alliances/:id/transfer-founder Fehler:', error.message);
-        res.status(500).json({ success: false, error: error.message });
+        res.status(500).json({ success: false, error: 'Interner Serverfehler.' });
     }
 });
 
@@ -2178,7 +2322,7 @@ app.put('/alliances/:id/edit', async (req, res) => {
         res.json({ success: true, alliance: result.rows[0] });
     } catch (error) {
         console.error('[Server] alliances/:id/edit PUT Fehler:', error.message);
-        res.status(500).json({ success: false, error: error.message });
+        res.status(500).json({ success: false, error: 'Interner Serverfehler.' });
     }
 });
 
@@ -2214,7 +2358,7 @@ app.get('/alliances/:id/ranks', async (req, res) => {
         res.json({ success: true, ranks: result.rows });
     } catch (error) {
         console.error('[Server] alliances/:id/ranks GET Fehler:', error.message);
-        res.status(500).json({ success: false, error: error.message });
+        res.status(500).json({ success: false, error: 'Interner Serverfehler.' });
     }
 });
 
@@ -2248,7 +2392,7 @@ app.post('/alliances/:id/ranks', async (req, res) => {
         res.json({ success: true, rank: result.rows[0] });
     } catch (error) {
         console.error('[Server] alliances/:id/ranks POST Fehler:', error.message);
-        res.status(500).json({ success: false, error: error.message });
+        res.status(500).json({ success: false, error: 'Interner Serverfehler.' });
     }
 });
 
@@ -2312,7 +2456,7 @@ app.put('/alliances/:id/ranks/:rankId', async (req, res) => {
         res.json({ success: true, rank: result.rows[0] });
     } catch (error) {
         console.error('[Server] alliances/:id/ranks PUT Fehler:', error.message);
-        res.status(500).json({ success: false, error: error.message });
+        res.status(500).json({ success: false, error: 'Interner Serverfehler.' });
     }
 });
 
@@ -2347,7 +2491,7 @@ app.delete('/alliances/:id/ranks/:rankId', async (req, res) => {
         res.json({ success: true });
     } catch (error) {
         console.error('[Server] alliances/:id/ranks DELETE Fehler:', error.message);
-        res.status(500).json({ success: false, error: error.message });
+        res.status(500).json({ success: false, error: 'Interner Serverfehler.' });
     }
 });
 
@@ -2418,7 +2562,7 @@ app.post('/alliances/:id/broadcast-mail', async (req, res) => {
         res.json({ success: true, recipientCount: membersResult.rows.length });
     } catch (error) {
         console.error('[Server] alliances/:id/broadcast-mail Fehler:', error.message);
-        res.status(500).json({ success: false, error: error.message });
+        res.status(500).json({ success: false, error: 'Interner Serverfehler.' });
     }
 });
 
@@ -2462,7 +2606,7 @@ app.post('/alliances/:id/members/:commanderId/promote', async (req, res) => {
         res.json({ success: true });
     } catch (error) {
         console.error('[Server] members/:id/promote Fehler:', error.message);
-        res.status(500).json({ success: false, error: error.message });
+        res.status(500).json({ success: false, error: 'Interner Serverfehler.' });
     }
 });
 
@@ -2505,7 +2649,7 @@ app.post('/alliances/:id/members/:commanderId/kick', async (req, res) => {
         res.json({ success: true });
     } catch (error) {
         console.error('[Server] members/:id/kick Fehler:', error.message);
-        res.status(500).json({ success: false, error: error.message });
+        res.status(500).json({ success: false, error: 'Interner Serverfehler.' });
     }
 });
 
@@ -2535,7 +2679,7 @@ app.put('/alliances/admin/:displayId/rename', async (req, res) => {
         res.json({ success: true });
     } catch (error) {
         console.error('[Server] admin/rename Fehler:', error.message);
-        res.status(500).json({ success: false, error: error.message });
+        res.status(500).json({ success: false, error: 'Interner Serverfehler.' });
     }
 });
 
@@ -2558,7 +2702,7 @@ app.put('/alliances/admin/:displayId/retag', async (req, res) => {
         res.json({ success: true });
     } catch (error) {
         console.error('[Server] admin/retag Fehler:', error.message);
-        res.status(500).json({ success: false, error: error.message });
+        res.status(500).json({ success: false, error: 'Interner Serverfehler.' });
     }
 });
 
@@ -2577,7 +2721,7 @@ app.put('/alliances/admin/:displayId/redescribe', async (req, res) => {
         res.json({ success: true });
     } catch (error) {
         console.error('[Server] admin/redescribe Fehler:', error.message);
-        res.status(500).json({ success: false, error: error.message });
+        res.status(500).json({ success: false, error: 'Interner Serverfehler.' });
     }
 });
 
@@ -2608,7 +2752,7 @@ app.post('/alliances/admin/:displayId/kick-everyone', async (req, res) => {
         res.json({ success: true, kickedCount: membersToKick.rows.length });
     } catch (error) {
         console.error('[Server] admin/kick-everyone Fehler:', error.message);
-        res.status(500).json({ success: false, error: error.message });
+        res.status(500).json({ success: false, error: 'Interner Serverfehler.' });
     }
 });
 
@@ -2640,7 +2784,7 @@ app.delete('/alliances/admin/:displayId', async (req, res) => {
         res.json({ success: true });
     } catch (error) {
         console.error('[Server] admin/delete Fehler:', error.message);
-        res.status(500).json({ success: false, error: error.message });
+        res.status(500).json({ success: false, error: 'Interner Serverfehler.' });
     }
 });
 
@@ -2653,6 +2797,11 @@ app.post('/alliances/charter', async (req, res) => {
 
     if (!founderCommanderId || !name || !tag)
         return res.status(400).json({ success: false, error: 'Fehlende Pflichtfelder' });
+    if (typeof name !== 'string' || typeof tag !== 'string' || /[<>\u0000-\u001F]/.test(name) || /[<>\u0000-\u001F]/.test(tag))
+        return res.status(400).json({ success: false, error: 'Name oder Tag enthalten ungueltige Zeichen.' });
+    const charterCaller = await requireCaller(req, res, { commanderId: founderCommanderId });
+    if (!charterCaller) return;
+    const charterProf = await verifiedProfile(charterCaller, founderName, founderCoord);
     if (name.length < 6 || name.length > 30) return res.status(400).json({ success: false, error: 'Name muss 6-30 Zeichen haben' });
     if (tag.length < 3 || tag.length > 6) return res.status(400).json({ success: false, error: 'Tag muss 3-6 Zeichen haben' });
     if ((description || '').length > ALLIANCE_DESCRIPTION_MAX) return res.status(400).json({ success: false, error: `Beschreibung zu lang (max. ${ALLIANCE_DESCRIPTION_MAX} Zeichen)` });
@@ -2678,7 +2827,7 @@ app.post('/alliances/charter', async (req, res) => {
                 (founder_commander_id, founder_name, founder_coord, founder_galaxy_id, name, tag, logo_id, description,
                  placeholder_01, placeholder_02, placeholder_03, required_signatures)
              VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12) RETURNING *`,
-            [founderCommanderId, founderName || 'Unbekannt', founderCoord || null, founderGalaxyId || 1,
+            [founderCommanderId, charterProf.name, charterProf.coord, founderGalaxyId || 1,
              name.trim(), tag.trim().toUpperCase(),
              logoId || 0, sanitizeRichText(description), sanitizeRichText(placeholder01), sanitizeRichText(placeholder02), sanitizeRichText(placeholder03),
              requiredSignatures]
@@ -2686,7 +2835,7 @@ app.post('/alliances/charter', async (req, res) => {
         res.json({ success: true, charter: result.rows[0] });
     } catch (error) {
         console.error('[Server] alliances/charter POST Fehler:', error.message);
-        res.status(500).json({ success: false, error: error.message });
+        res.status(500).json({ success: false, error: 'Interner Serverfehler.' });
     }
 });
 
@@ -2708,7 +2857,7 @@ app.get('/alliances/charter/:id', async (req, res) => {
         res.json({ success: true, charter: charterResult.rows[0], signatures: sigResult.rows });
     } catch (error) {
         console.error('[Server] alliances/charter/:id GET Fehler:', error.message);
-        res.status(500).json({ success: false, error: error.message });
+        res.status(500).json({ success: false, error: 'Interner Serverfehler.' });
     }
 });
 
@@ -2716,6 +2865,9 @@ app.post('/alliances/charter/:id/sign', async (req, res) => {
     const id = parseInt(req.params.id, 10);
     const { commanderId, commanderName, commanderCoord } = req.body;
     if (!id || !commanderId) return res.status(400).json({ success: false, error: 'Fehlende Parameter' });
+    const signCaller = await requireCaller(req, res, { commanderId });
+    if (!signCaller) return;
+    const signProf = await verifiedProfile(signCaller, commanderName, commanderCoord);
 
     try {
         const charterResult = await pool.query('SELECT * FROM alliance_charters WHERE id = $1', [id]);
@@ -2736,7 +2888,7 @@ app.post('/alliances/charter/:id/sign', async (req, res) => {
         try {
             await pool.query(
                 'INSERT INTO alliance_charter_signatures (charter_id, signer_commander_id, signer_name, signer_coord) VALUES ($1, $2, $3, $4)',
-                [id, commanderId, commanderName || 'Unbekannt', commanderCoord || null]
+                [id, commanderId, signProf.name, signProf.coord]
             );
         } catch (dupeError) {
             return res.status(400).json({ success: false, error: 'Du hast bereits unterschrieben.' });
@@ -2797,7 +2949,7 @@ app.post('/alliances/charter/:id/sign', async (req, res) => {
         res.json({ success: true, finalized: true, alliance: newAlliance });
     } catch (error) {
         console.error('[Server] alliances/charter/:id/sign Fehler:', error.message);
-        res.status(500).json({ success: false, error: error.message });
+        res.status(500).json({ success: false, error: 'Interner Serverfehler.' });
     }
 });
 
@@ -2834,7 +2986,7 @@ app.get('/relationships/:commanderId', async (req, res) => {
         res.json({ success: true, relationships: result.rows });
     } catch (error) {
         console.error('[Server] relationships GET Fehler:', error.message);
-        res.status(500).json({ success: false, error: error.message });
+        res.status(500).json({ success: false, error: 'Interner Serverfehler.' });
     }
 });
 
@@ -2862,7 +3014,7 @@ app.post('/relationships/friend-request', async (req, res) => {
         res.json({ success: true, relationship: result.rows[0] });
     } catch (error) {
         console.error('[Server] friend-request Fehler:', error.message);
-        res.status(500).json({ success: false, error: error.message });
+        res.status(500).json({ success: false, error: 'Interner Serverfehler.' });
     }
 });
 
@@ -2870,12 +3022,15 @@ app.post('/relationships/friend-request/:id/accept', async (req, res) => {
     const id = parseInt(req.params.id, 10);
     const { commanderId } = req.body;
     if (!id || !commanderId) return res.status(400).json({ success: false, error: 'Fehlende Parameter' });
+    const acceptCaller = await requireCaller(req, res, { commanderId });
+    if (!acceptCaller) return;
 
     try {
         const result = await pool.query(
             `UPDATE player_relationships SET status = 'friend', established_at = now(),
                 expires_at = now() + interval '30 days'
              WHERE id = $1 AND status = 'friend_request_pending' AND requested_by != $2
+               AND (commander_id_a = $2 OR commander_id_b = $2)
              RETURNING *`,
             [id, commanderId]
         );
@@ -2884,20 +3039,23 @@ app.post('/relationships/friend-request/:id/accept', async (req, res) => {
         res.json({ success: true, relationship: result.rows[0] });
     } catch (error) {
         console.error('[Server] friend-request/accept Fehler:', error.message);
-        res.status(500).json({ success: false, error: error.message });
+        res.status(500).json({ success: false, error: 'Interner Serverfehler.' });
     }
 });
 
 app.post('/relationships/friend-request/:id/decline', async (req, res) => {
     const id = parseInt(req.params.id, 10);
     if (!id) return res.status(400).json({ success: false, error: 'Ungueltige ID' });
+    // NEU 07.10.2026: nur einer der beiden Beteiligten darf die Anfrage ablehnen/zurueckziehen (vorher: jeder, ohne Pruefung)
+    const declineCaller = await requireCaller(req, res);
+    if (!declineCaller) return;
 
     try {
-        await pool.query("UPDATE player_relationships SET status = 'neutral' WHERE id = $1 AND status = 'friend_request_pending'", [id]);
+        await pool.query("UPDATE player_relationships SET status = 'neutral' WHERE id = $1 AND status = 'friend_request_pending' AND (commander_id_a = $2 OR commander_id_b = $2)", [id, declineCaller.commanderId]);
         res.json({ success: true });
     } catch (error) {
         console.error('[Server] friend-request/decline Fehler:', error.message);
-        res.status(500).json({ success: false, error: error.message });
+        res.status(500).json({ success: false, error: 'Interner Serverfehler.' });
     }
 });
 
@@ -2915,7 +3073,7 @@ app.post('/relationships/end-friendship', async (req, res) => {
         res.json({ success: true });
     } catch (error) {
         console.error('[Server] end-friendship Fehler:', error.message);
-        res.status(500).json({ success: false, error: error.message });
+        res.status(500).json({ success: false, error: 'Interner Serverfehler.' });
     }
 });
 
@@ -2961,7 +3119,7 @@ app.post('/relationships/declare-war', async (req, res) => {
         res.json({ success: true, relationship: result.rows[0] });
     } catch (error) {
         console.error('[Server] declare-war Fehler:', error.message);
-        res.status(500).json({ success: false, error: error.message });
+        res.status(500).json({ success: false, error: 'Interner Serverfehler.' });
     }
 });
 
@@ -2986,7 +3144,7 @@ app.post('/relationships/declare-peace', async (req, res) => {
         res.json({ success: true, relationship: result.rows[0] });
     } catch (error) {
         console.error('[Server] declare-peace Fehler:', error.message);
-        res.status(500).json({ success: false, error: error.message });
+        res.status(500).json({ success: false, error: 'Interner Serverfehler.' });
     }
 });
 
@@ -3005,13 +3163,20 @@ app.get('/alliance-relationships/:allianceId', async (req, res) => {
         res.json({ success: true, relationships: result.rows });
     } catch (error) {
         console.error('[Server] alliance-relationships GET Fehler:', error.message);
-        res.status(500).json({ success: false, error: error.message });
+        res.status(500).json({ success: false, error: 'Interner Serverfehler.' });
     }
 });
 
 app.post('/alliance-relationships/declare-war', async (req, res) => {
     const { allianceId, targetAllianceId } = req.body;
     if (!allianceId || !targetAllianceId) return res.status(400).json({ success: false, error: 'Fehlende Parameter' });
+    // NEU 07.10.2026: vorher konnte JEDER fuer JEDE Allianz Krieg/Frieden setzen. Jetzt: angemeldet + Recht "Beziehungen verwalten".
+    const relCaller = await requireCaller(req, res);
+    if (!relCaller) return;
+    if (!Number.isInteger(allianceId) || !Number.isInteger(targetAllianceId) || allianceId === targetAllianceId)
+        return res.status(400).json({ success: false, error: 'Ungueltige Allianz.' });
+    if (!(await allianceHasPermission(relCaller.commanderId, allianceId, 'can_manage_relationships')))
+        return res.status(403).json({ success: false, error: 'Keine Berechtigung, Beziehungen zu verwalten.' });
     const [a, b] = orderIds(allianceId, targetAllianceId);
 
     try {
@@ -3025,13 +3190,20 @@ app.post('/alliance-relationships/declare-war', async (req, res) => {
         res.json({ success: true, relationship: result.rows[0] });
     } catch (error) {
         console.error('[Server] alliance-relationships/declare-war Fehler:', error.message);
-        res.status(500).json({ success: false, error: error.message });
+        res.status(500).json({ success: false, error: 'Interner Serverfehler.' });
     }
 });
 
 app.post('/alliance-relationships/declare-peace', async (req, res) => {
     const { allianceId, targetAllianceId } = req.body;
     if (!allianceId || !targetAllianceId) return res.status(400).json({ success: false, error: 'Fehlende Parameter' });
+    // NEU 07.10.2026: vorher konnte JEDER fuer JEDE Allianz Krieg/Frieden setzen. Jetzt: angemeldet + Recht "Beziehungen verwalten".
+    const relCaller = await requireCaller(req, res);
+    if (!relCaller) return;
+    if (!Number.isInteger(allianceId) || !Number.isInteger(targetAllianceId) || allianceId === targetAllianceId)
+        return res.status(400).json({ success: false, error: 'Ungueltige Allianz.' });
+    if (!(await allianceHasPermission(relCaller.commanderId, allianceId, 'can_manage_relationships')))
+        return res.status(403).json({ success: false, error: 'Keine Berechtigung, Beziehungen zu verwalten.' });
     const [a, b] = orderIds(allianceId, targetAllianceId);
 
     try {
@@ -3043,7 +3215,7 @@ app.post('/alliance-relationships/declare-peace', async (req, res) => {
         res.json({ success: true, relationship: result.rows[0] || null });
     } catch (error) {
         console.error('[Server] alliance-relationships/declare-peace Fehler:', error.message);
-        res.status(500).json({ success: false, error: error.message });
+        res.status(500).json({ success: false, error: 'Interner Serverfehler.' });
     }
 });
 
@@ -3273,7 +3445,7 @@ app.post('/alliance-relationships/propose', async (req, res) => {
         res.json({ success: true, relationship: result.rows[0] });
     } catch (error) {
         console.error('[Server] alliance-relationships/propose Fehler:', error.message);
-        res.status(500).json({ success: false, error: error.message });
+        res.status(500).json({ success: false, error: 'Interner Serverfehler.' });
     }
 });
 
@@ -3317,7 +3489,7 @@ app.post('/alliance-relationships/respond', async (req, res) => {
         }
     } catch (error) {
         console.error('[Server] alliance-relationships/respond Fehler:', error.message);
-        res.status(500).json({ success: false, error: error.message });
+        res.status(500).json({ success: false, error: 'Interner Serverfehler.' });
     }
 });
 
@@ -3350,8 +3522,11 @@ const ADMIN_COMMANDER_IDS = [1000000]; // TheVirgoDominion — weitere Admin-Acc
 
 app.post('/reportBug', async (req, res) => {
     const { reporterName, reporterCommanderId, reportText } = req.body;
-    if (!reportText)
+    if (!reportText || typeof reportText !== 'string')
         return res.status(400).json({ success: false, error: 'Kein Berichtstext' });
+    const bugCaller = await requireCaller(req, res, { commanderId: reporterCommanderId });
+    if (!bugCaller) return;
+    const bugProf = await verifiedProfile(bugCaller, reporterName, null);
 
     try {
         const adminData = await playfabServer('/Server/GetUserData', {
@@ -3369,10 +3544,10 @@ app.post('/reportBug', async (req, res) => {
         const body = reportText.length > 2000 ? reportText.substring(0, 2000) + '\n[...gekürzt]' : reportText;
 
         const mailSeq = await getNextMailSeq();
-        adminCommander.inbox.push({
+        pushInbox(adminCommander, {
             mailId: `M-${adminCommander.commanderId}-${mailSeq}`,
             category: 0, // System
-            subject: `Fehlerbericht von ${reporterName || 'Unbekannt'} (#${reporterCommanderId || '?'})`,
+            subject: `Fehlerbericht von ${bugProf.name} (#${bugCaller.commanderId})`,
             body: body,
             senderName: 'Fehlerbericht-System',
             senderId: 0,
@@ -3391,7 +3566,7 @@ app.post('/reportBug', async (req, res) => {
         res.json({ success: true });
     } catch (error) {
         console.error('[Server] reportBug Fehler:', error.message);
-        res.status(500).json({ success: false, error: error.message });
+        res.status(500).json({ success: false, error: 'Interner Serverfehler.' });
     }
 });
 
@@ -3427,6 +3602,8 @@ app.post('/report-player', async (req, res) => {
         return res.status(400).json({ success: false, error: 'Du kannst dich nicht selbst melden.' });
     if (!REPORT_REASONS.includes(reason))
         return res.status(400).json({ success: false, error: 'Ungültiger Meldegrund.' });
+    const reportCaller = await requireCaller(req, res, { commanderId: reporterId });
+    if (!reportCaller) return;
 
     try {
         // Spam-Schutz serverseitig (nicht nur im Client umgehbar): derselbe
@@ -3445,7 +3622,7 @@ app.post('/report-player', async (req, res) => {
             [reporterId, reportedId, reason, message]);
     } catch (error) {
         console.error('[Server] report-player Fehler (Speichern):', error.message);
-        return res.status(500).json({ success: false, error: error.message });
+        return res.status(500).json({ success: false, error: 'Interner Serverfehler.' });
     }
 
     try {
@@ -3458,7 +3635,7 @@ app.post('/report-player', async (req, res) => {
             if (!adminCommander.inbox) adminCommander.inbox = [];
 
             const mailSeq = await getNextMailSeq();
-            adminCommander.inbox.push({
+            pushInbox(adminCommander, {
                 mailId: `M-${adminCommander.commanderId}-${mailSeq}`,
                 category: 0, // System
                 subject: `Spielermeldung: Commander #${reportedId} (${reason})`,
@@ -3537,7 +3714,7 @@ app.post('/admin/giveAccountResource', async (req, res) => {
         res.json({ success: true, newBalance: commander.accountResources[ressIndex] });
     } catch (error) {
         console.error('[Server] admin/giveAccountResource Fehler:', error.message);
-        res.status(500).json({ success: false, error: error.message });
+        res.status(500).json({ success: false, error: 'Interner Serverfehler.' });
     }
 });
 
@@ -3565,7 +3742,7 @@ app.get('/legal-texts', async (req, res) => {
         res.json({ success: true, texts: result.rows });
     } catch (error) {
         console.error('[Server] legal-texts GET Fehler:', error.message);
-        res.status(500).json({ success: false, error: error.message });
+        res.status(500).json({ success: false, error: 'Interner Serverfehler.' });
     }
 });
 
@@ -3598,7 +3775,7 @@ app.put('/legal-texts/:key', async (req, res) => {
         res.json({ success: true, text: result.rows[0] });
     } catch (error) {
         console.error('[Server] legal-texts PUT Fehler:', error.message);
-        res.status(500).json({ success: false, error: error.message });
+        res.status(500).json({ success: false, error: 'Interner Serverfehler.' });
     }
 });
 
@@ -3613,7 +3790,7 @@ app.post('/supportMessage', async (req, res) => {
     // sender_email bleibt vorerst bestehen, wird aber nicht mehr befuellt.
     const { senderCommanderId, senderName, message } = req.body;
 
-    if (!message || !message.trim())
+    if (typeof message !== 'string' || !message.trim())
         return res.status(400).json({ success: false, error: 'Nachricht darf nicht leer sein.' });
     if (message.length > 2000)
         return res.status(400).json({ success: false, error: 'Nachricht zu lang (max. 2000 Zeichen).' });
@@ -3622,12 +3799,12 @@ app.post('/supportMessage', async (req, res) => {
         const result = await pool.query(
             `INSERT INTO support_messages (sender_commander_id, sender_name, message)
              VALUES ($1, $2, $3) RETURNING *`,
-            [senderCommanderId || null, senderName || null, message.trim()]
+            [parseInt(senderCommanderId, 10) || null, senderName ? cleanDisplayName(senderName) : null, message.trim()]
         );
         res.json({ success: true, supportMessage: result.rows[0] });
     } catch (error) {
         console.error('[Server] supportMessage POST Fehler:', error.message);
-        res.status(500).json({ success: false, error: error.message });
+        res.status(500).json({ success: false, error: 'Interner Serverfehler.' });
     }
 });
 
@@ -3645,7 +3822,7 @@ app.get('/supportMessages', async (req, res) => {
         res.json({ success: true, messages: result.rows });
     } catch (error) {
         console.error('[Server] supportMessages GET Fehler:', error.message);
-        res.status(500).json({ success: false, error: error.message });
+        res.status(500).json({ success: false, error: 'Interner Serverfehler.' });
     }
 });
 
@@ -3671,7 +3848,7 @@ app.get('/shop/items', async (req, res) => {
         res.json({ success: true, items: result.rows });
     } catch (error) {
         console.error('[Server] shop/items GET Fehler:', error.message);
-        res.status(500).json({ success: false, error: error.message });
+        res.status(500).json({ success: false, error: 'Interner Serverfehler.' });
     }
 });
 
@@ -3682,8 +3859,9 @@ const SHOP_RESOURCE_CAP = 2000000000; // Unity speichert Ressourcen als int (max
 
 app.post('/shop/purchase', async (req, res) => {
     const { playFabId, itemId, targetCoord } = req.body;
-    if (!playFabId || !itemId || !targetCoord)
+    if (!playFabId || !itemId || !targetCoord || typeof itemId !== 'string' || typeof targetCoord !== 'string')
         return res.status(400).json({ success: false, error: 'Fehlende Parameter' });
+    if (!(await requireCaller(req, res, { playFabId }))) return; // NEU 07.10.2026: nur fuer das eigene Konto kaufen
 
     let quantity = req.body.quantity === undefined ? 1 : parseInt(req.body.quantity, 10);
     if (!Number.isInteger(quantity) || quantity < 1 || quantity > SHOP_MAX_QUANTITY)
@@ -3763,7 +3941,7 @@ app.post('/shop/purchase', async (req, res) => {
         res.json({ success: true, newIccBalance: commander.accountResources[4] });
     } catch (error) {
         console.error('[Server] shop/purchase Fehler:', error.message);
-        res.status(500).json({ success: false, error: error.message });
+        res.status(500).json({ success: false, error: 'Interner Serverfehler.' });
     }
 });
 
@@ -3808,6 +3986,7 @@ app.get('/giftbox/status', async (req, res) => {
     const { playFabId } = req.query;
     if (!playFabId)
         return res.status(400).json({ success: false, error: 'Fehlende Parameter' });
+    if (!(await requireCaller(req, res, { playFabId }))) return; // NEU 07.10.2026
 
     try {
         const { windowStart, nextResetUtc } = currentGiftBoxWindow();
@@ -3828,7 +4007,7 @@ app.get('/giftbox/status', async (req, res) => {
         });
     } catch (error) {
         console.error('[Server] giftbox/status Fehler:', error.message);
-        res.status(500).json({ success: false, error: error.message });
+        res.status(500).json({ success: false, error: 'Interner Serverfehler.' });
     }
 });
 
@@ -3836,6 +4015,7 @@ app.post('/giftbox/claim', async (req, res) => {
     const { playFabId } = req.body;
     if (!playFabId)
         return res.status(400).json({ success: false, error: 'Fehlende Parameter' });
+    if (!(await requireCaller(req, res, { playFabId }))) return; // NEU 07.10.2026
 
     try {
         const { windowStart, nextResetUtc } = currentGiftBoxWindow();
@@ -3920,7 +4100,7 @@ app.post('/giftbox/claim', async (req, res) => {
         });
     } catch (error) {
         console.error('[Server] giftbox/claim Fehler:', error.message);
-        res.status(500).json({ success: false, error: error.message });
+        res.status(500).json({ success: false, error: 'Interner Serverfehler.' });
     }
 });
 
@@ -3933,8 +4113,9 @@ app.post('/giftbox/claim', async (req, res) => {
 // =========================================================
 app.post('/promo/redeem', async (req, res) => {
     const { playFabId, commanderId, code } = req.body;
-    if (!playFabId || !commanderId || !code)
+    if (!playFabId || !commanderId || !code || typeof code !== 'string')
         return res.status(400).json({ success: false, error: 'Fehlende Parameter' });
+    if (!(await requireCaller(req, res, { playFabId, commanderId }))) return; // NEU 07.10.2026
 
     try {
         const codeResult = await pool.query(
@@ -3993,7 +4174,7 @@ app.post('/promo/redeem', async (req, res) => {
         });
     } catch (error) {
         console.error('[Server] promo/redeem Fehler:', error.message);
-        res.status(500).json({ success: false, error: error.message });
+        res.status(500).json({ success: false, error: 'Interner Serverfehler.' });
     }
 });
 
@@ -4006,6 +4187,20 @@ app.post('/notifyAttack', async (req, res) => {
     const { fleetId, attackerCommanderId, attackerName, originCoord, destinationCoord, arrivalUtc } = req.body;
     if (!fleetId || !attackerName || !originCoord || !destinationCoord || !arrivalUtc)
         return res.status(400).json({ success: false, error: 'Fehlende Parameter' });
+    // NEU 07.10.2026: vorher konnte jeder beliebige Warn-Mails mit frei erfundenem Absender in fremde Postfaecher schreiben.
+    const coordPattern = /^\d{1,5}:\d{1,5}:\d{1,5}:\d{1,5}$/;
+    if (typeof fleetId !== 'string' || !/^[A-Za-z0-9._-]{1,64}$/.test(fleetId) ||
+        !coordPattern.test(String(originCoord)) || !coordPattern.test(String(destinationCoord)))
+        return res.status(400).json({ success: false, error: 'Ungueltige Angaben.' });
+    const arrivalCheck = new Date(arrivalUtc);
+    if (isNaN(arrivalCheck.getTime()) || arrivalCheck.getTime() > Date.now() + 40 * 24 * 3600 * 1000)
+        return res.status(400).json({ success: false, error: 'Ungueltige Ankunftszeit.' });
+    const attackCaller = await requireCaller(req, res, { commanderId: attackerCommanderId });
+    if (!attackCaller) return;
+    const originInfo = await getPlanetOwnerInfo(String(originCoord));
+    if (originInfo && Number(originInfo.ownerCommanderId) !== attackCaller.commanderId)
+        return res.status(403).json({ success: false, error: 'Startplanet gehoert dir nicht.' });
+    const attackerProf = await verifiedProfile(attackCaller, attackerName, null);
 
     try {
         const ownerInfo = await getPlanetOwnerInfo(destinationCoord);
@@ -4016,7 +4211,7 @@ app.post('/notifyAttack', async (req, res) => {
         // komplette Kette (Start → Warnung → Kampf → Rückflug) für JEDEN
         // Angriff nachvollziehbar bleibt.
         await upsertAttackTrace(fleetId, {
-            attacker_commander_id: attackerCommanderId || null,
+            attacker_commander_id: attackCaller.commanderId,
             defender_commander_id: ownerInfo ? ownerInfo.ownerCommanderId : null,
             origin_coord: originCoord,
             destination_coord: destinationCoord,
@@ -4045,11 +4240,11 @@ app.post('/notifyAttack', async (req, res) => {
 
         if (!defenderCommander.inbox) defenderCommander.inbox = [];
         const mailSeq = await getNextMailSeq();
-        defenderCommander.inbox.push({
+        pushInbox(defenderCommander, {
             mailId: `M-${defenderCommander.commanderId}-${mailSeq}`,
             category: 2, // Military
             subject: `Angriff auf ${destinationCoord}`,
-            body: `Achtung, Sie werden angegriffen von ${attackerName}. Die Angriffsflotte n\u00e4hert sich von ${originCoord}, Ankunft in ${formatDurationText(remainingSeconds)}, um ${formatTimestamp(arrivalDate)}.`,
+            body: `Achtung, Sie werden angegriffen von ${attackerProf.name}. Die Angriffsflotte n\u00e4hert sich von ${originCoord}, Ankunft in ${formatDurationText(remainingSeconds)}, um ${formatTimestamp(arrivalDate)}.`,
             senderName: 'Milit\u00e4rkommando',
             senderId: 0,
             isRead: false,
@@ -4073,7 +4268,7 @@ app.post('/notifyAttack', async (req, res) => {
         res.json({ success: true, notified: true });
     } catch (error) {
         console.error('[Server] notifyAttack Fehler:', error.message);
-        res.status(500).json({ success: false, error: error.message });
+        res.status(500).json({ success: false, error: 'Interner Serverfehler.' });
     }
 });
 
@@ -4083,7 +4278,7 @@ app.post('/notifyAttack', async (req, res) => {
 // Optional: &limit=20 (max 200)
 // -------------------------------------------------------
 app.get('/admin/reports', async (req, res) => {
-    if (!process.env.ADMIN_KEY || req.query.key !== process.env.ADMIN_KEY) {
+    if (!adminKeyOk(req.query.key)) {
         return res.status(403).json({ success: false, error: 'Nicht autorisiert' });
     }
     const limit = Math.min(parseInt(req.query.limit) || 50, 200);
@@ -4094,7 +4289,7 @@ app.get('/admin/reports', async (req, res) => {
         );
         res.json({ success: true, count: result.rows.length, reports: result.rows.map(r => r.data) });
     } catch (e) {
-        res.status(500).json({ success: false, error: e.message });
+        res.status(500).json({ success: false, error: 'Interner Serverfehler.' });
     }
 });
 
@@ -4124,6 +4319,7 @@ app.post('/processFleet', async (req, res) => {
     const { playFabId, fleetId } = req.body;
     if (!playFabId || !fleetId)
         return res.status(400).json({ error: 'playFabId und fleetId erforderlich' });
+    if (!(await requireCaller(req, res, { playFabId }))) return; // NEU 07.10.2026: nur eigene Flotten
 
     try {
         const userData = await playfabServer('/Server/GetUserData', {
@@ -4211,7 +4407,7 @@ app.post('/processFleet', async (req, res) => {
             combat_processed_at: new Date(),
             combat_success: false
         });
-        res.status(500).json({ error: error.message });
+        res.status(500).json({ error: 'Interner Serverfehler.' });
     }
 });
 
@@ -4745,7 +4941,7 @@ app.post('/planets/repair-ownership', async (req, res) => {
         res.json({ success: true, repaired: true, message: `Planet ${coord} wurde wieder in deine Kolonie-Liste eingetragen.` });
     } catch (error) {
         console.error('[Server] planets/repair-ownership Fehler:', error.message);
-        res.status(500).json({ success: false, error: error.message });
+        res.status(500).json({ success: false, error: 'Interner Serverfehler.' });
     }
 });
 
@@ -4813,7 +5009,7 @@ app.get('/commander/:commanderId/colonies', async (req, res) => {
         });
     } catch (error) {
         console.error('[Server] commander/colonies GET Fehler:', error.message);
-        res.status(500).json({ success: false, error: error.message });
+        res.status(500).json({ success: false, error: 'Interner Serverfehler.' });
     }
 });
 
@@ -4821,7 +5017,8 @@ app.get('/highscore/commanders', async (req, res) => {
     try {
         const limit = Math.min(parseInt(req.query.limit) || 100, 500);
         const result = await pool.query(
-            `SELECT h.*, a.tag AS alliance_tag, a.name AS alliance_name, a.id AS alliance_id
+            `SELECT h.commander_id, h.commander_name, h.avatar_index, h.total_points, h.fleet_points, h.infrastructure_points,
+                    h.research_points, h.updated_at, a.tag AS alliance_tag, a.name AS alliance_name, a.id AS alliance_id
              FROM commander_highscore h
              LEFT JOIN alliance_members m ON m.commander_id = h.commander_id
              LEFT JOIN alliances a ON a.id = m.alliance_id
@@ -4831,7 +5028,7 @@ app.get('/highscore/commanders', async (req, res) => {
         res.json({ success: true, highscore: result.rows });
     } catch (error) {
         console.error('[Server] highscore/commanders GET Fehler:', error.message);
-        res.status(500).json({ success: false, error: error.message });
+        res.status(500).json({ success: false, error: 'Interner Serverfehler.' });
     }
 });
 
@@ -4849,7 +5046,8 @@ app.get('/highscore/commanders/:commanderId', async (req, res) => {
         }
 
         const result = await pool.query(
-            `SELECT h.*, a.tag AS alliance_tag, a.name AS alliance_name, a.id AS alliance_id
+            `SELECT h.commander_id, h.commander_name, h.avatar_index, h.total_points, h.fleet_points, h.infrastructure_points,
+                    h.research_points, h.updated_at, a.tag AS alliance_tag, a.name AS alliance_name, a.id AS alliance_id
              FROM commander_highscore h
              LEFT JOIN alliance_members m ON m.commander_id = h.commander_id
              LEFT JOIN alliances a ON a.id = m.alliance_id
@@ -4864,7 +5062,7 @@ app.get('/highscore/commanders/:commanderId', async (req, res) => {
         res.json({ success: true, commander: result.rows[0] });
     } catch (error) {
         console.error('[Server] highscore/commanders/:id GET Fehler:', error.message);
-        res.status(500).json({ success: false, error: error.message });
+        res.status(500).json({ success: false, error: 'Interner Serverfehler.' });
     }
 });
 
@@ -4890,7 +5088,7 @@ app.get('/highscore/rank/:commanderId', async (req, res) => {
         res.json({ success: true, rank: parseInt(result.rows[0].rank, 10), total: parseInt(result.rows[0].total, 10) });
     } catch (error) {
         console.error('[Server] highscore/rank GET Fehler:', error.message);
-        res.status(500).json({ success: false, error: error.message });
+        res.status(500).json({ success: false, error: 'Interner Serverfehler.' });
     }
 });
 
@@ -5755,7 +5953,7 @@ async function sendCombatMail(commander, report, isAttackerMail) {
     // bei der Sequenz-Erstellung in initDatabase).
     const mailSeq = await getNextMailSeq();
 
-    commander.inbox.push({
+    pushInbox(commander, {
         mailId: `M-${commander.commanderId}-${mailSeq}`,
         category: 2, // Military
         subject,
@@ -5836,7 +6034,7 @@ function calculateFlightTime(from, to, engineLevel = 1, fuelFactor = 1) {
 async function sendMail(commander, subject, body, category) {
     if (!commander.inbox) commander.inbox = [];
     const mailSeq = await getNextMailSeq();
-    commander.inbox.push({
+    pushInbox(commander, {
         mailId:    `M-${commander.commanderId}-${mailSeq}`,
         category,
         subject,
@@ -7080,16 +7278,10 @@ app.post('/planet/claim', async (req, res) => {
     if (!coord || !coordInGalaxyLimits(coord))
         return res.status(400).json({ success: false, error: 'Ungültige Koordinate.' });
 
-    // Identitaet: nur bei DEFINITIVEM Widerspruch zwischen Ticket und Body ablehnen (Uebergangsphase AUTH_MODE=log)
-    try {
-        const ticket = req.get('X-Session-Ticket');
-        if (ticket) {
-            const pf = await authenticateTicket(ticket);
-            const proven = pf ? await authCommanderIdFor(pf) : null;
-            if (proven !== null && Number(proven) !== commanderId)
-                return res.status(403).json({ success: false, error: 'Commander-ID passt nicht zum Login.' });
-        }
-    } catch (e) { /* Pruefung nicht moeglich -> wie Uebergangsmodus */ }
+    // NEU 07.10.2026: Identitaet IMMER aus dem Ticket (vorher nur bei erkanntem Widerspruch; ohne Ticket ging alles durch)
+    const regCaller = await requireCaller(req, res, { commanderId });
+    if (!regCaller) return;
+    const regProf = await verifiedProfile(regCaller, ownerName, null);
 
     try {
         try { await healRegistryFromTitleData(coord); }
@@ -7101,7 +7293,7 @@ app.post('/planet/claim', async (req, res) => {
         const ins = await pool.query(
             `INSERT INTO planet_registry (coord, galaxy_id, sector_id, system_id, planet_number, owner_commander_id, kind, owner_name, planet_name)
              VALUES ($1, $2, $3, $4, $5, $6, 'player', $7, '') ON CONFLICT (coord) DO NOTHING RETURNING coord`,
-            [coord, g, s, sys, n, commanderId, ownerName]);
+            [coord, g, s, sys, n, commanderId, regProf.name]);
         if (ins.rows.length > 0) return res.json({ success: true, claimed: true, coord });
 
         const cur = await pool.query('SELECT owner_commander_id, kind, owner_name FROM planet_registry WHERE coord = $1', [coord]);
@@ -7133,19 +7325,17 @@ app.post('/planet/reassert', async (req, res) => {
     if (!coord || !coordInGalaxyLimits(coord))
         return res.status(400).json({ success: false, error: 'Ungültige Koordinate.' });
 
-    // Identitaet: nur bei DEFINITIVEM Widerspruch zwischen Ticket und Body ablehnen (Uebergangsphase AUTH_MODE=log)
-    try {
-        const ticket = req.get('X-Session-Ticket');
-        if (ticket) {
-            const pf = await authenticateTicket(ticket);
-            const proven = pf ? await authCommanderIdFor(pf) : null;
-            if (proven !== null && Number(proven) !== commanderId)
-                return res.status(403).json({ success: false, error: 'Commander-ID passt nicht zum Login.' });
-        }
-    } catch (e) { /* Pruefung nicht moeglich -> wie Uebergangsmodus */ }
+    // NEU 07.10.2026: Identitaet IMMER aus dem Ticket (vorher nur bei erkanntem Widerspruch; ohne Ticket ging alles durch)
+    const regCaller = await requireCaller(req, res, { commanderId });
+    if (!regCaller) return;
+    const regProf = await verifiedProfile(regCaller, ownerName, null);
 
     try {
         const [g, s, sys, n] = coord.split(':').map(Number);
+        // NEU 07.10.2026: vorher durfte jeder JEDE Koordinate im Register auf sich umschreiben. Jetzt nur, was in der eigenen Kolonieliste steht.
+        const ownState = await marketLoadPlayer(regCaller.playFabId, []);
+        if (!ownState || !ownState.commander.colonies.includes(coord))
+            return res.status(403).json({ success: false, error: 'Dieser Planet steht nicht in deiner Kolonieliste.' });
         const upd = await pool.query(
             `INSERT INTO planet_registry (coord, galaxy_id, sector_id, system_id, planet_number, owner_commander_id, kind, owner_name, planet_name)
              VALUES ($1, $2, $3, $4, $5, $6, 'player', $7, '')
@@ -7156,7 +7346,7 @@ app.post('/planet/reassert', async (req, res) => {
                 updated_at = now()
              WHERE planet_registry.owner_commander_id IS DISTINCT FROM EXCLUDED.owner_commander_id
              RETURNING coord`,
-            [coord, g, s, sys, n, commanderId, ownerName]);
+            [coord, g, s, sys, n, commanderId, regProf.name]);
         res.json({ success: true, coord, corrected: upd.rows.length > 0 });
     } catch (error) {
         console.error('[Server] planet/reassert Fehler:', error.message);
@@ -7544,7 +7734,7 @@ async function marketSendSaleMail(offer, buyerName, payout, tax) {
             `Die Gutschrift erfolgt automatisch, spätestens wenn du den Handel öffnest.`;
 
         const mailSeq = await getNextMailSeq();
-        commander.inbox.push({
+        pushInbox(commander, {
             mailId: `M-${commander.commanderId}-${mailSeq}`,
             category: 0, // System
             subject: `Handel: ${article} verkauft`,
