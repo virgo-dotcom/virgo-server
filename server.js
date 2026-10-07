@@ -1088,6 +1088,9 @@ async function initDatabase() {
                 settled_at TIMESTAMPTZ
             );
         `);
+        // NEU (07.10.2026): Trade-IDs sind 8-stellig - die Nummernfolge beginnt bei 10.000.000 (bzw. hinter dem hoechsten vorhandenen Angebot).
+        // Idempotent bei jedem Start: setval(..., false) = der NAECHSTE Wert ist genau dieser.
+        await pool.query(`SELECT setval(pg_get_serial_sequence('market_offers', 'id'), GREATEST(10000000, COALESCE((SELECT MAX(id) FROM market_offers), 0) + 1), false)`);
         // Umstellung am selben Tag (04.10.2026): Bezahlung in Credits (Ress05, Planeten-Vorrat) statt ICC, dazu Schiffe als
         // Handelsware (item_kind). Idempotent: Spalten werden nur umbenannt, solange die alten Namen noch existieren. Noch
         // laufende Angebote aus der ICC-Zeit werden dabei sofort beendet (expires_at = jetzt) - der Verkaeufer bekommt seine
