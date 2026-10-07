@@ -824,6 +824,30 @@ async function initDatabase() {
             );
         `);
 
+        // NEU (07.10.): Transport-Lieferungen an ANDERE Commander (Mission "Transport" zu fremden Planeten). Der Absender-Client
+        // meldet die Ankunft (POST /transport/deliver), der Empfaenger holt die Ware selbst ab (POST /transport/claim) - gleiches
+        // Prinzip wie die Handels-Erloese: nie direkt in den Spielstand eines Dritten schreiben (sein Autosave wuerde es
+        // ueberschreiben). fleet_id ist UNIQUE: jede Flotte liefert hoechstens einmal.
+        await pool.query(`
+            CREATE TABLE IF NOT EXISTS transport_deliveries (
+                id SERIAL PRIMARY KEY,
+                fleet_id TEXT NOT NULL UNIQUE,
+                sender_commander_id INTEGER NOT NULL,
+                sender_name TEXT NOT NULL,
+                recipient_commander_id INTEGER NOT NULL,
+                target_coord TEXT NOT NULL,
+                res0 INTEGER NOT NULL DEFAULT 0,
+                res1 INTEGER NOT NULL DEFAULT 0,
+                res2 INTEGER NOT NULL DEFAULT 0,
+                res3 INTEGER NOT NULL DEFAULT 0,
+                res4 INTEGER NOT NULL DEFAULT 0,
+                claimed BOOLEAN NOT NULL DEFAULT false,
+                created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+                claimed_at TIMESTAMPTZ
+            );
+        `);
+        await pool.query(`CREATE INDEX IF NOT EXISTS idx_transport_deliveries_recipient ON transport_deliveries (recipient_commander_id) WHERE claimed = false;`);
+
         // NEU (05.10.): "Goldene" Tageskiste - je Spieler und "Geschenk-Tag" (Wechsel 12:00 Uhr Europe/Berlin) genau
         // einmal; gleiches Primary-Key-Prinzip. day_key = 'YYYY-MM-DD' des Geschenk-Tages.
         await pool.query(`
@@ -6045,6 +6069,20 @@ async function deleteAccountDataFor(playFabId, commanderId) {
         const giftboxGolden = await client.query('DELETE FROM giftbox_golden_claims WHERE playfab_id = $1', [playFabId]);
         summary.giftboxGoldenClaims = giftboxGolden.rowCount;
 
+        // NEU (07.10.2026): Handel und Transporte - Namen anonymisieren (Datenschutz), Angebote des geloeschten Accounts schliessen,
+        // offene Lieferungen an ihn verwerfen. (Vorher fehlte der Handel in dieser Bereinigung.)
+        if (commanderId) {
+            const moSeller = await client.query('UPDATE market_offers SET seller_name = $2 WHERE seller_commander_id = $1', [commanderId, DELETED_COMMANDER_NAME]);
+            const moBuyer  = await client.query('UPDATE market_offers SET buyer_name = $2 WHERE buyer_commander_id = $1', [commanderId, DELETED_COMMANDER_NAME]);
+            const moOpen   = await client.query("UPDATE market_offers SET status = 'cancelled', settled = true, settled_at = now() WHERE seller_commander_id = $1 AND status = 'active'", [commanderId]);
+            summary.marketNamesAnonymized = moSeller.rowCount + moBuyer.rowCount;
+            summary.marketOpenOffersClosed = moOpen.rowCount;
+            const trSender = await client.query('UPDATE transport_deliveries SET sender_name = $2 WHERE sender_commander_id = $1', [commanderId, DELETED_COMMANDER_NAME]);
+            const trRecipient = await client.query('DELETE FROM transport_deliveries WHERE recipient_commander_id = $1', [commanderId]);
+            summary.transportSendersAnonymized = trSender.rowCount;
+            summary.transportDeliveriesDropped = trRecipient.rowCount;
+        }
+
         await client.query('COMMIT');
         return { summary };
     } catch (error) {
@@ -7319,7 +7357,7 @@ const MARKET_SHIP_NAMES = {
 
 // Handelbare Gueter: Art -> erlaubte Indizes, Mengengrenzen, Feld im Planeten.
 const MARKET_KINDS = {
-    resource: { indices: [0, 1, 2, 3, 4], minAmount: 100, maxAmount: 1000000000, field: 'ressources', length: 5 },
+    resource: { indices: [0, 1, 2, 3, 4], minAmount: 1000, maxAmount: 1000000000, field: 'ressources', length: 5 },
     warship:  { indices: [0, 1, 2, 3],    minAmount: 1,   maxAmount: 1000000,    field: 'warships',   length: 10 },
     ship:     { indices: [1, 3],          minAmount: 1,   maxAmount: 1000000,    field: 'ships',      length: 6 }
 };
@@ -7454,6 +7492,16 @@ function marketStrictInt(value) {
     return Number.isInteger(n) ? n : NaN;
 }
 
+// Trade-ID aus Benutzereingabe: null = nicht angegeben, NaN = ungueltig, sonst die Angebotsnummer. Erlaubt "123", "#123", "T123", "ID 123".
+function marketParseTradeId(raw) {
+    if (raw === undefined || raw === null) return null;
+    const text = String(raw).trim();
+    if (text === '') return null;
+    const cleaned = text.replace(/^(?:id|trade-?id|t|#|\s|-|:)+/i, '');
+    if (!/^\d{1,9}$/.test(cleaned)) return NaN;
+    return parseInt(cleaned, 10);
+}
+
 function marketFail(res, status, error, extra) {
     return res.status(status).json(Object.assign({ success: false, error }, extra || {}));
 }
@@ -7512,8 +7560,11 @@ async function marketSendSaleMail(offer, buyerName, payout, tax) {
 }
 
 // -------------------------------------------------------
-// GET /market/offers?kind=resource|ship&index=<n>&exclude=<commanderId>&limit=100
-// Alle aktuell laufenden Angebote. kind "ship" umfasst Kampf- UND Zivilschiffe; ohne kind: alles.
+// GET /market/offers?kind=resource|warship|civil|ship&index=<n>&exclude=<commanderId>&tradeId=<id>&limit=100
+// Alle aktuell laufenden Angebote. kind: resource = Waren, warship = Kampfschiffe, civil = zivile Schiffe (Containerschiff,
+// Kolonisationsschiff ...), ship = Kampf- UND Zivilschiffe (alt); ohne kind: alles. index = bestimmte Ware/Schiff innerhalb der Art.
+// tradeId (NEU 07.10.): genau dieses Angebot (Trade-ID = Angebotsnummer); "#123" und "T123" werden akzeptiert. Mit tradeId
+// wird kind/index ignoriert; eine ungueltige ID ergibt eine leere Liste.
 // Enthaelt nur oeffentliche Angaben (Verkaeufername, Ware, Menge, Preis, Restzeit) - nie PlayFab-Ids.
 // -------------------------------------------------------
 app.get('/market/offers', async (req, res) => {
@@ -7522,11 +7573,22 @@ app.get('/market/offers', async (req, res) => {
         const index     = marketStrictInt(req.query.index);
         const exclude   = marketStrictInt(req.query.exclude);
         const limit     = Math.min(Math.max(parseInt(req.query.limit, 10) || 100, 1), 200);
+        const tradeId   = marketParseTradeId(req.query.tradeId);
+
+        if (Number.isNaN(tradeId)) return res.json({ success: true, offers: [] });
 
         const params = [];
         let where = `status = 'active' AND expires_at > now()`;
-        if (kindParam === 'resource') {
+        if (tradeId !== null) {
+            params.push(tradeId); where += ` AND id = $${params.length}`;
+        } else if (kindParam === 'resource') {
             where += ` AND item_kind = 'resource'`;
+            if (Number.isInteger(index) && index >= 0) { params.push(index); where += ` AND resource_index = $${params.length}`; }
+        } else if (kindParam === 'warship') {
+            where += ` AND item_kind = 'warship'`;
+            if (Number.isInteger(index) && index >= 0) { params.push(index); where += ` AND resource_index = $${params.length}`; }
+        } else if (kindParam === 'civil') {
+            where += ` AND item_kind = 'ship'`;
             if (Number.isInteger(index) && index >= 0) { params.push(index); where += ` AND resource_index = $${params.length}`; }
         } else if (kindParam === 'ship') {
             where += ` AND item_kind IN ('warship', 'ship')`;
@@ -8284,6 +8346,138 @@ async function buildInventoryAdminReport(rawQuery) {
         return 'Fehler: ' + error.message;
     }
 }
+
+// #####################################################################
+// §29  TRANSPORT-LIEFERUNGEN an andere Commander (NEU 07.10.2026)
+//      Mission "Transport": die Flotte fliegt zum Ziel, liefert die Rohstoffe ab und kehrt zurueck. Zu EIGENEN Planeten
+//      landet die Ware lokal im Client (FleetManager). Zu FREMDEN Planeten kann der Client nicht in den Spielstand des
+//      Empfaengers schreiben - deshalb:
+//        POST /transport/deliver { fleetId }  (Absender, Ticket): prueft die Flotte im Spielstand des Absenders (Mission Transport,
+//             angekommen, Ladung <= Laderaum der Schiffe), ermittelt den Empfaenger ueber das Galaxie-Register und legt eine
+//             Lieferung an (idempotent ueber fleet_id). Antwort: delivered true = Ware ist beim Empfaenger hinterlegt, der Client
+//             startet den Rueckflug; delivered false = kein Empfaenger (z.B. unbesiedelt) -> Flotte kehrt MIT Ladung zurueck.
+//        POST /transport/claim  (Empfaenger, Ticket): schreibt offene Lieferungen auf den Zielplaneten (bzw. Hauptplanet, falls
+//             die Kolonie nicht mehr existiert); der Client rechnet das Ergebnis als Differenz ein und schreibt eine System-Mail.
+//      BEKANNTE GRENZE (Fairplay): Die Flotte (und damit die Ladung) steht im vom Client geschriebenen Spielstand. Der Server
+//      begrenzt die Ladung durch den Laderaum der Schiffe der Flotte, kann aber nicht pruefen, ob sie beim Start bezahlt wurde.
+// #####################################################################
+
+// Laderaum je Schiff (MUSS zu den Unity-Assets passen: Assets/Ship Assets/*.asset, Stand 07.10.2026)
+const TRANSPORT_CARGO_WARSHIP = [1000, 1700, 2800, 4600, 77, 129, 215, 359, 599, 999];
+const TRANSPORT_CARGO_SHIP    = [50, 50000, 100000, 10000, 10000, 10000];
+const TRANSPORT_MISSION_TRANSPORT = 1; // FleetMission.Transport (Fleet.cs)
+
+function transportCargoCapacity(fleet) {
+    let total = 0;
+    (Array.isArray(fleet.warships) ? fleet.warships : []).forEach((n, i) => { total += (Number(n) || 0) * (TRANSPORT_CARGO_WARSHIP[i] || 0); });
+    (Array.isArray(fleet.ships) ? fleet.ships : []).forEach((n, i) => { total += (Number(n) || 0) * (TRANSPORT_CARGO_SHIP[i] || 0); });
+    return total;
+}
+
+app.post('/transport/deliver', async (req, res) => {
+    const who = await marketIdentity(req);
+    if (!who) return marketFail(res, 401, 'Nicht angemeldet.');
+    const fleetId = req.body && typeof req.body.fleetId === 'string' ? req.body.fleetId.trim() : '';
+    if (!fleetId || fleetId.length > 80) return marketFail(res, 400, 'Ungültige Flotte.');
+
+    try {
+        // Schon geliefert? (Wiederholter Aufruf nach Netzfehler) -> gleiche Antwort wie beim ersten Mal
+        const already = await pool.query('SELECT 1 FROM transport_deliveries WHERE fleet_id = $1 AND sender_commander_id = $2', [fleetId, who.commanderId]);
+        if (already.rows.length > 0) return res.json({ success: true, delivered: true, duplicate: true });
+
+        const data = await playfabServer('/Server/GetUserData', { PlayFabId: who.playFabId, Keys: ['commander_data'] });
+        const entry = data && data.Data && data.Data['commander_data'];
+        if (!entry) return marketFail(res, 404, 'Commander nicht gefunden.');
+        const commander = JSON.parse(entry.Value);
+        const fleet = (Array.isArray(commander.activeFleets) ? commander.activeFleets : []).find(x => x && x.fleetId === fleetId);
+        if (!fleet) return marketFail(res, 404, 'Flotte nicht gefunden.');
+        if (Number(fleet.mission) !== TRANSPORT_MISSION_TRANSPORT || fleet.isReturnFlight) return marketFail(res, 400, 'Das ist kein Transport.');
+        const arrival = Date.parse(fleet.arrivalUtc);
+        if (!Number.isFinite(arrival) || arrival > Date.now() + 5000) return marketFail(res, 409, 'Die Flotte ist noch unterwegs.');
+
+        const coord = normalizeRegistryCoord(fleet.destinationCoord);
+        if (!coord) return marketFail(res, 400, 'Ungültiges Ziel.');
+        const raw = Array.isArray(fleet.ressources) ? fleet.ressources : [];
+        const cargo = [0, 1, 2, 3, 4].map(i => Math.max(0, Math.min(2000000000, Math.floor(Number(raw[i]) || 0))));
+        const sum = cargo.reduce((a, b) => a + b, 0);
+        if (sum <= 0) return res.json({ success: true, delivered: true, nothing: true });
+        if (sum > transportCargoCapacity(fleet))
+            return marketFail(res, 400, 'Die Ladung übersteigt den Laderaum der Flotte.');
+
+        const reg = await pool.query('SELECT owner_commander_id, kind FROM planet_registry WHERE coord = $1', [coord]);
+        const row = reg.rows[0];
+        if (!row || row.kind !== 'player' || !(Number(row.owner_commander_id) >= 1000000))
+            return res.json({ success: true, delivered: false, reason: 'no_recipient' });
+        const recipientId = Number(row.owner_commander_id);
+        if (recipientId === who.commanderId) return res.json({ success: true, delivered: false, reason: 'own_planet' });
+
+        const senderName = String(commander.visibleName || ('Commander ' + who.commanderId)).slice(0, 32);
+        const ins = await pool.query(
+            `INSERT INTO transport_deliveries (fleet_id, sender_commander_id, sender_name, recipient_commander_id, target_coord, res0, res1, res2, res3, res4)
+             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)
+             ON CONFLICT (fleet_id) DO NOTHING RETURNING id`,
+            [fleetId, who.commanderId, senderName, recipientId, coord, cargo[0], cargo[1], cargo[2], cargo[3], cargo[4]]);
+        console.log(`[Transport] ${fleetId}: Commander ${who.commanderId} liefert ${cargo.join('/')} an Commander ${recipientId} (${coord})${ins.rowCount === 0 ? ' [doppelt]' : ''}`);
+        res.json({ success: true, delivered: true, duplicate: ins.rowCount === 0 });
+    } catch (error) {
+        console.error('[Transport] deliver Fehler:', error.message);
+        marketFail(res, 500, 'Lieferung konnte nicht gemeldet werden.');
+    }
+});
+
+app.post('/transport/claim', async (req, res) => {
+    const who = await marketIdentity(req);
+    if (!who) return marketFail(res, 401, 'Nicht angemeldet.');
+    try {
+        const pending = await pool.query(
+            'SELECT 1 FROM transport_deliveries WHERE recipient_commander_id = $1 AND claimed = false LIMIT 1', [who.commanderId]);
+        if (pending.rows.length === 0) return res.json({ success: true, deliveries: [] });
+
+        const outcome = await withMarketLock(who.playFabId, async () => {
+            const claimed = await pool.query(
+                `UPDATE transport_deliveries SET claimed = true, claimed_at = now()
+                 WHERE id IN (SELECT id FROM transport_deliveries WHERE recipient_commander_id = $1 AND claimed = false ORDER BY id LIMIT 50)
+                 RETURNING id, sender_name, target_coord, res0, res1, res2, res3, res4`, [who.commanderId]);
+            if (claimed.rows.length === 0) return { status: 200, body: { success: true, deliveries: [] } };
+            const ids = claimed.rows.map(r => r.id);
+
+            try {
+                const first = await marketLoadPlayer(who.playFabId, []);
+                if (!first) throw new Error('Commander nicht gefunden');
+                const commander = first.commander;
+                const coords = [];
+                const target = row => marketReturnCoord(commander, row.target_coord);
+                claimed.rows.forEach(r => { const c = target(r); if (c && !coords.includes(c)) coords.push(c); });
+                if (coords.length === 0) throw new Error('Keine Kolonie fuer die Lieferung');
+                const planets = await marketLoadPlanets(who.playFabId, coords);
+
+                const deliveries = [];
+                const entries = {};
+                for (const r of claimed.rows) {
+                    const c = target(r);
+                    const planet = c ? planets[c] : null;
+                    if (!planet) throw new Error('Planet ' + c + ' nicht gefunden');
+                    const amounts = [r.res0, r.res1, r.res2, r.res3, r.res4].map(Number);
+                    amounts.forEach((a, i) => { if (a > 0) marketAdd(planet, 'resource', i, a); });
+                    entries[marketPlanetKey(c)] = planet;
+                    deliveries.push({ coord: c, senderName: r.sender_name, amounts });
+                }
+                await marketSaveEntries(who.playFabId, entries);
+                console.log(`[Transport] Commander ${who.commanderId} holt ${deliveries.length} Lieferung(en) ab`);
+                return { status: 200, body: { success: true, deliveries } };
+            } catch (e) {
+                console.error('[Transport] claim: Gutschrift fehlgeschlagen, gebe Lieferungen wieder frei:', e.message);
+                try { await pool.query('UPDATE transport_deliveries SET claimed = false, claimed_at = NULL WHERE id = ANY($1::int[])', [ids]); }
+                catch (revertError) { console.error('[Transport] claim: FREIGABE FEHLGESCHLAGEN (Lieferungen ' + ids.join(',') + '):', revertError.message); }
+                throw e;
+            }
+        });
+        res.status(outcome.status).json(outcome.body);
+    } catch (error) {
+        console.error('[Transport] claim Fehler:', error.message);
+        marketFail(res, 500, 'Lieferungen konnten nicht abgeholt werden.');
+    }
+});
 
 // #####################################################################
 // §21  SERVERSTART (app.listen)
