@@ -72,7 +72,10 @@ const { Pool } = require('pg');
 const app     = express();
 app.disable('x-powered-by'); // NEU 07.10.2026: Framework-Kennung nicht verraten
 
-app.use(express.json());
+// NEU 07.10.2026: Nur der Datenbank-Import (/admin/db-import, standardmaessig AUS) darf einen grossen Body haben; alles andere bleibt bei 100 KB.
+const importJsonParser = express.json({ limit: '20mb' });
+const defaultJsonParser = express.json();
+app.use((req, res, next) => (req.path === '/admin/db-import' ? importJsonParser(req, res, next) : defaultJsonParser(req, res, next)));
 
 // #####################################################################
 // §02  GRUNDKONFIGURATION: CORS + PlayFab-Zugang
@@ -140,6 +143,7 @@ const AUTH_POLICY = [
     ['*',    /^\/devtodos(\/.*)?$/,            'keyed'],    // eigener ADMIN_KEY
     ['GET',  /^\/admin\/reports$/,             'keyed'],    // eigener ADMIN_KEY
     ['GET',  /^\/admin\/db-export$/,           'keyed'],    // eigener ADMIN_KEY (+ DB_EXPORT_ENABLED)
+    ['POST', /^\/admin\/db-import$/,           'keyed'],    // eigener ADMIN_KEY (+ DB_IMPORT_ENABLED)
     ['POST', /^\/admin\/giveAccountResource$/, 'admin'],
     ['POST', /^\/admin\/inspectPlayer$/,       'admin'],
     ['POST', /^\/admin\/inventory\/grant$/,    'admin'],
@@ -335,7 +339,7 @@ const RATE_RULES = [
     ['POST', /^\/giftbox\/claim$/,                     'gift',     20,    60000],
     ['POST', /^\/market\/(create|buy|cancel)$/,        'market',   60,    60000],
     ['POST', /^\/inventory\/use$/,                     'inv',      60,    60000],
-    ['*',    /^\/(devtodos|admin\/reports|admin\/db-export)/, 'adminkey', 300, 3600000]
+    ['*',    /^\/(devtodos|admin\/reports|admin\/db-export|admin\/db-import)/, 'adminkey', 300, 3600000]
 ];
 app.use((req, res, next) => {
     if (req.method === 'OPTIONS' || req.path === '/serverTick') return next();
@@ -4318,6 +4322,56 @@ app.get('/admin/db-export', async (req, res) => {
     } catch (error) {
         console.error('[Server] db-export Fehler:', error.message);
         res.status(500).json({ success: false, error: 'Export fehlgeschlagen.' });
+    }
+});
+
+// -------------------------------------------------------
+// NEU 07.10.2026: Gegenstueck zum Export - spielt eine Sicherung (Ausgabe von /admin/db-export) in die aktuelle Datenbank ein.
+// Nur mit ADMIN_KEY UND DB_IMPORT_ENABLED=true (Standard AUS -> 404). Vorhandene Zeilen werden NICHT ueberschrieben (ON CONFLICT DO NOTHING),
+// danach werden die Nummernfolgen auf den hoechsten Stand gesetzt. Aufruf: POST /admin/db-import?key=...  Body = JSON der Sicherung.
+// -------------------------------------------------------
+app.post('/admin/db-import', async (req, res) => {
+    if (process.env.DB_IMPORT_ENABLED !== 'true') return res.status(404).json({ success: false, error: 'Nicht verfuegbar.' });
+    if (!adminKeyOk(req.query.key)) return res.status(403).json({ success: false, error: 'Nicht autorisiert' });
+    const dump = req.body;
+    if (!dump || typeof dump.tables !== 'object') return res.status(400).json({ success: false, error: 'Keine Sicherung im Body.' });
+    const result = {};
+    try {
+        for (const name of DB_EXPORT_TABLES) {            // feste Reihenfolge = Fremdschluessel-Reihenfolge
+            const rows = dump.tables[name];
+            if (!Array.isArray(rows)) continue;
+            let inserted = 0, failed = 0;
+            for (const row of rows) {
+                const cols = Object.keys(row);
+                if (cols.length === 0 || !cols.every(c => /^[a-z_][a-z0-9_]*$/.test(c))) { failed++; continue; }
+                const values = cols.map(c => (row[c] !== null && typeof row[c] === 'object') ? JSON.stringify(row[c]) : row[c]);
+                try {
+                    const r = await pool.query(
+                        'INSERT INTO ' + name + ' (' + cols.join(', ') + ') VALUES (' + cols.map((c, i) => '$' + (i + 1)).join(', ') + ') ON CONFLICT DO NOTHING',
+                        values);
+                    inserted += r.rowCount;
+                } catch (e) { failed++; console.error('[Import] ' + name + ':', e.message); }
+            }
+            result[name] = { rows: rows.length, inserted, failed };
+        }
+        // Nummernfolgen: Tabellen mit id-Spalte auf den hoechsten Wert setzen; benannte Folgen aus der Sicherung uebernehmen
+        for (const name of DB_EXPORT_TABLES) {
+            try {
+                const s = await pool.query("SELECT pg_get_serial_sequence($1, 'id') AS seq", [name]);
+                if (s.rows[0] && s.rows[0].seq) await pool.query("SELECT setval($1, GREATEST((SELECT COALESCE(MAX(id), 0) FROM " + name + "), 1))", [s.rows[0].seq]);
+            } catch (e) { /* Tabelle ohne id-Spalte */ }
+        }
+        const seqs = dump.sequences || {};
+        for (const seq of ['combat_report_seq', 'mail_id_seq', 'alliance_id_seq']) {
+            if (seqs[seq] && seqs[seq].last_value !== undefined)
+                await pool.query('SELECT setval($1, $2, $3)', [seq, parseInt(seqs[seq].last_value, 10), !!seqs[seq].is_called]);
+        }
+        // Handels-Nummern bleiben 8-stellig (mindestens 10.000.000), siehe initDatabase
+        await pool.query("SELECT setval(pg_get_serial_sequence('market_offers', 'id'), GREATEST(10000000, COALESCE((SELECT MAX(id) FROM market_offers), 0) + 1), false)");
+        res.json({ success: true, result });
+    } catch (error) {
+        console.error('[Server] db-import Fehler:', error.message);
+        res.status(500).json({ success: false, error: 'Import fehlgeschlagen.', result });
     }
 });
 
