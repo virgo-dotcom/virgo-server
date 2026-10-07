@@ -139,6 +139,7 @@ const AUTH_POLICY = [
     ['*',    /^\/serverTick$/,                 'internal'], // cron-job.org, kein Spieler-Ticket
     ['*',    /^\/devtodos(\/.*)?$/,            'keyed'],    // eigener ADMIN_KEY
     ['GET',  /^\/admin\/reports$/,             'keyed'],    // eigener ADMIN_KEY
+    ['GET',  /^\/admin\/db-export$/,           'keyed'],    // eigener ADMIN_KEY (+ DB_EXPORT_ENABLED)
     ['POST', /^\/admin\/giveAccountResource$/, 'admin'],
     ['POST', /^\/admin\/inspectPlayer$/,       'admin'],
     ['POST', /^\/admin\/inventory\/grant$/,    'admin'],
@@ -333,7 +334,7 @@ const RATE_RULES = [
     ['POST', /^\/giftbox\/claim$/,                     'gift',     20,    60000],
     ['POST', /^\/market\/(create|buy|cancel)$/,        'market',   60,    60000],
     ['POST', /^\/inventory\/use$/,                     'inv',      60,    60000],
-    ['*',    /^\/(devtodos|admin\/reports)/,           'adminkey', 300, 3600000]
+    ['*',    /^\/(devtodos|admin\/reports|admin\/db-export)/, 'adminkey', 300, 3600000]
 ];
 app.use((req, res, next) => {
     if (req.method === 'OPTIONS' || req.path === '/serverTick') return next();
@@ -4279,6 +4280,46 @@ app.post('/notifyAttack', async (req, res) => {
 // Aufruf im Browser: https://virgo-server.onrender.com/admin/reports?key=DEIN_ADMIN_KEY
 // Optional: &limit=20 (max 200)
 // -------------------------------------------------------
+// -------------------------------------------------------
+// NEU 07.10.2026: Datenbank-Sicherung fuer den Umzug (Render-Frist 10.10.2026).
+// Nur mit ADMIN_KEY UND gesetzter Umgebungsvariable DB_EXPORT_ENABLED=true (Standard: AUS -> 404). Nach dem Umzug wieder ausschalten/entfernen.
+// Liefert ALLE Zeilen der unten genannten Tabellen als JSON + den Stand der Nummernfolgen. Enthaelt Pseudonyme und Freitexte -> nur lokal speichern.
+// Aufruf: GET /admin/db-export?key=...   (optional &tables=alliances,alliance_members)
+// -------------------------------------------------------
+const DB_EXPORT_TABLES = ['alliances', 'alliance_ranks', 'alliance_members', 'alliance_applications', 'alliance_charters', 'alliance_charter_signatures',
+    'alliance_relationships', 'player_relationships', 'commander_highscore', 'legal_texts', 'dev_todos', 'announcements', 'virgodom_messages',
+    'support_messages', 'player_reports', 'shop_items', 'promo_codes', 'promo_redemptions', 'giftbox_claims', 'giftbox_golden_claims',
+    'market_offers', 'transport_deliveries', 'planet_registry', 'combat_reports', 'attack_traces', 'processed_fleets'];
+app.get('/admin/db-export', async (req, res) => {
+    if (process.env.DB_EXPORT_ENABLED !== 'true') return res.status(404).json({ success: false, error: 'Nicht verfuegbar.' });
+    if (!adminKeyOk(req.query.key)) return res.status(403).json({ success: false, error: 'Nicht autorisiert' });
+    try {
+        const wanted = typeof req.query.tables === 'string' && req.query.tables ? req.query.tables.split(',') : DB_EXPORT_TABLES;
+        const tables = {}, counts = {};
+        for (const name of wanted) {
+            if (!DB_EXPORT_TABLES.includes(name)) continue; // nur bekannte Tabellen (keine freie Eingabe in SQL)
+            try {
+                const r = await pool.query('SELECT * FROM ' + name);
+                tables[name] = r.rows; counts[name] = r.rows.length;
+            } catch (e) { counts[name] = 'fehlt'; }
+        }
+        const sequences = {};
+        for (const seq of ['combat_report_seq', 'mail_id_seq', 'alliance_id_seq']) {
+            const r = await pool.query('SELECT last_value, is_called FROM ' + seq);
+            sequences[seq] = r.rows[0];
+        }
+        const moSeq = await pool.query("SELECT pg_get_serial_sequence('market_offers', 'id') AS name");
+        if (moSeq.rows[0] && moSeq.rows[0].name) {
+            const mo = await pool.query('SELECT last_value, is_called FROM ' + moSeq.rows[0].name);
+            sequences.market_offers_id = mo.rows[0];
+        }
+        res.json({ success: true, exportedAt: new Date().toISOString(), counts, sequences, tables });
+    } catch (error) {
+        console.error('[Server] db-export Fehler:', error.message);
+        res.status(500).json({ success: false, error: 'Export fehlgeschlagen.' });
+    }
+});
+
 app.get('/admin/reports', async (req, res) => {
     if (!adminKeyOk(req.query.key)) {
         return res.status(403).json({ success: false, error: 'Nicht autorisiert' });
