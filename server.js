@@ -366,6 +366,7 @@ function adminKeyOk(provided) {
 async function requireCaller(req, res, claimed = {}) {
     const caller = await marketIdentity(req);
     if (!caller) {
+        try { authLog(req, 'CALLER-KEIN-TICKET', '', true); } catch (e) { /* nur Diagnose */ }
         res.status(401).json({ success: false, error: 'Nicht angemeldet.', code: 'KEIN-TICKET' });
         return null;
     }
@@ -373,6 +374,7 @@ async function requireCaller(req, res, claimed = {}) {
     const hasCmd   = claimed.commanderId !== undefined && claimed.commanderId !== null && claimed.commanderId !== '';
     const wrongCmd = hasCmd && Number(claimed.commanderId) !== caller.commanderId;
     if (wrongPf || wrongCmd) {
+        try { authLog(req, 'CALLER-IDENTITAET-ABWEICHUNG', wrongPf ? 'playFabId' : 'commanderId', true); } catch (e) { /* nur Diagnose */ }
         res.status(403).json({ success: false, error: 'Angaben passen nicht zum Login.', code: 'IDENTITAET-ABWEICHUNG' });
         return null;
     }
