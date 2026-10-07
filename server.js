@@ -327,6 +327,7 @@ const RATE_RULES = [
     ['POST', /^\/promo\/redeem$/,                      'promo',    20,  3600000],
     ['POST', /^\/planet\/claim$/,                      'pclaim',   40,  3600000],
     ['POST', /^\/planet\/reassert$/,                   'preassert',60,  3600000],
+    ['POST', /^\/planet\/assign-start$/,               'assignstart', 10, 3600000],
     ['POST', /^\/relationships\/friend-request$/,      'friendreq',30,  3600000],
     ['POST', /^\/alliances\/[0-9]+\/apply$/,           'apply',    20,  3600000],
     ['POST', /^\/alliances\/charter$/,                 'charter',  10,  3600000],
@@ -6428,6 +6429,12 @@ async function deleteAccountCompletely(playFabId) {
 
     const postgres = await deleteAccountDataFor(playFabId, commanderId);
     if (postgres.blocked) return { blocked: postgres.blocked };
+    // NEU 07.10.2026 (Fund beim Loeschtest): Register-Zeilen, die dem geloeschten Spieler noch zugeordnet sind (z. B. Planeten, die laut
+    // oeffentlichen Daten jemand anderem gehoerten und deshalb nicht uebergeben wurden), freigeben - sonst bliebe ein Geister-Besitzer stehen.
+    if (commanderId !== null) {
+        try { await pool.query("DELETE FROM planet_registry WHERE owner_commander_id = $1 AND kind = 'player'", [commanderId]); }
+        catch (e) { console.error('[Registry] Aufraeumen nach Loeschung fehlgeschlagen:', e.message); }
+    }
 
     await removeFromActivePlayerIds(playFabId);
 
@@ -7394,6 +7401,68 @@ app.post('/planet/reassert', async (req, res) => {
     } catch (error) {
         console.error('[Server] planet/reassert Fehler:', error.message);
         res.status(500).json({ success: false, error: 'Korrektur gerade nicht möglich.' });
+    }
+});
+
+// NEU 07.10.2026: Der SERVER vergibt die zwei Startplaneten eines neuen Spielers (Heimatplanet im hoechsten offenen Sektor, zweite Kolonie einen Sektor
+// darunter, Position 4-10, hoechstens 3 verschiedene Besitzer je System) und traegt sie atomar ins Register ein. Vorher wuerfelte der Client selbst
+// (immer dieselbe Zufallsfolge nach dem Start -> mehrere Spieler bekamen dieselben Planeten, Fund vom 07.10.2026).
+// Idempotent: ein erneuter Aufruf (z. B. nach Absturz vor dem Speichern) liefert dieselben Koordinaten. Verweigert, wenn der Spieler schon Kolonien hat.
+const START_HIGHEST_SECTOR = parseInt(process.env.START_HIGHEST_SECTOR, 10) || 4;
+const START_SYSTEMS_PER_SECTOR = 12;
+const START_PLANET_MIN = 4, START_PLANET_MAX = 10, START_MAX_OWNERS_PER_SYSTEM = 3;
+
+async function pickStartPlanet(sector, commanderId, ownerName) {
+    for (let attempt = 0; attempt < 80; attempt++) {
+        const system = 1 + Math.floor(Math.random() * START_SYSTEMS_PER_SECTOR);
+        const rows = await pool.query(
+            'SELECT planet_number, owner_commander_id FROM planet_registry WHERE galaxy_id = 1 AND sector_id = $1 AND system_id = $2', [sector, system]);
+        if (new Set(rows.rows.map(r => r.owner_commander_id)).size >= START_MAX_OWNERS_PER_SYSTEM) continue;
+        const taken = new Set(rows.rows.map(r => r.planet_number));
+        const free = [];
+        for (let n = START_PLANET_MIN; n <= START_PLANET_MAX; n++) if (!taken.has(n)) free.push(n);
+        if (free.length === 0) continue;
+        const number = free[Math.floor(Math.random() * free.length)];
+        const coord = `1:${sector}:${system}:${number}`;
+        // Altbestand aus den oeffentlichen Systemdaten (sys_*) beruecksichtigen: steht dort ein Besitzer, landet er jetzt im Register -> Einfuegen unten scheitert.
+        try { await healRegistryFromTitleData(coord); } catch (e) { continue; }
+        const ins = await pool.query(
+            `INSERT INTO planet_registry (coord, galaxy_id, sector_id, system_id, planet_number, owner_commander_id, kind, owner_name, planet_name)
+             VALUES ($1, 1, $2, $3, $4, $5, 'player', $6, '') ON CONFLICT (coord) DO NOTHING RETURNING coord`,
+            [coord, sector, system, number, commanderId, ownerName]);
+        if (ins.rows.length > 0) return coord;
+    }
+    return null;
+}
+
+app.post('/planet/assign-start', async (req, res) => {
+    const caller = await requireCaller(req, res, { commanderId: req.body && req.body.commanderId });
+    if (!caller) return;
+    if (!caller.commanderId || caller.commanderId < 1000000)
+        return res.status(400).json({ success: false, error: 'Ungültige Commander-ID.' });
+    try {
+        const own = await marketLoadPlayer(caller.playFabId, []);
+        if (own && own.commander.colonies.length > 0)
+            return res.status(409).json({ success: false, error: 'Du hast bereits Planeten.' });
+
+        const prof = await verifiedProfile(caller, req.body && req.body.ownerName, null);
+        const existing = await pool.query(
+            "SELECT coord, sector_id FROM planet_registry WHERE owner_commander_id = $1 AND kind = 'player' ORDER BY sector_id DESC, coord", [caller.commanderId]);
+        const coords = existing.rows.slice(0, 2).map(r => r.coord);
+
+        const sectorOf = c => parseInt(c.split(':')[1], 10);
+        const high = START_HIGHEST_SECTOR, low = Math.max(1, START_HIGHEST_SECTOR - 1);
+        while (coords.length < 2) {
+            const sector = coords.length === 0 ? high : (sectorOf(coords[0]) === high ? low : high);
+            const coord = await pickStartPlanet(sector, caller.commanderId, prof.name);
+            if (!coord) return res.status(503).json({ success: false, error: 'Kein freier Startplatz gefunden.' });
+            coords.push(coord);
+        }
+        coords.sort((a, b) => sectorOf(b) - sectorOf(a)); // Heimatplanet (hoechster Sektor) zuerst
+        res.json({ success: true, coords });
+    } catch (error) {
+        console.error('[Server] planet/assign-start Fehler:', error.message);
+        res.status(500).json({ success: false, error: 'Startplaneten konnten nicht vergeben werden.' });
     }
 });
 
