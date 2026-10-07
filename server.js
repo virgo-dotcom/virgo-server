@@ -7386,6 +7386,11 @@ app.post('/planet/reassert', async (req, res) => {
         const ownState = await marketLoadPlayer(regCaller.playFabId, []);
         if (!ownState || !ownState.commander.colonies.includes(coord))
             return res.status(403).json({ success: false, error: 'Dieser Planet steht nicht in deiner Kolonieliste.' });
+        // NEU 07.10.2026: Nennen die OEFFENTLICHEN Daten (sys_*) einen anderen lebenden Spieler als Besitzer, gewinnt dieser - sonst koennten sich
+        // zwei Spieler mit doppelt gefuehrter Kolonie das Register gegenseitig abnehmen (Fund Doppelbelegung 07.10.2026).
+        const publicInfo = await getPlanetOwnerInfo(coord);
+        if (publicInfo && Number(publicInfo.ownerCommanderId) >= 1000000 && Number(publicInfo.ownerCommanderId) !== regCaller.commanderId)
+            return res.status(409).json({ success: false, occupied: true, error: 'Laut öffentlichen Daten gehört dieser Planet einem anderen Spieler.' });
         const upd = await pool.query(
             `INSERT INTO planet_registry (coord, galaxy_id, sector_id, system_id, planet_number, owner_commander_id, kind, owner_name, planet_name)
              VALUES ($1, $2, $3, $4, $5, $6, 'player', $7, '')
