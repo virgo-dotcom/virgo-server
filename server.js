@@ -2862,7 +2862,14 @@ app.get('/alliances/charter/:id', async (req, res) => {
             'SELECT * FROM alliance_charter_signatures WHERE charter_id = $1 ORDER BY signed_at ASC',
             [id]
         );
-        res.json({ success: true, charter: charterResult.rows[0], signatures: sigResult.rows });
+        // NEU 08.10.2026: Die drei INTERNEN Textfelder (placeholder_01..03) bekommt nur der Gruender selbst zu sehen - Unterzeichner sind noch
+        // keine Mitglieder (Fund aus der Allianz-Pruefung: die Satzung verriet sie bisher jedem, der sie ansah).
+        const charterRow = { ...charterResult.rows[0] };
+        const viewer = await marketIdentity(req);
+        if (!viewer || Number(viewer.commanderId) !== Number(charterRow.founder_commander_id)) {
+            delete charterRow.placeholder_01; delete charterRow.placeholder_02; delete charterRow.placeholder_03;
+        }
+        res.json({ success: true, charter: charterRow, signatures: sigResult.rows });
     } catch (error) {
         console.error('[Server] alliances/charter/:id GET Fehler:', error.message);
         res.status(500).json({ success: false, error: 'Interner Serverfehler.' });
