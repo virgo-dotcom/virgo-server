@@ -54,6 +54,8 @@
 //  §25  KAMPF V2 (Rundenkampf, Mischbonus, Zivile in letzter Reihe): steht VOR §21; aktiv nur bei COMBAT_ENGINE=shadow|v2
 //  §26  GALAXIE-REGISTER (planet_registry): serverautoritative Belegung, Schritt 1 (nur lesen/befuellen); steht VOR §21
 //  §28  INVENTAR (PlayFab Internal Data "inventory"): Kisten (Rohstoffe Ress01-10, Schiffe), Oeffnen, Admin-Vergabe "#inv"; steht VOR §21
+//  §32  TERRAFORMING (Wartezeit, Abschluss, Abbruch durch Spieler/Angreifer, /planet/terraform-complete|abort); steht VOR §21
+//  §31  KOLONISATIONS-REGELN (Verwaltung/Habitat/Kosten, Pruefung in /planet/claim und beim Forschungs-Abschluss); steht VOR §21
 //  §30  GALAXIE-STRUKTUR (galaxy_sectors/galaxy_config/galaxy_texts): Sektoren + Systemzahl, Auto-Eroeffnung je 2 Sektoren, Texte, Admin /admin/galaxy/*; steht VOR §21
 //  §27  SPIELERHANDEL (market_offers): TAUSCHHANDEL Spieler -> Spieler (Ress01-05 + Schiffe gegen Ress01-05, Preisband 100-200 % des Werts), 20 % Steuer, Verkaufs-Mail; steht VOR §21
 //
@@ -1165,6 +1167,10 @@ async function initDatabase() {
         `);
         await pool.query(`CREATE INDEX IF NOT EXISTS idx_planet_registry_system ON planet_registry (galaxy_id, sector_id, system_id);`);
         await pool.query(`CREATE INDEX IF NOT EXISTS idx_planet_registry_owner ON planet_registry (owner_commander_id);`);
+        // NEU 18.10.2026 (§32): Terraforming - bis wann der Planet noch terraformt (NULL = fertig/normal)
+        await pool.query(`ALTER TABLE planet_registry ADD COLUMN IF NOT EXISTS terraform_until TIMESTAMPTZ NULL;`);
+        await pool.query(`CREATE TABLE IF NOT EXISTS planet_freed (id SERIAL PRIMARY KEY, coord TEXT NOT NULL, freed_at TIMESTAMPTZ NOT NULL DEFAULT now());`);
+        await pool.query(`CREATE INDEX IF NOT EXISTS idx_planet_freed_time ON planet_freed (freed_at);`);
 
         // NEU 18.10.2026 (§30): Galaxie-Struktur. Sektor offen/geplant mit Anzahl Sonnensysteme (die Zahl darf nie unter der des Vorgaengers liegen),
         // Einstellungen der automatischen Eroeffnung, Text-Ueberschreibungen fuer die Fusszeile der Systeme. Alle drei stehen in DB_EXPORT_TABLES.
@@ -4720,6 +4726,18 @@ async function serverTickHandler(req, res) {
 
                             const planet = JSON.parse(pData.Data[planetKey].Value);
 
+                            // NEU 18.10.2026 (§32): Terraforming abgeschlossen? (genau einmal; Mail + Gutschrift)
+                            if (planet.terraformUntilUtc && new Date(planet.terraformUntilUtc) <= now) {
+                                try {
+                                    const tf = await terraformCompleteForPlanet(playFabId, coord, planet, now);
+                                    if (tf.completed) {
+                                        await sendMail(commander, 'Terraforming abgeschlossen', // LOCALIZE
+                                            `Das Terraforming von ${coord} ist abgeschlossen. Der Planet ist jetzt voll nutzbar (Kommandozentrale Stufe 1, ${COLONY_START_RESOURCES} Einheiten Ress01-04 gutgeschrieben).`, 1);
+                                        changed = true;
+                                    }
+                                } catch (e) { console.error('[Terraforming] Tick-Abschluss Fehler:', e.message); }
+                            }
+
                             // Echte verstrichene Zeit seit dem letzten Tick
                             // verwenden (statt fest "300") — falls der Server
                             // mal ausfällt oder ein Tick verpasst wird, wird
@@ -4805,7 +4823,15 @@ async function serverTickHandler(req, res) {
                 // Forschung prüfen
                 if (commander.activeResearch?.endTimeUtc &&
                     new Date(commander.activeResearch.endTimeUtc) <= now) {
-                    applyResearch(commander, commander.activeResearch.type, commander.activeResearch.targetLevel);
+                    // NEU 18.10.2026 (§31): Verwaltung (18) und Habitatentwicklung (17) sind gekoppelt - Stufe L braucht Stufe L-1 der anderen.
+                    // Verletzt der Abschluss das (z.B. durch einen manipulierten Client), wird die Forschung verworfen statt angewendet.
+                    const rType = commander.activeResearch.type, rLevel = commander.activeResearch.targetLevel;
+                    const coupledOther = rType === 18 ? commander.terraforming : rType === 17 ? commander.verwaltung : null;
+                    if (coupledOther !== null && !colResearchAllowed(rLevel, coupledOther)) {
+                        console.warn(`[Forschung] Kopplung verletzt: Commander ${commander.commanderId} Typ ${rType} Stufe ${rLevel} bei Gegenstueck ${coupledOther} - verworfen`);
+                    } else {
+                        applyResearch(commander, rType, rLevel);
+                    }
                     commander.activeResearch = null;
                     changed = true;
                     log.push(`Forschung fertig: ${playFabId}`);
@@ -5971,6 +5997,20 @@ async function resolveCombat(attackerPlayFabId, attackerCommander, attackerFleet
         }
     }
 
+    // NEU 18.10.2026 (§32): Gewinnt der Angreifer gegen einen Planeten, der noch terraformt, ist das Terraforming vereitelt:
+    // der Planet wird wieder frei, Ueberlebende und Rohstoffe fliegen zum naechsten Planeten des Verteidigers (gespeichert wird unten wie gewohnt).
+    if (attackerWins && defenderPlanet && defenderCommander && defenderPlanet.terraformUntilUtc) {
+        try {
+            defenderPlanet.warships = defenderAfterWarships; defenderPlanet.ships = defenderAfterShips;
+            const ab = await terraformAbort(defenderCommander, destCoord, defenderPlanet, now, `Das Terraforming wurde von ${attackerCommander.visibleName} vereitelt.`);
+            if (ab.ok) {
+                report.terraformAborted = true;
+                defenderAfterWarships.fill(0); defenderAfterShips.fill(0);     // die Ueberlebenden sind jetzt in der Flotte (nicht doppelt auf dem Planeten lassen)
+                log.push(`Terraforming auf ${destCoord} vereitelt`);
+            }
+        } catch (e) { console.error('[Terraforming] Abbruch durch Angriff fehlgeschlagen:', e.message); }
+    }
+
     // Verteidiger-Planet + Commander speichern (falls bekannt)
     if (defenderPfid && defenderPlanetKey && defenderPlanet) {
         defenderPlanet.warships = defenderAfterWarships;
@@ -6070,6 +6110,10 @@ async function sendCombatMail(commander, report, isAttackerMail) {
         body = `Das planetare Schild hat gehalten. Wir mussten uns zurückziehen.`;
     } else {
         body = `${victory ? 'Sieg' : 'Niederlage'} bei ${report.planetCoord}.\nEigene Verluste: ${ownLosses}\nFeindliche Verluste: ${enemyLosses}`;
+        if (report.terraformAborted)     // NEU 18.10.2026 (§32)
+            body += isAttackerMail
+                ? '\nDas Terraforming des Gegners wurde vereitelt - der Planet ist wieder frei.'                       // LOCALIZE
+                : '\nDas Terraforming wurde abgebrochen, der Planet ist wieder frei. Überlebende Schiffe fliegen zu deinem nächsten Planeten.'; // LOCALIZE
     }
 
     if (!commander.inbox) commander.inbox = [];
@@ -6122,6 +6166,12 @@ async function processReturn(playFabId, commander, fleet, log) {
     const planet = JSON.parse(pData.Data[planetKey].Value);
     fleet.warships.forEach((n, i) => { planet.warships[i] = (planet.warships[i] || 0) + n; });
     fleet.ressources.forEach((n, i) => { planet.ressources[i] = (planet.ressources[i] || 0) + n; });
+    // NEU 18.10.2026 (Fund): Zivilschiffe (Container, Kolonisationsschiffe ...) einer zurueckkehrenden Flotte wurden hier NICHT gutgeschrieben
+    // (nur Kriegsschiffe und Fracht) - sie gingen beim Rueckflug nach einem Angriff verloren.
+    if (Array.isArray(fleet.ships)) {
+        if (!Array.isArray(planet.ships)) planet.ships = [0, 0, 0, 0, 0, 0];
+        fleet.ships.forEach((n, i) => { planet.ships[i] = (planet.ships[i] || 0) + (Number(n) || 0); });
+    }
     await playfabServer('/Server/UpdateUserData', {
         PlayFabId: playFabId,
         Data: { [planetKey]: JSON.stringify(planet) },
@@ -6148,8 +6198,11 @@ async function processReturn(playFabId, commander, fleet, log) {
 function calculateFlightTime(from, to, engineLevel = 1, fuelFactor = 1) {
     const f = from.split(':').map(Number);
     const t = to.split(':').map(Number);
-    const sectorDist = Math.min(Math.abs(f[1]-t[1]), 4-Math.abs(f[1]-t[1]));
-    const systemDist = Math.min(Math.abs(f[2]-t[2]), 12-Math.abs(f[2]-t[2]));
+    // NEU 18.10.2026 (§30): Ringlaenge = Zahl der offenen Sektoren / Systeme (vorher fest 4 und 12); ohne geladene Struktur wie bisher
+    const nSectors = galaxyStructure ? Math.max(1, galaxyHighestOpen()) : 4;
+    const nSystems = galaxyStructure ? Math.max(1, galaxySystemsIn(f[1]), galaxySystemsIn(t[1])) : 12;
+    const sectorDist = Math.min(Math.abs(f[1]-t[1]), nSectors-Math.abs(f[1]-t[1]));
+    const systemDist = Math.min(Math.abs(f[2]-t[2]), nSystems-Math.abs(f[2]-t[2]));
     const planetDist = Math.abs(f[3]-t[3]);
     let total = sectorDist * 45 + systemDist * 30 + planetDist * 10;
     if (total <= 0) total = 10;
@@ -7394,12 +7447,22 @@ app.get('/galaxy/registry', async (req, res) => {
         const serverTime = t.rows[0].t;
         const r = since
             ? await pool.query(
-                `SELECT coord, owner_commander_id, kind, owner_name, planet_name FROM planet_registry
+                `SELECT coord, owner_commander_id, kind, owner_name, planet_name, terraform_until FROM planet_registry
                  WHERE galaxy_id = $1 AND updated_at >= $2::timestamptz - interval '2 seconds'`, [g, since.toISOString()])
             : await pool.query(
-                'SELECT coord, owner_commander_id, kind, owner_name, planet_name FROM planet_registry WHERE galaxy_id = $1', [g]);
-        res.json({ success: true, serverTime: new Date(serverTime).toISOString(), planets: r.rows.map(x => ({
-            c: x.coord, owner: x.owner_commander_id, kind: x.kind, name: x.owner_name, pname: x.planet_name })) });
+                'SELECT coord, owner_commander_id, kind, owner_name, planet_name, terraform_until FROM planet_registry WHERE galaxy_id = $1', [g]);
+        // NEU 18.10.2026 (§32): in letzter Zeit freigegebene Planeten (nur bei Abgleich "seit"; ein Voll-Abruf zeigt geloeschte Zeilen ohnehin nicht)
+        let freed = [];
+        if (since) {
+            try {
+                const f = await pool.query("SELECT DISTINCT coord FROM planet_freed WHERE freed_at >= $1::timestamptz - interval '2 seconds'", [since.toISOString()]);
+                freed = f.rows.map(x => x.coord);
+                if (Math.random() < 0.02) await pool.query("DELETE FROM planet_freed WHERE freed_at < now() - interval '3 days'");
+            } catch (e) { console.error('[Server] planet_freed Abfrage:', e.message); }
+        }
+        res.json({ success: true, serverTime: new Date(serverTime).toISOString(), freed, planets: r.rows.map(x => ({
+            c: x.coord, owner: x.owner_commander_id, kind: x.kind, name: x.owner_name, pname: x.planet_name,
+            t: x.terraform_until ? new Date(x.terraform_until).toISOString() : '' })) });
     } catch (error) {
         console.error('[Server] galaxy/registry GET Fehler:', error.message);
         res.status(500).json({ success: false, error: 'Abfrage fehlgeschlagen.' });
@@ -7429,16 +7492,29 @@ app.post('/planet/claim', async (req, res) => {
             console.error('[Server] planet/claim: sys_-Abgleich fehlgeschlagen:', e.message);
             return res.status(503).json({ success: false, retry: true, error: 'Belegung gerade nicht prüfbar. Bitte später erneut versuchen.' });
         }
+        // NEU 18.10.2026 (§31): Regeln der Besiedlung (Habitatentwicklung, erlaubte Planeten, Kolonie-Limit). Wiederholter Aufruf fuer einen schon eigenen Planeten bleibt idempotent.
+        let terraformHours = 0;
+        const already = await pool.query('SELECT owner_commander_id, terraform_until FROM planet_registry WHERE coord = $1', [coord]);
+        if (!(already.rows[0] && already.rows[0].owner_commander_id === commanderId)) {
+            const rule = await colonizationRuleCheck(regCaller, commanderId, coord);
+            if (!rule.ok) return res.status(rule.status || 403).json({ success: false, rule: !rule.retry, retry: !!rule.retry, error: rule.error });
+            terraformHours = rule.terraformHours || 0;     // 0 = Startplatz-Phase (kein Terraforming)
+        }
         const [g, s, sys, n] = coord.split(':').map(Number);
         const ins = await pool.query(
-            `INSERT INTO planet_registry (coord, galaxy_id, sector_id, system_id, planet_number, owner_commander_id, kind, owner_name, planet_name)
-             VALUES ($1, $2, $3, $4, $5, $6, 'player', $7, '') ON CONFLICT (coord) DO NOTHING RETURNING coord`,
-            [coord, g, s, sys, n, commanderId, regProf.name]);
-        if (ins.rows.length > 0) return res.json({ success: true, claimed: true, coord });
+            `INSERT INTO planet_registry (coord, galaxy_id, sector_id, system_id, planet_number, owner_commander_id, kind, owner_name, planet_name, terraform_until)
+             VALUES ($1, $2, $3, $4, $5, $6, 'player', $7, '', $8) ON CONFLICT (coord) DO NOTHING RETURNING coord`,
+            [coord, g, s, sys, n, commanderId, regProf.name, terraformHours > 0 ? new Date(Date.now() + terraformHours * 3600 * 1000).toISOString() : null]);
+        if (ins.rows.length > 0) {
+            // NEU 18.10.2026 (§32): bei einer Kolonisierung beginnt das Terraforming; der Client uebernimmt die Zeit vom Server
+            return res.json({ success: true, claimed: true, coord, terraformHours,
+                terraformUntilUtc: terraformHours > 0 ? new Date(Date.now() + terraformHours * 3600 * 1000).toISOString() : '' });
+        }
 
         const cur = await pool.query('SELECT owner_commander_id, kind, owner_name FROM planet_registry WHERE coord = $1', [coord]);
         const row = cur.rows[0];
-        if (row && row.owner_commander_id === commanderId) return res.json({ success: true, claimed: true, alreadyMine: true, coord });
+        if (row && row.owner_commander_id === commanderId) return res.json({ success: true, claimed: true, alreadyMine: true, coord,
+            terraformUntilUtc: already.rows[0] && already.rows[0].terraform_until ? new Date(already.rows[0].terraform_until).toISOString() : '' });
         return res.status(409).json({ success: false, occupied: true, error: 'Planet bereits besiedelt.',
             ownerCommanderId: row ? row.owner_commander_id : 0, kind: row ? row.kind : 'player', ownerName: row ? row.owner_name : '' });
     } catch (error) {
@@ -9202,6 +9278,259 @@ app.post('/admin/galaxy/text', async (req, res) => {
         const texts = await galaxyListTexts();
         res.json({ success: true, saved, texts, items: galaxyTextItems(texts) });
     } catch (error) { res.status(400).json({ success: false, error: error.message }); }
+});
+
+// #####################################################################
+// §31  KOLONISATIONS-REGELN (Verwaltung, Habitatentwicklung, Kosten) — NEU 18.10.2026
+//      Spiegel von Assets/Skripts/ColonizationRules.cs (Pruefvorlage: Tools/Galaxie-Tests/galaxylore.js, Test: Tools/Server-Tests/colonization_test.js).
+//      Verwaltung (commander.verwaltung)  -> maximale Zahl Kolonien: Stufe 0..7 = 2, 3, 5, 8, 13, 20, 31, 44, danach weiter mit Primzahlen
+//      Habitatentwicklung (commander.terraforming) -> Stufe 1 = Kolonisieren erlaubt, Planeten 4-9; ab 5: +10, 6: +3, 7: +11, 8: +2, 9: +12, 10: +1, 11: alle
+//      Kopplung: Stufe L der einen braucht Stufe L-1 der anderen (Pruefung beim Abschluss im Server-Tick).
+//      Durchgesetzt wird beim Besiedeln (/planet/claim): wer schon eine Kolonie hat, muss die Regeln erfuellen (Registrierung/Startplaetze sind ausgenommen).
+// #####################################################################
+
+function colNthPrime(n) {
+    let count = 0, c = 1;
+    while (count < n) { c++; let p = true; for (let d = 2; d * d <= c; d++) if (c % d === 0) { p = false; break; } if (p) count++; }
+    return c;
+}
+function colMaxColonies(verwaltungLevel) {
+    let total = 2;
+    for (let l = 1; l <= Math.max(0, verwaltungLevel | 0); l++) total += l === 1 ? 1 : colNthPrime(l - 1);
+    return total;
+}
+function colCanColonize(habitatLevel) { return (habitatLevel | 0) >= 1; }
+function colIsPlanetAllowed(habitatLevel, n) {
+    habitatLevel = habitatLevel | 0;
+    if (habitatLevel < 1 || n < 1) return false;
+    if (habitatLevel >= 11) return true;
+    if (n >= 4 && n <= 9) return true;
+    switch (n) {
+        case 10: return habitatLevel >= 5;
+        case 3: return habitatLevel >= 6;
+        case 11: return habitatLevel >= 7;
+        case 2: return habitatLevel >= 8;
+        case 12: return habitatLevel >= 9;
+        case 1: return habitatLevel >= 10;
+        default: return false;
+    }
+}
+function colHabitatLevelRequired(n) { for (let l = 1; l <= 11; l++) if (colIsPlanetAllowed(l, n)) return l; return 11; }
+function colTerraformHours(habitatLevel) { const h = 24 - (Math.max(1, habitatLevel | 0) - 1); return h < 6 ? 6 : h; }
+function colResearchAllowed(targetLevel, otherLevel) { return (otherLevel | 0) >= targetLevel - 1; }
+function colShipCostPercent(v, h, colonies) { return 100 + 2 * Math.max(0, v | 0) + 2 * Math.max(0, h | 0) + 10 * Math.max(0, (colonies | 0) - 2); }
+
+// Pruefung fuer /planet/claim. Rueckgabe { ok } oder { ok:false, status, error, retry? }.
+// Wer noch KEINE Kolonie hat (Registrierung, lokaler Startplatz-Rueckfall), wird nicht geprueft.
+async function colonizationRuleCheck(caller, commanderId, coord) {
+    let registryCount = 0;
+    try {
+        const r = await pool.query("SELECT COUNT(*)::int AS n FROM planet_registry WHERE owner_commander_id = $1 AND kind = 'player'", [commanderId]);
+        registryCount = r.rows[0].n;
+    } catch (e) { return { ok: false, status: 503, retry: true, error: 'Regeln gerade nicht prüfbar. Bitte später erneut versuchen.' }; }
+
+    let commander = null;
+    try {
+        const own = await marketLoadPlayer(caller.playFabId, []);
+        commander = own && own.commander ? own.commander : null;
+    } catch (e) { return { ok: false, status: 503, retry: true, error: 'Spielerdaten gerade nicht lesbar. Bitte später erneut versuchen.' }; }
+
+    const have = Math.max(registryCount, commander ? (commander.colonies || []).length : 0);
+    if (have === 0) return { ok: true };          // Startplatz-Phase
+    if (!commander) return { ok: false, status: 503, retry: true, error: 'Spielerdaten nicht gefunden.' };
+
+    const habitat = commander.terraforming | 0, verwaltung = commander.verwaltung | 0;
+    const n = Number(String(coord).split(':')[3]);
+    if (!colCanColonize(habitat))
+        return { ok: false, status: 403, error: 'Kolonisieren braucht die Forschung Habitatentwicklung (mindestens Stufe 1).' };
+    if (!colIsPlanetAllowed(habitat, n))
+        return { ok: false, status: 403, error: `Planet ${n} kann erst mit Habitatentwicklung Stufe ${colHabitatLevelRequired(n)} kolonisiert werden (aktuell Stufe ${habitat}).` };
+    const max = colMaxColonies(verwaltung);
+    if (have >= max)
+        return { ok: false, status: 403, error: `Kolonie-Limit erreicht (${have}/${max}). Erforsche Verwaltung.` };
+    return { ok: true, terraformHours: colTerraformHours(habitat) };
+}
+
+// #####################################################################
+// §32  TERRAFORMING (Kolonisierung mit Wartezeit) — NEU 18.10.2026
+//      Ablauf: Kolonisationsflotte erreicht einen freien Planeten -> /planet/claim reserviert ihn SOFORT fuer den Kolonisierer (planet_registry,
+//      Spalte terraform_until = jetzt + 24 h minus 1 h je Habitat-Stufe, mind. 6 h) -> der Planet gehoert dem Kolonisierer, hat aber noch keine Gebaeude
+//      und keine Produktion; mitgebrachte Schiffe landen dort und verteidigen ihn, mitgebrachte Rohstoffe liegen im Depot.
+//      Abschluss (nach Ablauf): Kommandozentrale Stufe 1, +1.000 Ress01-04 - EINMAL (atomar ueber planet_registry.terraform_until, siehe
+//      terraformCompleteForPlanet), durch den Server-Tick ODER /planet/terraform-complete.
+//      Abbruch: durch den Kolonisierer (/planet/terraform-abort) oder durch einen Angreifer, der den Planeten besiegt (resolveCombat):
+//      Planet wird wieder frei (Registerzeile geloescht), das Kolonisationsschiff ist verloren, Schiffe/Rohstoffe vor Ort fliegen zum
+//      naechsten eigenen Planeten (Verlegen; Rohstoffe nur soweit Laderaum reicht).
+// #####################################################################
+
+const COLONY_START_RESOURCES = 1000;
+
+// Pro Koordinate nacheinander (Tick und Endpunkt duerfen sich nicht ueberholen). Gilt nur fuer EINE Server-Instanz (wie §22).
+const terraformChains = new Map();
+function terraformExclusive(key, task) {
+    const prev = terraformChains.get(key) || Promise.resolve();
+    const result = prev.then(task, task);
+    const tail = result.catch(() => {});
+    terraformChains.set(key, tail);
+    tail.then(() => { if (terraformChains.get(key) === tail) terraformChains.delete(key); });
+    return result;
+}
+
+function terraformPlanetKey(coord) { return 'planet_' + String(coord).replace(/:/g, '_'); }
+
+// Schliesst das Terraforming eines Planeten ab, wenn die Zeit um ist. Aendert `planet` (frisch aus PlayFab geladen) und speichert ihn.
+// Rueckgabe { completed } - completed = true nur beim ERSTEN Abschluss (Mail + Gutschrift passieren genau dieses eine Mal).
+async function terraformCompleteForPlanet(playFabId, coord, planet, now) {
+    return terraformExclusive(coord, async () => {
+        const key = terraformPlanetKey(coord);
+        const res = await playfabServer('/Server/GetUserData', { PlayFabId: playFabId, Keys: [key] });
+        const fresh = res && res.Data && res.Data[key] ? JSON.parse(res.Data[key].Value) : null;
+        if (!fresh || !fresh.terraformUntilUtc) { if (fresh && planet) Object.assign(planet, fresh); return { completed: false }; }
+        const until = new Date(fresh.terraformUntilUtc);
+        if (isNaN(until.getTime()) || until > now) { if (planet) Object.assign(planet, fresh); return { completed: false, remainingSeconds: isNaN(until.getTime()) ? 0 : Math.ceil((until - now) / 1000) }; }
+
+        // Einmalige Gutschrift: nur wer die Registerzeile von "terraformend" auf "fertig" setzt, bekommt die Rohstoffe.
+        let grant = false;
+        const upd = await pool.query(
+            'UPDATE planet_registry SET terraform_until = NULL, updated_at = now() WHERE coord = $1 AND terraform_until IS NOT NULL AND terraform_until <= now() RETURNING coord', [coord]);
+        if (upd.rows.length > 0) grant = true;
+        else {
+            const exists = await pool.query('SELECT 1 FROM planet_registry WHERE coord = $1', [coord]);
+            if (exists.rows.length === 0) grant = true;     // Altbestand ohne Registerzeile: einmalig gutschreiben
+        }
+
+        fresh.terraformUntilUtc = '';
+        if (!Array.isArray(fresh.buildings)) fresh.buildings = new Array(20).fill(0);
+        fresh.buildings[0] = Math.max(1, fresh.buildings[0] | 0);
+        if (!Array.isArray(fresh.ressources)) fresh.ressources = [0, 0, 0, 0, 0, 0, 0, 0, 0, 0];
+        if (grant) for (let i = 0; i < 4; i++) fresh.ressources[i] = (fresh.ressources[i] || 0) + COLONY_START_RESOURCES;
+        fresh.lastProductionTickUtc = until.toISOString();      // Produktion zaehlt ab dem Abschluss
+
+        await playfabServer('/Server/UpdateUserData', { PlayFabId: playFabId, Data: { [key]: JSON.stringify(fresh) }, Permission: 'Private' });
+        if (planet) Object.assign(planet, fresh);
+        return { completed: grant };
+    });
+}
+
+// Naechster eigener Planet (kuerzeste Flugzeit), ausser dem genannten
+function terraformNearestOwn(commander, coord) {
+    let best = null, bestTime = Infinity;
+    for (const c of (commander.colonies || [])) {
+        if (c === coord) continue;
+        const t = calculateFlightTime(coord, c, 1, 1);
+        if (t < bestTime) { bestTime = t; best = c; }
+    }
+    return best;
+}
+
+// Bricht ein laufendes Terraforming ab. Aendert commander und planet NUR im Speicher (Speichern macht der Aufrufer), loescht aber die Registerzeile.
+// planet.warships/ships/ressources sind der Bestand VOR Ort (bei einem Angriff: die Ueberlebenden). Rueckgabe { ok, destCoord, fleet, carried, lost } oder { ok:false, error }.
+async function terraformAbort(commander, coord, planet, now, reasonText) {
+    if (!planet || !planet.terraformUntilUtc) return { ok: false, error: 'Dieser Planet terraformt nicht.' };
+    const destCoord = terraformNearestOwn(commander, coord);
+    if (!destCoord) return { ok: false, error: 'Du hast keinen anderen Planeten, zu dem die Schiffe fliegen könnten.' };
+
+    const warships = [...(planet.warships || new Array(10).fill(0))];
+    const ships = [...(planet.ships || new Array(6).fill(0))];
+    const stock = (planet.ressources || []).slice(0, 5).map(n => Math.max(0, n | 0));
+    const capacity = v2CargoCapacity(warships, ships);
+    const total = stock.reduce((a, b) => a + b, 0);
+    const factor = total <= capacity || total === 0 ? 1 : capacity / total;
+    const carried = stock.map(n => Math.floor(n * factor));
+    const lost = stock.map((n, i) => n - carried[i]);
+
+    // Registerzeile loeschen: der Planet ist wieder frei (nur wenn sie noch dem Kolonisierer gehoert und terraformt)
+    const del = await pool.query('DELETE FROM planet_registry WHERE coord = $1 AND owner_commander_id = $2 RETURNING coord', [coord, commander.commanderId]);
+    // Andere Clients erfahren die Freigabe ueber die Liste "freed" in /galaxy/registry (geloeschte Zeilen tauchen in einem Abgleich sonst nie auf)
+    if (del.rows && del.rows.length > 0) {
+        try { await pool.query('INSERT INTO planet_freed (coord) VALUES ($1)', [coord]); }
+        catch (e) { console.error('[Terraforming] planet_freed:', e.message); }
+    }
+
+    // Flotte (Verlegen) zum naechsten eigenen Planeten - verarbeitet der Client bei der Ankunft (live oder beim naechsten Login)
+    let fleet = null;
+    if (sumArray(warships) + sumArray(ships) + sumArray(carried) > 0) {
+        const flight = calculateFlightTime(coord, destCoord, 1, 1);
+        if (typeof commander.nextFleetCounter !== 'number') commander.nextFleetCounter = 1;
+        fleet = {
+            fleetId: `F-${commander.commanderId}-${commander.nextFleetCounter++}`,
+            commanderId: commander.commanderId, commanderName: commander.visibleName,
+            originCoord: coord, destinationCoord: destCoord,
+            departureUtc: now.toISOString(), arrivalUtc: new Date(now.getTime() + flight * 1000).toISOString(),
+            mission: 0, warships, ships, ressources: carried,
+            isReturnFlight: false, hasArrived: false, engineLevel: 1, fuelFactor: 1
+        };
+        if (!Array.isArray(commander.activeFleets)) commander.activeFleets = [];
+        commander.activeFleets.push(fleet);
+    }
+
+    // Planet freigeben (Markierung fuer den Client: er raeumt seine Kolonieliste danach selbst auf)
+    commander.colonies = (commander.colonies || []).filter(c => c !== coord);
+    if (commander.mainPlanetCoord === coord) commander.mainPlanetCoord = destCoord;
+    planet.terraformUntilUtc = '';
+    planet.terraformAborted = true;
+    planet.ownerPlayerId = -1; planet.ownerName = '';
+    planet.warships = new Array(10).fill(0); planet.ships = new Array(6).fill(0);
+    planet.ressources = new Array((planet.ressources || []).length || 10).fill(0);
+    planet.buildings = new Array((planet.buildings || []).length || 20).fill(0);
+
+    const lostText = lost.some(n => n > 0) ? ` Rohstoffe, die nicht in den Laderaum passten, sind verloren (${lost.join('/')}).` : '';
+    await sendMail(commander, 'Terraforming abgebrochen', // LOCALIZE
+        `${reasonText} Der Planet ${coord} ist wieder frei, das Kolonisationsschiff ist verloren.` +
+        (fleet ? ` Schiffe und Rohstoffe fliegen zu ${destCoord} (Ankunft ${formatTimestamp(new Date(fleet.arrivalUtc))}).` : '') + lostText, 1);
+    return { ok: true, destCoord, fleet, carried, lost };
+}
+
+// ---- Endpunkte ----
+// Der Client meldet, dass die Zeit um ist (statt bis zum naechsten 5-Minuten-Tick zu warten). Der Server prueft die Zeit selbst.
+app.post('/planet/terraform-complete', async (req, res) => {
+    const commanderId = parseInt(req.body && req.body.commanderId, 10);
+    const coord = normalizeRegistryCoord(req.body && req.body.coord);
+    if (!commanderId || !coord) return res.status(400).json({ success: false, error: 'Ungültige Angaben.' });
+    const caller = await requireCaller(req, res, { commanderId });
+    if (!caller) return;
+    try {
+        const own = await marketLoadPlayer(caller.playFabId, [coord]);
+        if (!own || !own.commander.colonies.includes(coord)) return res.status(403).json({ success: false, error: 'Dieser Planet gehört dir nicht.' });
+        const planet = own.planets[coord];
+        if (!planet) return res.status(404).json({ success: false, error: 'Planetendaten fehlen.' });
+        if (!planet.terraformUntilUtc) return res.json({ success: true, completed: false, pending: false });
+        const r = await terraformCompleteForPlanet(caller.playFabId, coord, planet, new Date());
+        if (r.completed) {
+            await sendMail(own.commander, 'Terraforming abgeschlossen', // LOCALIZE
+                `Das Terraforming von ${coord} ist abgeschlossen. Der Planet ist jetzt voll nutzbar (Kommandozentrale Stufe 1, ${COLONY_START_RESOURCES} Einheiten Ress01-04 gutgeschrieben).`, 1);
+            await marketSaveEntries(caller.playFabId, { commander_data: own.commander });
+        }
+        res.json({ success: true, completed: !!r.completed, pending: !!planet.terraformUntilUtc, remainingSeconds: r.remainingSeconds || 0 });
+    } catch (error) {
+        console.error('[Terraforming] complete Fehler:', error.message);
+        res.status(500).json({ success: false, error: 'Abschluss gerade nicht möglich.' });
+    }
+});
+
+// Der Kolonisierer bricht ab (diplomatisch/taktisch): Planet wird wieder frei, Schiff bleibt verloren.
+app.post('/planet/terraform-abort', async (req, res) => {
+    const commanderId = parseInt(req.body && req.body.commanderId, 10);
+    const coord = normalizeRegistryCoord(req.body && req.body.coord);
+    if (!commanderId || !coord) return res.status(400).json({ success: false, error: 'Ungültige Angaben.' });
+    const caller = await requireCaller(req, res, { commanderId });
+    if (!caller) return;
+    try {
+        const result = await terraformExclusive(coord, async () => {
+            const own = await marketLoadPlayer(caller.playFabId, [coord]);
+            if (!own || !own.commander.colonies.includes(coord)) return { status: 403, body: { success: false, error: 'Dieser Planet gehört dir nicht.' } };
+            const planet = own.planets[coord];
+            if (!planet || !planet.terraformUntilUtc) return { status: 409, body: { success: false, error: 'Dieser Planet terraformt nicht (mehr).' } };
+            const r = await terraformAbort(own.commander, coord, planet, new Date(), 'Du hast das Terraforming abgebrochen.');
+            if (!r.ok) return { status: 409, body: { success: false, error: r.error } };
+            await marketSaveEntries(caller.playFabId, { commander_data: own.commander, [terraformPlanetKey(coord)]: planet });
+            return { status: 200, body: { success: true, destCoord: r.destCoord, fleetId: r.fleet ? r.fleet.fleetId : '', fleet: r.fleet || null } };
+        });
+        res.status(result.status).json(result.body);
+    } catch (error) {
+        console.error('[Terraforming] abort Fehler:', error.message);
+        res.status(500).json({ success: false, error: 'Abbruch gerade nicht möglich.' });
+    }
 });
 
 // #####################################################################
