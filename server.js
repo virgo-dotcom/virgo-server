@@ -4700,6 +4700,54 @@ function classifyFleetMission(mission) {
     return 'unsupported';
 }
 
+// -------------------------------------------------------
+// NEU 18.10.2026: Der Tick liest commander_data, rechnet mehrere Sekunden (Planeten lesen/schreiben) und schreibt dann den GANZEN
+// Commander zurueck. Hat der Client in der Zwischenzeit selbst gespeichert (Autosave alle 60 s, Bau, Flottenstart ...), waere dessen
+// Stand weg (z. B. gerade gestartete Forschung oder Flotte). Darum wird direkt vor dem Schreiben frisch gelesen:
+//   - unveraendert seit dem Lesen        -> normal schreiben
+//   - zwischenzeitlich vom Client geaendert -> die Aenderungen des Ticks (Spalte 'mine' gegen 'original') auf den frischen Stand
+//     uebertragen: Flotten/Mails nach ID (entfernte raus, neue dazu), Zaehler und Forschungsstufen als Maximum, fertige Forschung
+//     leeren (nur wenn sie noch dieselbe ist), alle uebrigen Felder nur, wenn der Client sie nicht angefasst hat.
+// -------------------------------------------------------
+function mergeCommanderForTickWrite(originalJson, mine, freshJson) {
+    if (freshJson === originalJson) return { merged: false, commander: mine };
+    let original, fresh;
+    try { original = JSON.parse(originalJson); fresh = JSON.parse(freshJson); }
+    catch (e) { return { merged: false, commander: mine }; }
+    const same = (a, b) => JSON.stringify(a === undefined ? null : a) === JSON.stringify(b === undefined ? null : b);
+    const result = fresh;
+
+    const mergeById = (key, idKey) => {
+        const orig = Array.isArray(original[key]) ? original[key] : [];
+        const mi = Array.isArray(mine[key]) ? mine[key] : [];
+        const fr = Array.isArray(fresh[key]) ? fresh[key] : [];
+        const origIds = new Set(orig.map(x => x && x[idKey]));
+        const mineIds = new Set(mi.map(x => x && x[idKey]));
+        const removed = new Set([...origIds].filter(id => !mineIds.has(id)));        // vom Tick entfernt
+        const frIds = new Set(fr.map(x => x && x[idKey]));
+        const out = fr.filter(x => !(x && removed.has(x[idKey])));
+        for (const x of mi) if (x && !origIds.has(x[idKey]) && !frIds.has(x[idKey])) out.push(x);   // vom Tick neu
+        result[key] = out;
+    };
+
+    for (const key of Object.keys(mine)) {
+        if (same(mine[key], original[key])) continue;                 // der Tick hat dieses Feld nicht veraendert
+        if (key === 'activeFleets') mergeById('activeFleets', 'fleetId');
+        else if (key === 'inbox') mergeById('inbox', 'mailId');
+        else if (key === 'activeResearch') {
+            // Tick hat die Forschung abgeschlossen (null). Nur leeren, wenn der Client keine andere gestartet hat.
+            const fr = fresh.activeResearch, orig = original.activeResearch;
+            if (mine.activeResearch === null || mine.activeResearch === undefined) {
+                if (!fr || (orig && fr.type === orig.type && fr.targetLevel === orig.targetLevel)) result.activeResearch = null;
+            }
+        }
+        else if (typeof mine[key] === 'number' && typeof fresh[key] === 'number') result[key] = Math.max(mine[key], fresh[key]);   // Zaehler/Forschungsstufen
+        else if (same(fresh[key], original[key])) result[key] = mine[key];                                                          // Client hat es nicht angefasst
+        // sonst: Client hat es auch geaendert -> sein Stand bleibt
+    }
+    return { merged: true, commander: result };
+}
+
 async function serverTickHandler(req, res) {
     if (!serverTickAuthorized(req))
         return res.status(401).json({ success: false, error: 'Nicht autorisiert.' });
@@ -4867,9 +4915,20 @@ async function serverTickHandler(req, res) {
                 await updateCommanderHighscore(commander, commanderPlanetsForHighscore, playFabId);
 
                 if (changed) {
+                    // NEU 18.10.2026: direkt vor dem Schreiben frisch lesen und bei Aenderungen des Clients zusammenfuehren (siehe mergeCommanderForTickWrite)
+                    let toWrite = commander;
+                    try {
+                        const freshData = await playfabServer('/Server/GetUserData', { PlayFabId: playFabId, Keys: ['commander_data'] });
+                        const freshJson = freshData.Data && freshData.Data['commander_data'] ? freshData.Data['commander_data'].Value : null;
+                        if (freshJson) {
+                            const m = mergeCommanderForTickWrite(userData.Data['commander_data'].Value, commander, freshJson);
+                            toWrite = m.commander;
+                            if (m.merged) log.push(`Commander zusammengefuehrt (Client hat waehrenddessen gespeichert): ${playFabId}`);
+                        }
+                    } catch (e) { console.error('[Tick] Abgleich vor dem Schreiben fehlgeschlagen, schreibe wie bisher:', e.message); }
                     await playfabServer('/Server/UpdateUserData', {
                         PlayFabId: playFabId,
-                        Data: { 'commander_data': JSON.stringify(commander) },
+                        Data: { 'commander_data': JSON.stringify(toWrite) },
                         Permission: 'Private'
                     });
                     log.push(`Commander gespeichert: ${playFabId}`);
@@ -7633,14 +7692,15 @@ app.post('/planet/claim', async (req, res) => {
             terraformHours = rule.terraformHours || 0;     // 0 = Startplatz-Phase (kein Terraforming)
         }
         const [g, s, sys, n] = coord.split(':').map(Number);
+        // Endzeit EINMAL berechnen: Datenbank und Antwort an den Client muessen exakt dieselbe Zeit tragen
+        const terraformUntilIso = terraformHours > 0 ? new Date(Date.now() + terraformHours * 3600 * 1000).toISOString() : '';
         const ins = await pool.query(
             `INSERT INTO planet_registry (coord, galaxy_id, sector_id, system_id, planet_number, owner_commander_id, kind, owner_name, planet_name, terraform_until)
              VALUES ($1, $2, $3, $4, $5, $6, 'player', $7, '', $8) ON CONFLICT (coord) DO NOTHING RETURNING coord`,
-            [coord, g, s, sys, n, commanderId, regProf.name, terraformHours > 0 ? new Date(Date.now() + terraformHours * 3600 * 1000).toISOString() : null]);
+            [coord, g, s, sys, n, commanderId, regProf.name, terraformUntilIso || null]);
         if (ins.rows.length > 0) {
             // NEU 18.10.2026 (§32): bei einer Kolonisierung beginnt das Terraforming; der Client uebernimmt die Zeit vom Server
-            return res.json({ success: true, claimed: true, coord, terraformHours,
-                terraformUntilUtc: terraformHours > 0 ? new Date(Date.now() + terraformHours * 3600 * 1000).toISOString() : '' });
+            return res.json({ success: true, claimed: true, coord, terraformHours, terraformUntilUtc: terraformUntilIso });
         }
 
         const cur = await pool.query('SELECT owner_commander_id, kind, owner_name FROM planet_registry WHERE coord = $1', [coord]);
