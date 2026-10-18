@@ -54,6 +54,7 @@
 //  §25  KAMPF V2 (Rundenkampf, Mischbonus, Zivile in letzter Reihe): steht VOR §21; aktiv nur bei COMBAT_ENGINE=shadow|v2
 //  §26  GALAXIE-REGISTER (planet_registry): serverautoritative Belegung, Schritt 1 (nur lesen/befuellen); steht VOR §21
 //  §28  INVENTAR (PlayFab Internal Data "inventory"): Kisten (Rohstoffe Ress01-10, Schiffe), Oeffnen, Admin-Vergabe "#inv"; steht VOR §21
+//  §30  GALAXIE-STRUKTUR (galaxy_sectors/galaxy_config/galaxy_texts): Sektoren + Systemzahl, Auto-Eroeffnung je 2 Sektoren, Texte, Admin /admin/galaxy/*; steht VOR §21
 //  §27  SPIELERHANDEL (market_offers): TAUSCHHANDEL Spieler -> Spieler (Ress01-05 + Schiffe gegen Ress01-05, Preisband 100-200 % des Werts), 20 % Steuer, Verkaufs-Mail; steht VOR §21
 //
 //  WICHTIGE ARBEITSREGELN FUER DIESE DATEI
@@ -147,6 +148,7 @@ const AUTH_POLICY = [
     ['POST', /^\/admin\/giveAccountResource$/, 'admin'],
     ['POST', /^\/admin\/inspectPlayer$/,       'admin'],
     ['POST', /^\/admin\/inventory\/grant$/,    'admin'],
+    ['*',    /^\/admin\/galaxy\/.+/,          'admin'],    // NEU 18.10.2026 (§30)
     ['*',    /^\/alliances\/admin\/.+/,        'admin'],
     ['PUT',  /^\/legal-texts\/.+/,             'admin'],
     ['GET',  /^\/supportMessages$/,            'admin'],
@@ -438,6 +440,9 @@ const pool = new Pool({
     connectionString: process.env.DATABASE_URL,
     ssl: { rejectUnauthorized: false }
 });
+
+// NEU 18.10.2026 (§30): Cache der Galaxie-Struktur (Sektoren/Systemzahlen); null = noch nicht geladen -> alte Grenzen
+let galaxyStructure = null;
 
 async function initDatabase() {
     try {
@@ -1160,6 +1165,23 @@ async function initDatabase() {
         `);
         await pool.query(`CREATE INDEX IF NOT EXISTS idx_planet_registry_system ON planet_registry (galaxy_id, sector_id, system_id);`);
         await pool.query(`CREATE INDEX IF NOT EXISTS idx_planet_registry_owner ON planet_registry (owner_commander_id);`);
+
+        // NEU 18.10.2026 (§30): Galaxie-Struktur. Sektor offen/geplant mit Anzahl Sonnensysteme (die Zahl darf nie unter der des Vorgaengers liegen),
+        // Einstellungen der automatischen Eroeffnung, Text-Ueberschreibungen fuer die Fusszeile der Systeme. Alle drei stehen in DB_EXPORT_TABLES.
+        await pool.query(`
+            CREATE TABLE IF NOT EXISTS galaxy_sectors (
+                galaxy_id INTEGER NOT NULL DEFAULT 1,
+                sector_id INTEGER NOT NULL,
+                systems INTEGER NOT NULL,
+                opened BOOLEAN NOT NULL DEFAULT false,
+                opened_at TIMESTAMPTZ,
+                PRIMARY KEY (galaxy_id, sector_id)
+            );
+        `);
+        await pool.query(`CREATE TABLE IF NOT EXISTS galaxy_config (key TEXT PRIMARY KEY, value TEXT NOT NULL, updated_at TIMESTAMPTZ NOT NULL DEFAULT now());`);
+        await pool.query(`CREATE TABLE IF NOT EXISTS galaxy_texts (key TEXT PRIMARY KEY, text TEXT NOT NULL, updated_by INTEGER NOT NULL DEFAULT 0, updated_at TIMESTAMPTZ NOT NULL DEFAULT now());`);
+        try { await galaxyEnsureSeedAndLoad(); }
+        catch (e) { console.error('[Galaxie] Struktur konnte nicht geladen werden (alte Grenzen bleiben aktiv):', e.message); }
 
         // NEU 26.09.2026: Rang-Option "im Allianz-Profil anzeigen" (Minister/Anfuehrer erscheinen im oeffentlichen
         // Allianz-Profil). Nur beim ALLERERSTEN Anlegen der Spalte werden die drei Start-Ministerien fuer bestehende
@@ -4301,7 +4323,8 @@ app.post('/notifyAttack', async (req, res) => {
 const DB_EXPORT_TABLES = ['alliances', 'alliance_ranks', 'alliance_members', 'alliance_applications', 'alliance_charters', 'alliance_charter_signatures',
     'alliance_relationships', 'player_relationships', 'commander_highscore', 'legal_texts', 'dev_todos', 'announcements', 'virgodom_messages',
     'support_messages', 'player_reports', 'shop_items', 'promo_codes', 'promo_redemptions', 'giftbox_claims', 'giftbox_golden_claims',
-    'market_offers', 'transport_deliveries', 'planet_registry', 'combat_reports', 'attack_traces', 'processed_fleets'];
+    'market_offers', 'transport_deliveries', 'planet_registry', 'combat_reports', 'attack_traces', 'processed_fleets',
+    'galaxy_sectors', 'galaxy_config', 'galaxy_texts'];
 app.get('/admin/db-export', async (req, res) => {
     if (process.env.DB_EXPORT_ENABLED !== 'true') return res.status(404).json({ success: false, error: 'Nicht verfuegbar.' });
     if (!adminKeyOk(req.query.key)) return res.status(403).json({ success: false, error: 'Nicht autorisiert' });
@@ -7326,9 +7349,15 @@ app.get('/galaxy/system/:g/:s/:sys', async (req, res) => {
 // SCHRITT 2 (26.09.2026): Client nutzt das Register
 // ---------------------------------------------------------------------
 // Grenzen der Galaxie (muessen zu GalaxyManager passen: 12 Systeme je Sektor, max. 15 Planeten je System)
+// NEU 18.10.2026 (§30): gilt, was die Struktur sagt (offener Sektor, Systemzahl des Sektors, Planetenzahl des Systems). Ist die Struktur noch nicht
+// geladen, gelten die alten Grenzen.
 function coordInGalaxyLimits(coord) {
     const [g, s, sys, n] = String(coord).split(':').map(Number);
-    return g === 1 && s >= 1 && s <= 50 && sys >= 1 && sys <= 12 && n >= 1 && n <= 15;
+    if (!(g === 1 && s >= 1 && sys >= 1 && n >= 1)) return false;
+    if (!galaxyStructure) return s <= 50 && sys <= 12 && n <= 15;
+    const sec = galaxyStructure.sectors.find(x => x.id === s && x.opened);
+    if (!sec || sys > sec.systems) return false;
+    return n <= galaxyPlanetCount(1, s, sys);
 }
 
 // Traegt einen Planeten, den die OEFFENTLICHEN Systemdaten (sys_*) als belegt fuehren, ins Register nach
@@ -7474,13 +7503,14 @@ app.post('/planet/reassert', async (req, res) => {
 // darunter, Position 4-10, hoechstens 3 verschiedene Besitzer je System) und traegt sie atomar ins Register ein. Vorher wuerfelte der Client selbst
 // (immer dieselbe Zufallsfolge nach dem Start -> mehrere Spieler bekamen dieselben Planeten, Fund vom 07.10.2026).
 // Idempotent: ein erneuter Aufruf (z. B. nach Absturz vor dem Speichern) liefert dieselben Koordinaten. Verweigert, wenn der Spieler schon Kolonien hat.
-const START_HIGHEST_SECTOR = parseInt(process.env.START_HIGHEST_SECTOR, 10) || 4;
-const START_SYSTEMS_PER_SECTOR = 12;
-const START_PLANET_MIN = 4, START_PLANET_MAX = 10, START_MAX_OWNERS_PER_SYSTEM = 3;
+// NEU 18.10.2026 (§30): hoechster offener Sektor und Systemzahl kommen aus der Galaxie-Struktur (galaxyHighestOpen/galaxySystemsIn), Startplaneten nur noch 4-9.
+const START_PLANET_MIN = 4, START_PLANET_MAX = 9, START_MAX_OWNERS_PER_SYSTEM = 3;
 
 async function pickStartPlanet(sector, commanderId, ownerName) {
     for (let attempt = 0; attempt < 80; attempt++) {
-        const system = 1 + Math.floor(Math.random() * START_SYSTEMS_PER_SECTOR);
+        const systemCount = galaxySystemsIn(sector);
+        if (systemCount <= 0) return null;
+        const system = 1 + Math.floor(Math.random() * systemCount);
         const rows = await pool.query(
             'SELECT planet_number, owner_commander_id FROM planet_registry WHERE galaxy_id = 1 AND sector_id = $1 AND system_id = $2', [sector, system]);
         if (new Set(rows.rows.map(r => r.owner_commander_id)).size >= START_MAX_OWNERS_PER_SYSTEM) continue;
@@ -7517,7 +7547,7 @@ app.post('/planet/assign-start', async (req, res) => {
         const coords = existing.rows.slice(0, 2).map(r => r.coord);
 
         const sectorOf = c => parseInt(c.split(':')[1], 10);
-        const high = START_HIGHEST_SECTOR, low = Math.max(1, START_HIGHEST_SECTOR - 1);
+        const high = galaxyHighestOpen(), low = Math.max(1, high - 1);
         while (coords.length < 2) {
             const sector = coords.length === 0 ? high : (sectorOf(coords[0]) === high ? low : high);
             const coord = await pickStartPlanet(sector, caller.commanderId, prof.name);
@@ -7525,6 +7555,7 @@ app.post('/planet/assign-start', async (req, res) => {
             coords.push(coord);
         }
         coords.sort((a, b) => sectorOf(b) - sectorOf(a)); // Heimatplanet (hoechster Sektor) zuerst
+        await galaxyAutoOpenCheck(); // NEU 18.10.2026 (§30): wird es eng, werden automatisch zwei neue Sektoren eroeffnet (Fehler dort stoeren die Vergabe nicht)
         res.json({ success: true, coords });
     } catch (error) {
         console.error('[Server] planet/assign-start Fehler:', error.message);
@@ -8848,6 +8879,324 @@ app.post('/transport/claim', async (req, res) => {
         console.error('[Transport] claim Fehler:', error.message);
         marketFail(res, 500, 'Lieferungen konnten nicht abgeholt werden.');
     }
+});
+
+// #####################################################################
+// §30  GALAXIE-STRUKTUR (Sektoren, Systeme, Texte) — NEU 18.10.2026
+//      Der SERVER bestimmt, welche Sektoren offen sind und wie viele Sonnensysteme sie haben (Tabelle galaxy_sectors),
+//      eroeffnet bei Bedarf automatisch je ZWEI neue Sektoren (Startplatz-Pruefung) und liefert Struktur + Texte an die Clients.
+//      Planetenzahl je System = Spiegel von Assets/Skripts/GalaxyLore.cs (PlanetCount): mindestens 11, Hoechstzahl je Sektor
+//      12/13/14/15, danach +2 je Sektor, aus den Koordinaten gerechnet (kein Zufall). Pruefvorlage: Tools/Galaxie-Tests/galaxylore.js.
+//      Tabellen (initDatabase): galaxy_sectors, galaxy_config, galaxy_texts - alle in DB_EXPORT_TABLES (Datenbank-Umzug!).
+//      Admin-Routen /admin/galaxy/* (AUTH_POLICY 'admin' + eigene Pruefung auf ADMIN_COMMANDER_IDS).
+// #####################################################################
+
+// ---- Rechenkern (reine Ganzzahlen, identisch zu C# GalaxyLore.Hash / MaxPlanets / PlanetCount) ----
+function galaxyHash(a, b, c, d) {
+    let h = 2166136261 >>> 0;
+    h = Math.imul((h ^ (a >>> 0)) >>> 0, 16777619) >>> 0; h = (h ^ (h >>> 15)) >>> 0; h = Math.imul(h, 2246822519) >>> 0;
+    h = Math.imul((h ^ (b >>> 0)) >>> 0, 16777619) >>> 0; h = (h ^ (h >>> 13)) >>> 0; h = Math.imul(h, 3266489917) >>> 0;
+    h = Math.imul((h ^ (c >>> 0)) >>> 0, 16777619) >>> 0; h = (h ^ (h >>> 16)) >>> 0; h = Math.imul(h, 668265263) >>> 0;
+    h = Math.imul((h ^ (d >>> 0)) >>> 0, 16777619) >>> 0; h = (h ^ (h >>> 15)) >>> 0; h = Math.imul(h, 2246822519) >>> 0;
+    h = (h ^ (h >>> 13)) >>> 0;
+    return h;
+}
+const GALAXY_MIN_PLANETS = 11;
+function galaxyMaxPlanets(sector) { if (sector < 1) sector = 1; return sector <= 4 ? 11 + sector : 7 + 2 * sector; }
+function galaxyPlanetCount(g, s, sys) { return GALAXY_MIN_PLANETS + (galaxyHash(g, s, sys, 6001) % (galaxyMaxPlanets(s) - GALAXY_MIN_PLANETS + 1)); }
+
+// ---- Struktur (Cache in galaxyStructure, wird bei jeder Aenderung neu geladen) ----
+const GALAXY_DEFAULT_SYSTEMS = 12;
+const GALAXY_MAX_SYSTEMS_PER_SECTOR = 1000;       // Sicherheitsgrenze gegen Tippfehler im Editor
+const GALAXY_LOCK_KEY = 710030;                   // Postgres-Sperre: nur eine Struktur-Aenderung gleichzeitig
+
+async function galaxyLoadStructure() {
+    const r = await pool.query('SELECT sector_id, systems, opened FROM galaxy_sectors WHERE galaxy_id = 1 ORDER BY sector_id');
+    galaxyStructure = {
+        sectors: r.rows.map(x => ({ id: x.sector_id, systems: x.systems, opened: !!x.opened })),
+        version: Date.now()
+    };
+    return galaxyStructure;
+}
+
+// Beim Start: Tabellen sind da (initDatabase). Ist galaxy_sectors leer, wird der bisherige Stand eingetragen (START_HIGHEST_SECTOR, Standard 4, je 12 Systeme).
+async function galaxyEnsureSeedAndLoad() {
+    const c = await pool.query('SELECT COUNT(*)::int AS n FROM galaxy_sectors WHERE galaxy_id = 1');
+    if (c.rows[0].n === 0) {
+        const open = parseInt(process.env.START_HIGHEST_SECTOR, 10) || 4;
+        for (let s = 1; s <= open; s++)
+            await pool.query('INSERT INTO galaxy_sectors (galaxy_id, sector_id, systems, opened, opened_at) VALUES (1, $1, $2, true, now()) ON CONFLICT DO NOTHING', [s, GALAXY_DEFAULT_SYSTEMS]);
+        console.log(`[Galaxie] Struktur angelegt: ${open} Sektoren je ${GALAXY_DEFAULT_SYSTEMS} Systeme.`);
+    }
+    await galaxyLoadStructure();
+}
+
+function galaxyOpenSectorList() { return galaxyStructure ? galaxyStructure.sectors.filter(x => x.opened) : []; }
+function galaxyHighestOpen() {
+    const open = galaxyOpenSectorList();
+    if (open.length === 0) return parseInt(process.env.START_HIGHEST_SECTOR, 10) || 4;
+    return open.reduce((m, x) => Math.max(m, x.id), 0);
+}
+function galaxySystemsIn(sector) {
+    const sec = galaxyStructure ? galaxyStructure.sectors.find(x => x.id === sector && x.opened) : null;
+    return sec ? sec.systems : (galaxyStructure ? 0 : GALAXY_DEFAULT_SYSTEMS);
+}
+
+// ---- Einstellungen der automatischen Eroeffnung ----
+const GALAXY_CONFIG_DEFAULTS = { auto_open: 'true', threshold_percent: '15', threshold_min: '6' };
+async function galaxyGetConfig() {
+    const r = await pool.query('SELECT key, value FROM galaxy_config');
+    const m = Object.assign({}, GALAXY_CONFIG_DEFAULTS);
+    for (const row of r.rows) if (row.key in GALAXY_CONFIG_DEFAULTS) m[row.key] = row.value;
+    return {
+        autoOpen: m.auto_open === 'true',
+        thresholdPercent: parseInt(m.threshold_percent, 10) || 15,
+        thresholdMin: parseInt(m.threshold_min, 10) || 6
+    };
+}
+async function galaxySetConfig(input) {
+    const upsert = (k, v) => pool.query('INSERT INTO galaxy_config (key, value, updated_at) VALUES ($1, $2, now()) ON CONFLICT (key) DO UPDATE SET value = EXCLUDED.value, updated_at = now()', [k, String(v)]);
+    if (input.autoOpen !== undefined) await upsert('auto_open', input.autoOpen === true || input.autoOpen === 'true' ? 'true' : 'false');
+    if (input.thresholdPercent !== undefined) {
+        const p = Number(input.thresholdPercent);
+        if (!Number.isInteger(p) || p < 1 || p > 90) throw new Error('Schwelle in Prozent: ganze Zahl von 1 bis 90.');
+        await upsert('threshold_percent', p);
+    }
+    if (input.thresholdMin !== undefined) {
+        const m = Number(input.thresholdMin);
+        if (!Number.isInteger(m) || m < 1 || m > 1000) throw new Error('Mindestanzahl freier Plaetze: ganze Zahl von 1 bis 1000.');
+        await upsert('threshold_min', m);
+    }
+    return galaxyGetConfig();
+}
+
+// ---- Freie Startplaetze eines Sektors: je System bis zu 3 Besitzer, Startplaneten 4-9 ----
+async function galaxyStartCapacity(sector) {
+    const systems = galaxySystemsIn(sector);
+    if (systems <= 0) return { free: 0, total: 0, systems: 0 };
+    const r = await pool.query('SELECT system_id, planet_number, owner_commander_id FROM planet_registry WHERE galaxy_id = 1 AND sector_id = $1', [sector]);
+    const perSystem = new Map();
+    for (const row of r.rows) {
+        if (!perSystem.has(row.system_id)) perSystem.set(row.system_id, { owners: new Set(), taken: new Set() });
+        const e = perSystem.get(row.system_id);
+        e.owners.add(row.owner_commander_id); e.taken.add(row.planet_number);
+    }
+    let free = 0;
+    for (let sys = 1; sys <= systems; sys++) {
+        const e = perSystem.get(sys);
+        if (!e) { free += START_MAX_OWNERS_PER_SYSTEM; continue; }
+        let freePlanets = 0;
+        for (let n = START_PLANET_MIN; n <= START_PLANET_MAX; n++) if (!e.taken.has(n)) freePlanets++;
+        free += Math.max(0, Math.min(START_MAX_OWNERS_PER_SYSTEM - e.owners.size, freePlanets));
+    }
+    return { free, total: systems * START_MAX_OWNERS_PER_SYSTEM, systems };
+}
+
+// ---- Sektoren eroeffnen (manuell oder automatisch); immer ATOMAR unter Sperre ----
+// onlyIfHighest (optional): nur eroeffnen, wenn der hoechste offene Sektor NOCH diese Nummer hat - verhindert, dass zwei gleichzeitige
+// Auto-Pruefungen je zwei Sektoren eroeffnen (statt zusammen zwei).
+async function galaxyOpenSectors(count, reason, onlyIfHighest) {
+    count = Math.max(1, Math.min(10, parseInt(count, 10) || 1));
+    const client = await pool.connect();
+    const opened = [];
+    let skipped = false;
+    try {
+        await client.query('BEGIN');
+        await client.query('SELECT pg_advisory_xact_lock($1)', [GALAXY_LOCK_KEY]);
+        const rows = (await client.query('SELECT sector_id, systems, opened FROM galaxy_sectors WHERE galaxy_id = 1 ORDER BY sector_id')).rows;
+        const openRows = rows.filter(x => x.opened);
+        const currentHighest = openRows.reduce((m, x) => Math.max(m, x.sector_id), 0);
+        if (onlyIfHighest !== undefined && currentHighest !== onlyIfHighest) {
+            await client.query('ROLLBACK');
+            skipped = true;
+            throw new Error('GALAXY_SKIP');   // wird unten abgefangen (kein Fehler)
+        }
+        let lastSystems = openRows.reduce((m, x) => Math.max(m, x.systems), GALAXY_DEFAULT_SYSTEMS);
+        let nextId = currentHighest + 1;
+        for (let i = 0; i < count; i++) {
+            const planned = rows.find(x => x.sector_id === nextId && !x.opened);
+            const systems = planned ? Math.max(planned.systems, lastSystems) : lastSystems;   // nie weniger als der Vorgaenger
+            await client.query(
+                `INSERT INTO galaxy_sectors (galaxy_id, sector_id, systems, opened, opened_at) VALUES (1, $1, $2, true, now())
+                 ON CONFLICT (galaxy_id, sector_id) DO UPDATE SET systems = EXCLUDED.systems, opened = true, opened_at = now()`, [nextId, systems]);
+            opened.push({ id: nextId, systems });
+            lastSystems = systems; nextId++;
+        }
+        await client.query('COMMIT');
+    } catch (e) {
+        if (!skipped) { try { await client.query('ROLLBACK'); } catch (e2) { /* ignorieren */ } }
+        if (!skipped) throw e;
+    } finally {
+        client.release();
+    }
+    await galaxyLoadStructure();
+    if (skipped) return [];
+    console.log(`[Galaxie] Sektoren eroeffnet (${reason || 'manuell'}): ${opened.map(x => x.id + ' (' + x.systems + ' Systeme)').join(', ')}`);
+    return opened;
+}
+
+// Automatische Eroeffnung: nach jeder Startplatz-Vergabe. Fehler hier duerfen die Vergabe NIE verhindern.
+async function galaxyAutoOpenCheck() {
+    try {
+        const cfg = await galaxyGetConfig();
+        if (!cfg.autoOpen) return null;
+        const high = galaxyHighestOpen();
+        const low = Math.max(1, high - 1);
+        const capHigh = await galaxyStartCapacity(high);
+        const capLow = low === high ? capHigh : await galaxyStartCapacity(low);
+        const need = cap => Math.max(cfg.thresholdMin, Math.ceil(cap.total * cfg.thresholdPercent / 100));
+        if (capHigh.free >= need(capHigh) && capLow.free >= need(capLow)) return null;
+        // 'high' als Bedingung: hat inzwischen ein anderer Aufruf geoeffnet, passiert hier nichts mehr
+        const opened = await galaxyOpenSectors(2, `automatisch: Sektor ${high} frei ${capHigh.free}/${capHigh.total}, Sektor ${low} frei ${capLow.free}/${capLow.total}`, high);
+        return opened.length > 0 ? opened : null;
+    } catch (e) {
+        console.error('[Galaxie] Auto-Eroeffnung fehlgeschlagen:', e.message);
+        return null;
+    }
+}
+
+// ---- Plan fuer kuenftige Sektoren: [{id, systems}] fuer id = hoechster offener + 1, +2, ...; Systemzahl nie kleiner als beim Vorgaenger ----
+async function galaxySavePlan(entries) {
+    if (!Array.isArray(entries) || entries.length > 100) throw new Error('Ungueltiger Plan.');
+    const client = await pool.connect();
+    try {
+        await client.query('BEGIN');
+        await client.query('SELECT pg_advisory_xact_lock($1)', [GALAXY_LOCK_KEY]);
+        const rows = (await client.query('SELECT sector_id, systems, opened FROM galaxy_sectors WHERE galaxy_id = 1 ORDER BY sector_id')).rows;
+        const openRows = rows.filter(x => x.opened);
+        const highest = openRows.reduce((m, x) => Math.max(m, x.sector_id), 0);
+        let prev = openRows.filter(x => x.sector_id === highest).reduce((m, x) => Math.max(m, x.systems), GALAXY_DEFAULT_SYSTEMS);
+        const sorted = entries.map(e => ({ id: Number(e.id), systems: Number(e.systems) })).sort((a, b) => a.id - b.id);
+        let expected = highest + 1;
+        for (const e of sorted) {
+            if (!Number.isInteger(e.id) || !Number.isInteger(e.systems)) throw new Error('Sektor und Systemzahl muessen ganze Zahlen sein.');
+            if (e.id !== expected) throw new Error(`Der Plan muss lueckenlos mit Sektor ${highest + 1} beginnen (erwartet ${expected}, erhalten ${e.id}).`);
+            if (e.systems < prev) throw new Error(`Sektor ${e.id}: ${e.systems} Systeme sind weniger als beim Vorgaenger (${prev}). Die Zahl darf nie sinken.`);
+            if (e.systems > GALAXY_MAX_SYSTEMS_PER_SECTOR) throw new Error(`Sektor ${e.id}: hoechstens ${GALAXY_MAX_SYSTEMS_PER_SECTOR} Systeme.`);
+            prev = e.systems; expected++;
+        }
+        await client.query('DELETE FROM galaxy_sectors WHERE galaxy_id = 1 AND opened = false');
+        for (const e of sorted)
+            await client.query('INSERT INTO galaxy_sectors (galaxy_id, sector_id, systems, opened) VALUES (1, $1, $2, false)', [e.id, e.systems]);
+        await client.query('COMMIT');
+    } catch (e) {
+        try { await client.query('ROLLBACK'); } catch (e2) { /* ignorieren */ }
+        throw e;
+    } finally {
+        client.release();
+    }
+    return galaxyLoadStructure();
+}
+
+// ---- Texte unter den Systemen (Ueberschreibungen; Standardtexte stehen im Client, GalaxyLore.cs) ----
+// Schluessel: star:<Sonnenart 0-12> | egg:<g:s:sys:planet> | sys:<g:s:sys>
+const GALAXY_TEXT_KEY = /^(star:[0-9]{1,2}|egg:[0-9]{1,5}:[0-9]{1,5}:[0-9]{1,5}:[0-9]{1,5}|sys:[0-9]{1,5}:[0-9]{1,5}:[0-9]{1,5})$/;
+const GALAXY_TEXT_MAX = 600;
+async function galaxyListTexts() {
+    const r = await pool.query('SELECT key, text FROM galaxy_texts ORDER BY key');
+    const out = {};
+    for (const row of r.rows) out[row.key] = row.text;
+    return out;
+}
+async function galaxySaveText(key, text, adminId) {
+    if (typeof key !== 'string' || !GALAXY_TEXT_KEY.test(key)) throw new Error('Ungueltiger Textschluessel.');
+    const clean = sanitizeRichText(text).trim();
+    if (clean.length === 0) {
+        await pool.query('DELETE FROM galaxy_texts WHERE key = $1', [key]);    // leer = Standardtext wieder verwenden
+        return { key, text: null };
+    }
+    if (clean.length > GALAXY_TEXT_MAX) throw new Error(`Text zu lang (hoechstens ${GALAXY_TEXT_MAX} Zeichen).`);
+    await pool.query('INSERT INTO galaxy_texts (key, text, updated_by, updated_at) VALUES ($1, $2, $3, now()) ON CONFLICT (key) DO UPDATE SET text = EXCLUDED.text, updated_by = EXCLUDED.updated_by, updated_at = now()',
+        [key, clean, adminId || 0]);
+    return { key, text: clean };
+}
+
+// ---- Endpunkte fuer Spieler (Gruppe 'player') ----
+app.get('/galaxy/structure', async (req, res) => {
+    try {
+        if (!galaxyStructure) await galaxyLoadStructure();
+        res.json({ success: true, version: galaxyStructure.version, highestOpen: galaxyHighestOpen(), sectors: galaxyStructure.sectors.filter(x => x.opened).map(x => ({ id: x.id, systems: x.systems })) });
+    } catch (error) {
+        console.error('[Galaxie] structure Fehler:', error.message);
+        res.status(500).json({ success: false, error: 'Struktur nicht verfuegbar.' });
+    }
+});
+
+app.get('/galaxy/texts', async (req, res) => {
+    try {
+        res.json({ success: true, texts: await galaxyListTexts() });
+    } catch (error) {
+        console.error('[Galaxie] texts Fehler:', error.message);
+        res.status(500).json({ success: false, error: 'Texte nicht verfuegbar.' });
+    }
+});
+
+// ---- Admin (Gruppe 'admin' in AUTH_POLICY + hier zusaetzlich eigene Pruefung, falls AUTH nicht erzwungen wird) ----
+async function galaxyAdminOnly(req, res) {
+    let playFabId = req.auth && req.auth.playFabId;
+    if (!playFabId) {
+        const ticket = req.get('X-Session-Ticket');
+        if (ticket) playFabId = await authenticateTicket(ticket);
+    }
+    if (!playFabId) { res.status(401).json({ success: false, error: 'Nicht angemeldet.' }); return null; }
+    const commanderId = await authCommanderIdFor(playFabId);
+    if (commanderId === null || !ADMIN_COMMANDER_IDS.includes(Number(commanderId))) {
+        res.status(403).json({ success: false, error: 'Nur Admin-Accounts dürfen das.' });
+        return null;
+    }
+    return Number(commanderId);
+}
+
+async function galaxyAdminState() {
+    if (!galaxyStructure) await galaxyLoadStructure();
+    const cfg = await galaxyGetConfig();
+    const high = galaxyHighestOpen();
+    const sectors = [];
+    for (const s of galaxyStructure.sectors) {
+        const entry = { id: s.id, systems: s.systems, opened: s.opened, maxPlanets: galaxyMaxPlanets(s.id) };
+        if (s.opened && s.id >= high - 1) entry.capacity = await galaxyStartCapacity(s.id);
+        sectors.push(entry);
+    }
+    return { highestOpen: high, config: cfg, sectors, version: galaxyStructure.version };
+}
+
+app.get('/admin/galaxy/state', async (req, res) => {
+    if (await galaxyAdminOnly(req, res) === null) return;
+    try { res.json(Object.assign({ success: true }, await galaxyAdminState())); }
+    catch (error) { console.error('[Galaxie] admin state Fehler:', error.message); res.status(500).json({ success: false, error: 'Zustand nicht verfuegbar.' }); }
+});
+
+app.post('/admin/galaxy/plan', async (req, res) => {
+    if (await galaxyAdminOnly(req, res) === null) return;
+    try {
+        await galaxySavePlan(req.body && req.body.sectors);
+        res.json(Object.assign({ success: true }, await galaxyAdminState()));
+    } catch (error) { res.status(400).json({ success: false, error: error.message }); }
+});
+
+app.post('/admin/galaxy/open', async (req, res) => {
+    if (await galaxyAdminOnly(req, res) === null) return;
+    try {
+        const opened = await galaxyOpenSectors(req.body && req.body.count, 'Admin');
+        res.json(Object.assign({ success: true, opened }, await galaxyAdminState()));
+    } catch (error) { console.error('[Galaxie] admin open Fehler:', error.message); res.status(500).json({ success: false, error: 'Eroeffnung fehlgeschlagen.' }); }
+});
+
+app.post('/admin/galaxy/config', async (req, res) => {
+    if (await galaxyAdminOnly(req, res) === null) return;
+    try {
+        await galaxySetConfig(req.body || {});
+        res.json(Object.assign({ success: true }, await galaxyAdminState()));
+    } catch (error) { res.status(400).json({ success: false, error: error.message }); }
+});
+
+app.post('/admin/galaxy/text', async (req, res) => {
+    const adminId = await galaxyAdminOnly(req, res);
+    if (adminId === null) return;
+    try {
+        const saved = await galaxySaveText(req.body && req.body.key, req.body && req.body.text, adminId);
+        res.json({ success: true, saved, texts: await galaxyListTexts() });
+    } catch (error) { res.status(400).json({ success: false, error: error.message }); }
 });
 
 // #####################################################################
