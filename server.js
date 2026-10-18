@@ -9098,6 +9098,9 @@ async function galaxyListTexts() {
     for (const row of r.rows) out[row.key] = row.text;
     return out;
 }
+// Unity (JsonUtility) kann keine Objekte mit beliebigen Schluesseln lesen -> zusaetzlich als Liste [{key, text}]
+function galaxyTextItems(map) { return Object.keys(map).map(key => ({ key, text: map[key] })); }
+
 async function galaxySaveText(key, text, adminId) {
     if (typeof key !== 'string' || !GALAXY_TEXT_KEY.test(key)) throw new Error('Ungueltiger Textschluessel.');
     const clean = sanitizeRichText(text).trim();
@@ -9124,7 +9127,8 @@ app.get('/galaxy/structure', async (req, res) => {
 
 app.get('/galaxy/texts', async (req, res) => {
     try {
-        res.json({ success: true, texts: await galaxyListTexts() });
+        const texts = await galaxyListTexts();
+        res.json({ success: true, texts, items: galaxyTextItems(texts) });
     } catch (error) {
         console.error('[Galaxie] texts Fehler:', error.message);
         res.status(500).json({ success: false, error: 'Texte nicht verfuegbar.' });
@@ -9195,7 +9199,8 @@ app.post('/admin/galaxy/text', async (req, res) => {
     if (adminId === null) return;
     try {
         const saved = await galaxySaveText(req.body && req.body.key, req.body && req.body.text, adminId);
-        res.json({ success: true, saved, texts: await galaxyListTexts() });
+        const texts = await galaxyListTexts();
+        res.json({ success: true, saved, texts, items: galaxyTextItems(texts) });
     } catch (error) { res.status(400).json({ success: false, error: error.message }); }
 });
 
