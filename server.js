@@ -54,6 +54,7 @@
 //  §25  KAMPF V2 (Rundenkampf, Mischbonus, Zivile in letzter Reihe): steht VOR §21; aktiv nur bei COMBAT_ENGINE=shadow|v2
 //  §26  GALAXIE-REGISTER (planet_registry): serverautoritative Belegung, Schritt 1 (nur lesen/befuellen); steht VOR §21
 //  §28  INVENTAR (PlayFab Internal Data "inventory"): Kisten (Rohstoffe Ress01-10, Schiffe), Oeffnen, Admin-Vergabe "#inv"; steht VOR §21
+//  §33  STATIONIEREN + gemeinsames Verteidigen (stationed_fleets, /fleets/stationed, Kampf mit mehreren Teilnehmern); steht VOR §21
 //  §32  TERRAFORMING (Wartezeit, Abschluss, Abbruch durch Spieler/Angreifer, /planet/terraform-complete|abort); steht VOR §21
 //  §31  KOLONISATIONS-REGELN (Verwaltung/Habitat/Kosten, Pruefung in /planet/claim und beim Forschungs-Abschluss); steht VOR §21
 //  §30  GALAXIE-STRUKTUR (galaxy_sectors/galaxy_config/galaxy_texts): Sektoren + Systemzahl, Auto-Eroeffnung je 2 Sektoren, Texte, Admin /admin/galaxy/*; steht VOR §21
@@ -1169,6 +1170,23 @@ async function initDatabase() {
         await pool.query(`CREATE INDEX IF NOT EXISTS idx_planet_registry_owner ON planet_registry (owner_commander_id);`);
         // NEU 18.10.2026 (§32): Terraforming - bis wann der Planet noch terraformt (NULL = fertig/normal)
         await pool.query(`ALTER TABLE planet_registry ADD COLUMN IF NOT EXISTS terraform_until TIMESTAMPTZ NULL;`);
+        // NEU 18.10.2026 (§33): stationierte Flotten (Besitzer, Gastgeber-Planet, Flotte als JSON). Steht in DB_EXPORT_TABLES.
+        await pool.query(`
+            CREATE TABLE IF NOT EXISTS stationed_fleets (
+                fleet_id TEXT PRIMARY KEY,
+                owner_commander_id INTEGER NOT NULL,
+                owner_playfab_id TEXT NOT NULL,
+                owner_name TEXT NOT NULL DEFAULT '',
+                host_commander_id INTEGER NOT NULL,
+                host_name TEXT NOT NULL DEFAULT '',
+                host_coord TEXT NOT NULL,
+                origin_coord TEXT NOT NULL DEFAULT '',
+                fleet JSONB NOT NULL,
+                stationed_at TIMESTAMPTZ NOT NULL DEFAULT now()
+            );
+        `);
+        await pool.query(`CREATE INDEX IF NOT EXISTS idx_stationed_host ON stationed_fleets (host_coord);`);
+        await pool.query(`CREATE INDEX IF NOT EXISTS idx_stationed_owner ON stationed_fleets (owner_commander_id);`);
         await pool.query(`CREATE TABLE IF NOT EXISTS planet_freed (id SERIAL PRIMARY KEY, coord TEXT NOT NULL, freed_at TIMESTAMPTZ NOT NULL DEFAULT now());`);
         await pool.query(`CREATE INDEX IF NOT EXISTS idx_planet_freed_time ON planet_freed (freed_at);`);
 
@@ -4330,7 +4348,7 @@ const DB_EXPORT_TABLES = ['alliances', 'alliance_ranks', 'alliance_members', 'al
     'alliance_relationships', 'player_relationships', 'commander_highscore', 'legal_texts', 'dev_todos', 'announcements', 'virgodom_messages',
     'support_messages', 'player_reports', 'shop_items', 'promo_codes', 'promo_redemptions', 'giftbox_claims', 'giftbox_golden_claims',
     'market_offers', 'transport_deliveries', 'planet_registry', 'combat_reports', 'attack_traces', 'processed_fleets',
-    'galaxy_sectors', 'galaxy_config', 'galaxy_texts'];
+    'galaxy_sectors', 'galaxy_config', 'galaxy_texts', 'stationed_fleets'];
 app.get('/admin/db-export', async (req, res) => {
     if (process.env.DB_EXPORT_ENABLED !== 'true') return res.status(404).json({ success: false, error: 'Nicht verfuegbar.' });
     if (!adminKeyOk(req.query.key)) return res.status(403).json({ success: false, error: 'Nicht autorisiert' });
@@ -4675,6 +4693,7 @@ function classifyFleetMission(mission) {
     const m = typeof mission === 'string' ? mission.toLowerCase() : mission;
     if (m === 3 || m === 'attack') return 'combat';
     if (m === 10 || m === 'return') return 'return';
+    if (m === 6 || m === 'stationing') return 'stationing';   // NEU 18.10.2026 (§33)
     if (m === undefined || m === null || m === 0 || m === 1 || m === 2 || m === 4 ||
         m === 'transfer' || m === 'transport' || m === 'verladen' || m === 'colonize' || m === 'colonization')
         return 'client';
@@ -4796,6 +4815,10 @@ async function serverTickHandler(req, res) {
                             if (returnFleet) returnFleets.push(returnFleet);
                         } else if (missionKind === 'return') {
                             await processReturn(playFabId, commander, fleet, log);
+                        } else if (missionKind === 'stationing') {
+                            // NEU 18.10.2026 (§33): Flotte wird beim Gastgeber stationiert (oder kehrt heim, wenn das nicht geht)
+                            const homeFleet = await processStationingArrival(playFabId, commander, fleet, now);
+                            if (homeFleet) returnFleets.push(homeFleet);
                         } else {
                             // Mission noch nicht verfuegbar (Stationieren/Spionage/Invasion/Sprengung):
                             // Flotte mit Fracht zurueckschicken statt sie zu loeschen.
@@ -5655,7 +5678,7 @@ async function getPlanetOwnerInfo(coord) {
 // =========================================================
 async function resolveCombat(attackerPlayFabId, attackerCommander, attackerFleet, now, log = []) {
     const destCoord = attackerFleet.destinationCoord;
-    const ownerInfo = await getPlanetOwnerInfo(destCoord);
+    let ownerInfo = await getPlanetOwnerInfo(destCoord);
 
     // NEU: Angriffs-Akte — Kampfbeginn vermerken
     await upsertAttackTrace(attackerFleet.fleetId, { combat_started_at: now });
@@ -5685,6 +5708,31 @@ async function resolveCombat(attackerPlayFabId, attackerCommander, attackerFleet
             if (defData.Data?.[defenderPlanetKey]) defenderPlanet = JSON.parse(defData.Data[defenderPlanetKey].Value);
         } catch (e) {
             log.push(`Verteidiger-Daten nicht lesbar: ${e.message}`);
+        }
+    }
+
+    // NEU 18.10.2026 (§33): Der Verteidiger wird notfalls ueber das Register + Highscore gefunden (die oeffentlichen Systemdaten haben nicht immer 'pfid';
+    // das betraf z.B. frisch besiedelte/terraformende Planeten). Ohne das haette der Angreifer ins Leere geschossen.
+    if (!defenderPfid) {
+        try {
+            const reg = await pool.query('SELECT owner_commander_id, kind, owner_name, planet_name FROM planet_registry WHERE coord = $1', [destCoord]);
+            const row = reg.rows[0];
+            if (row && row.kind === 'player' && row.owner_commander_id >= 1000000) {
+                const info = await stationedLookupCommander(row.owner_commander_id);
+                if (info) {
+                    const key = `planet_${destCoord.replace(/:/g, '_')}`;
+                    const defData = await playfabServer('/Server/GetUserData', { PlayFabId: info.playFabId, Keys: ['commander_data', key] });
+                    if (defData.Data?.['commander_data'] && defData.Data?.[key]) {
+                        defenderPfid = info.playFabId;
+                        defenderPlanetKey = key;
+                        defenderCommander = JSON.parse(defData.Data['commander_data'].Value);
+                        defenderPlanet = JSON.parse(defData.Data[key].Value);
+                        ownerInfo = { ownerCommanderId: row.owner_commander_id, ownerName: row.owner_name, planetName: row.planet_name || '', pfid: info.playFabId, hqLevel: 0 };
+                    }
+                }
+            }
+        } catch (e) {
+            log.push(`Verteidiger ueber Register nicht lesbar: ${e.message}`);
         }
     }
 
@@ -5827,15 +5875,36 @@ async function resolveCombat(attackerPlayFabId, attackerCommander, attackerFleet
     const combatEngine = getCombatEngineMode();
     let v2Result = null;
     let useV2 = false;
+    let stationed = null;          // NEU 18.10.2026 (§33): stationierte Flotten auf diesem Planeten
+    let phaseA = null;             // Kampf gegen fremde stationierte Flotten (zuerst)
+    let skipPhaseB = false;        // Angreifer hat Phase A nicht gewonnen: der Planet selbst wird nicht angegriffen
     if (combatEngine !== 'v1') {
         try {
             const v2Seed = Math.floor(Math.random() * 2147483646) + 1;
-            v2Result = runCombatV2({
-                attacker: { warships: attackerFleet.warships, ships: attackerShipsBefore,
-                            research: v2ResearchOf(attackerCommander), retreatLossPercent: attackerFleet.retreatLossPercent },
-                defender: { warships: defWarships, ships: defShips, research: v2ResearchOf(defenderCommander) },
-                seed: v2Seed
-            });
+            // §33: stationierte Flotten nur mit der v2-Engine (im Schattenmodus bleibt alles beim Alten)
+            if (combatEngine === 'v2' && defenderCommander && ownerInfo && ownerInfo.ownerCommanderId >= 1000000) {
+                try { stationed = await stationedPrepareCombat(destCoord, ownerInfo.ownerCommanderId); }
+                catch (e) { stationed = null; log.push(`Stationierte Flotten nicht lesbar: ${e.message}`); }
+            }
+            let attSpec = { warships: attackerFleet.warships, ships: attackerShipsBefore, research: v2ResearchOf(attackerCommander), retreatLossPercent: attackerFleet.retreatLossPercent };
+            if (stationed && stationed.foreign.length > 0) {
+                phaseA = runCombatV2({ attacker: attSpec, defender: { parts: stationed.foreign.map(stationedPartSpec) }, seed: v2Seed });
+                attSpec = Object.assign({}, attSpec, { warships: phaseA.attacker.warships, ships: phaseA.attacker.ships });
+                skipPhaseB = phaseA.outcome !== 'win';
+            }
+            if (!skipPhaseB) {
+                const hostSpec = { warships: defWarships, ships: defShips, research: v2ResearchOf(defenderCommander), tag: '' };
+                v2Result = runCombatV2({
+                    attacker: attSpec,
+                    defender: stationed && stationed.allied.length > 0 ? { parts: [hostSpec].concat(stationed.allied.map(stationedPartSpec)) } : hostSpec,
+                    seed: phaseA ? v2Seed + 1 : v2Seed
+                });
+            } else {
+                // Der Planet wurde nicht erreicht: Ergebnis = Ausgang von Phase A, der Planetenbesitzer bleibt unberuehrt
+                v2Result = { outcome: phaseA.outcome === 'win' ? 'lose' : phaseA.outcome, rounds: phaseA.rounds, roundLog: [], startState: phaseA.startState,
+                    attacker: phaseA.attacker, defender: { warships: defWarships.slice(0, 10), ships: defShips.slice(0, 6) }, defenderParts: null,
+                    attackerBonusPercent: phaseA.attackerBonusPercent, defenderBonusPercent: v2Round1(v2MixBonus(defWarships) * 100), retreated: phaseA.retreated, seed: phaseA.seed };
+            }
             const v1Text = attackerWins ? 'Angreifer siegt' : 'Verteidiger siegt';
             const v2Line = `[Kampf ${combatEngine}] ${attackerFleet.fleetId} | ${v2Summary(v2Result)} | v1: ${v1Text}`;
             log.push(v2Line);
@@ -5866,6 +5935,29 @@ async function resolveCombat(attackerPlayFabId, attackerCommander, attackerFleet
         report.combatSeed        = v2Result.seed;
         report.rounds            = v2Result.roundLog;
         report.roundsStart       = { round: 0, att: v2Result.startState.att, def: v2Result.startState.def, events: [] };
+
+        // NEU 18.10.2026 (§33): Ergebnisse der stationierten Teilnehmer, ein gemeinsamer Rundenverlauf
+        const cut = a => (a || []);
+        if (stationed) {
+            stationed.foreign.forEach((p, k) => {
+                const dp = phaseA && phaseA.defenderParts ? phaseA.defenderParts[k] : null;
+                if (dp) { p.after = { w: cut(dp.warships).slice(0, 10), s: cut(dp.ships).slice(0, 6) }; p.bonusPercent = dp.bonusPercent; }
+            });
+            stationed.allied.forEach((p, k) => {
+                const dp = !skipPhaseB && v2Result.defenderParts ? v2Result.defenderParts[k + 1] : null;
+                if (dp) { p.after = { w: cut(dp.warships).slice(0, 10), s: cut(dp.ships).slice(0, 6) }; p.bonusPercent = dp.bonusPercent; }
+            });
+        }
+        if (phaseA) {
+            const offset = phaseA.roundLog.length;
+            const bRounds = skipPhaseB ? [] : v2Result.roundLog.map(r => Object.assign({}, r, { round: r.round + offset }));
+            if (phaseA.roundLog.length > 0) phaseA.roundLog[0].events.unshift('Phase 1: Kampf gegen fremde stationierte Flotten (sie kämpfen allein und zuerst)');   // LOCALIZE
+            if (bRounds.length > 0) bRounds[0].events.unshift('Phase 2: Kampf gegen den Planetenbesitzer' + (stationed.allied.length > 0 ? ' und seine Verbündeten' : ''));   // LOCALIZE
+            report.roundsStart = { round: 0, att: phaseA.startState.att, def: phaseA.startState.def, events: [] };
+            report.rounds = phaseA.roundLog.concat(bRounds);
+        } else if (stationed && stationed.allied.length > 0 && report.rounds.length > 0) {
+            report.rounds[0].events.unshift('Der Planetenbesitzer kämpft gemeinsam mit verbündeten stationierten Flotten');   // LOCALIZE
+        }
     }
 
     const attackerParticipant = buildParticipant(attackerCommander, attackerFleet.fleetId, true, false, false,
@@ -5881,6 +5973,7 @@ async function resolveCombat(attackerPlayFabId, attackerCommander, attackerFleet
     defenderParticipant.commanderName = report.planetOwnerName;
     report.defenders.push(defenderParticipant);
     report.totalDefenderShips += defenderParticipant.totalShipsBefore;
+    if (useV2 && stationed) stationedAddParticipants(report, stationed);   // NEU 18.10.2026 (§33): stationierte Teilnehmer
 
     // PHASE 6: Beute (nur bei Angreifer-Sieg, nur wenn Verteidiger-Planet bekannt)
     let lootedRessources = [0,0,0,0,0];
@@ -5920,7 +6013,7 @@ async function resolveCombat(attackerPlayFabId, attackerCommander, attackerFleet
         for (let i = 0; i < 10; i++) {
             const lostAttacker = Math.max(0, (attackerFleet.warships[i] || 0) - attackerAfterWarships[i]);
             const lostDefender = Math.max(0, (defWarships[i] || 0) - defenderAfterWarships[i]);
-            const lost = lostAttacker + lostDefender;
+            const lost = lostAttacker + lostDefender + (useV2 && stationed ? stationedLostWarships(stationed, i) : 0);   // §33: auch die Verluste stationierter Gaeste hinterlassen Truemmer
             if (lost <= 0) continue;
             const buildCost = SHIP_BUILD_COST[i] || 1000;
             totalRecycled += Math.floor(lost * buildCost * recyclingBonus);
@@ -5960,11 +6053,14 @@ async function resolveCombat(attackerPlayFabId, attackerCommander, attackerFleet
         }
     }
 
+    if (useV2 && stationed) stationedRepair(stationed);      // NEU 18.10.2026 (§33): Reparatur je Gast mit seiner Forschung
+
     // Verluste nach Reparatur neu berechnen (für korrekte Anzeige im Bericht)
     recalcParticipantLosses(attackerParticipant, attackerFleet.warships, attackerShipsBefore, attackerAfterWarships, attackerAfterShips);
     recalcParticipantLosses(defenderParticipant, defWarships, defShips, defenderAfterWarships, defenderAfterShips);
     report.totalAttackerLosses = attackerParticipant.totalLosses;
     report.totalDefenderLosses = defenderParticipant.totalLosses;
+    if (useV2 && stationed) stationedRecalc(report, stationed);
 
     // PHASE 9: Erfahrung (Ress05)
     const attackerExp = 10 + (attackerWins ? 10 : 0);
@@ -6026,7 +6122,7 @@ async function resolveCombat(attackerPlayFabId, attackerCommander, attackerFleet
         }
 
         if (defenderCommander) {
-            await sendCombatMail(defenderCommander, report, false);
+            await sendCombatMail(defenderCommander, report, false, defenderParticipant, true);
             try {
                 await playfabServer('/Server/UpdateUserData', {
                     PlayFabId: defenderPfid,
@@ -6043,6 +6139,7 @@ async function resolveCombat(attackerPlayFabId, attackerCommander, attackerFleet
     // unabhängig von Mails/PlayFab) + Angreifer-Mail
     await saveReportToDatabase(report);
     await sendCombatMail(attackerCommander, report, true);
+    if (useV2 && stationed) await stationedFinalize(stationed, report, now, log);   // NEU 18.10.2026 (§33): Gaeste speichern + Bericht an alle Beteiligten
 
     log.push(`Kampf: ${attackerFleet.fleetId} | ${attackerWins ? 'Angreifer siegt' : 'Verteidiger siegt'} | Verluste ${report.totalAttackerLosses}/${report.totalDefenderLosses}`);
 
@@ -6098,10 +6195,11 @@ function buildReturnFleet(fleet, now, warshipsRemaining, lootRessources) {
 
 // Kampfbericht-Mail — trägt jetzt NUR NOCH die reportId als Verweis,
 // nicht mehr den kompletten Bericht (der lebt jetzt dauerhaft in der DB).
-async function sendCombatMail(commander, report, isAttackerMail) {
+async function sendCombatMail(commander, report, isAttackerMail, participant, isPlanetOwner) {
     if (!commander) return;
     const victory      = isAttackerMail ? report.attackerWins : !report.attackerWins;
-    const ownLosses     = isAttackerMail ? report.totalAttackerLosses : report.totalDefenderLosses;
+    // NEU 18.10.2026 (§33): bei mehreren Teilnehmern zaehlen die EIGENEN Verluste des Empfaengers
+    const ownLosses     = participant ? participant.totalLosses : (isAttackerMail ? report.totalAttackerLosses : report.totalDefenderLosses);
     const enemyLosses   = isAttackerMail ? report.totalDefenderLosses : report.totalAttackerLosses;
     const subject = `Kampfbericht: ${report.planetCoord}`;
 
@@ -6110,6 +6208,7 @@ async function sendCombatMail(commander, report, isAttackerMail) {
         body = `Das planetare Schild hat gehalten. Wir mussten uns zurückziehen.`;
     } else {
         body = `${victory ? 'Sieg' : 'Niederlage'} bei ${report.planetCoord}.\nEigene Verluste: ${ownLosses}\nFeindliche Verluste: ${enemyLosses}`;
+        if (isPlanetOwner) { const debris = stationedRecyclingText(report); if (debris) body += '\n' + debris; }   // NEU 18.10.2026 (§33): Truemmer auf dem Planeten
         if (report.terraformAborted)     // NEU 18.10.2026 (§32)
             body += isAttackerMail
                 ? '\nDas Terraforming des Gegners wurde vereitelt - der Planet ist wieder frei.'                       // LOCALIZE
@@ -6248,6 +6347,8 @@ async function processFleetArrival(playFabId, commander, fleet, now) {
         await processReturn(playFabId, commander, fleet, []);
         return null;
     }
+    if (mission === 6 || mission === 'Stationing')       // NEU 18.10.2026 (§33)
+        return await processStationingArrival(playFabId, commander, fleet, now);
     return null;
 }
 // #####################################################################
@@ -6995,7 +7096,8 @@ function v2Num(x, max) {
     return Math.min(n, max);
 }
 
-function v2BuildSide(spec, isAttacker, mix) {
+function v2BuildSide(spec, isAttacker, mix, tag) {
+    tag = tag || '';
     const res = spec.research || {};
     const rw = res.w || [0, 0, 0];
     const rs = res.s || [0, 0, 0];
@@ -7008,7 +7110,7 @@ function v2BuildSide(spec, isAttacker, mix) {
         if (n <= 0) continue;
         totalShips += n;
         const st = V2_WARSHIPS[i];
-        const g = { id: st.id, kind: 'war', idx: i, carrier: st.carrier, active: true, n0: n, w: [0, 0, 0], s: [0, 0, 0], hp0: 0, list: [] };
+        const g = { id: st.id + tag, kind: 'war', idx: i, carrier: st.carrier, active: true, n0: n, w: [0, 0, 0], s: [0, 0, 0], hp0: 0, list: [] };
         for (let k = 0; k < 3; k++) {
             g.w[k] = st.w[k] * (1 + 0.01 * v2Num(rw[k], 1000)) * (isAttacker ? 1 + mix : 1);
             g.s[k] = st.s[k] * (1 + 0.01 * v2Num(rs[k], 1000));
@@ -7021,10 +7123,24 @@ function v2BuildSide(spec, isAttacker, mix) {
         const n = Math.floor(v2Num((spec.ships || [])[i], 1e9));
         if (n <= 0) continue;
         totalShips += n;
-        groups.push({ id: 'Ship0' + i, kind: 'civil', idx: i, carrier: false, active: false, n0: n, w: [0, 0, 0], s: [0, 0, 0], hp0: COMBAT_V2.civilHp, list: [] });
+        groups.push({ id: 'Ship0' + i + tag, kind: 'civil', idx: i, carrier: false, active: false, n0: n, w: [0, 0, 0], s: [0, 0, 0], hp0: COMBAT_V2.civilHp, list: [] });
     }
     if (totalShips > COMBAT_V2.maxShipsPerSide) throw new Error('Kampf v2: zu viele Schiffe (' + totalShips + ')');
     for (const g of groups) for (let j = 0; j < g.n0; j++) g.list.push({ hp: g.hp0 });
+    return { groups, warHp0, civilActive: false };
+}
+
+// NEU 18.10.2026 (§33 Stationieren): Seite aus mehreren Teilnehmern. parts = [{ warships, ships, research, tag }]. Jeder Teilnehmer bekommt SEINE
+// Forschung und SEINEN Mischbonus; die Gruppen tragen den Zusatz tag (z. B. "·Anna"), damit der Bericht sie unterscheiden kann.
+function v2BuildSideParts(parts, isAttacker) {
+    const groups = [];
+    let warHp0 = 0, total = 0;
+    parts.forEach((p, idx) => {
+        const one = v2BuildSide(p, isAttacker, v2MixBonus(p.warships), p.tag || '');
+        for (const g of one.groups) { g.part = idx; groups.push(g); total += g.n0; }
+        warHp0 += one.warHp0;
+    });
+    if (total > COMBAT_V2.maxShipsPerSide) throw new Error('Kampf v2: zu viele Schiffe (' + total + ')');
     return { groups, warHp0, civilActive: false };
 }
 
@@ -7222,10 +7338,11 @@ function runCombatV2(input) {
     const rng = v2Rng(input.seed);
     const attSpec = input.attacker || {};
     const defSpec = input.defender || {};
+    const defParts = Array.isArray(defSpec.parts) && defSpec.parts.length > 0 ? defSpec.parts : null;
     const attMix = v2MixBonus(attSpec.warships);
-    const defMix = v2MixBonus(defSpec.warships);
+    const defMix = v2MixBonus(defParts ? defParts[0].warships : defSpec.warships);   // Bonus der Anzeige: der erste Teilnehmer (Planetenbesitzer)
     const att = v2BuildSide(attSpec, true, attMix);
-    const def = v2BuildSide(defSpec, false, defMix);
+    const def = defParts ? v2BuildSideParts(defParts, false) : v2BuildSide(defSpec, false, defMix);
     const retreatPct = Math.min(100, v2Num(attSpec.retreatLossPercent, 100));
 
     // Zivile treten sofort ein, wenn die Seite gar keine Kriegsschiffe hat
@@ -7285,13 +7402,28 @@ function runCombatV2(input) {
         return { warships: war, ships: civ };
     };
 
+    // Ueberlebende je Teilnehmer der Verteidiger-Seite (nur bei parts)
+    let defenderParts = null;
+    if (defParts) {
+        defenderParts = defParts.map((p, idx) => {
+            const war = Array.from({ length: 10 }, (_, i) => Math.max(0, Math.floor(Number((p.warships || [])[i]) || 0)));
+            const civ = Array.from({ length: 6 }, (_, i) => Math.max(0, Math.floor(Number((p.ships || [])[i]) || 0)));
+            for (const g of def.groups) {
+                if (g.part !== idx) continue;
+                if (g.kind === 'war') war[g.idx] = g.list.length; else civ[g.idx] = g.list.length;
+            }
+            return { warships: war, ships: civ, bonusPercent: v2Round1(v2MixBonus(p.warships) * 100) };
+        });
+    }
+
     return {
         outcome,
         rounds: roundLog.length,
         roundLog,
         startState,
         attacker: survivors(attSpec, att),
-        defender: survivors(defSpec, def),
+        defender: defenderParts ? { warships: defenderParts[0].warships, ships: defenderParts[0].ships } : survivors(defSpec, def),
+        defenderParts,
         attackerBonusPercent: v2Round1(attMix * 100),
         defenderBonusPercent: v2Round1(defMix * 100),
         retreated,
@@ -9532,6 +9664,301 @@ app.post('/planet/terraform-abort', async (req, res) => {
         res.status(500).json({ success: false, error: 'Abbruch gerade nicht möglich.' });
     }
 });
+
+// #####################################################################
+// §33  STATIONIEREN UND GEMEINSAMES VERTEIDIGEN — NEU 18.10.2026
+//      Eine stationierte Flotte gehoert weiter ihrem Besitzer, steht aber auf dem Planeten eines anderen Commanders (Gastgeber).
+//      Sie liegt in der Tabelle stationed_fleets (nicht in den Spielerdaten), damit der Server sie beim Kampf sofort findet.
+//      Kampf (resolveCombat, nur COMBAT_ENGINE=v2):
+//        1. Fremde Gaeste (weder befreundet noch verbuendet mit dem Gastgeber) kaempfen ALLEIN gegen den Angreifer, und zwar ZUERST.
+//           Wird diese Gruppe nicht besiegt, ist der Kampf zu Ende - der Planet wird nicht angegriffen.
+//        2. Danach kaempft der Angreifer (mit seinen Ueberlebenden) gegen den Planetenbesitzer UND die befreundeten/verbuendeten Gaeste gemeinsam.
+//        Jeder Teilnehmer wird einzeln gerechnet (eigene Forschung, eigener Flottenbonus, eigene Verluste und Reparatur); EIN Bericht, alle bekommen die Mail.
+//        Truemmer (Recycling) landen wie bisher auf dem Planeten des Gastgebers; die Mail an ihn nennt sie.
+//      Befreundet/verbuendet = persoenliche Freundschaft, gleiche Allianz oder verbuendete Allianzen (isAuthorizedToViewCommanderData).
+// #####################################################################
+
+const STATIONED_MAX_PER_PLANET = 10;
+const STATIONED_RESOURCE_NAMES = ['Energie', 'Wasserstoff', 'Metalle', 'Werkzeuge', 'Credits'];
+
+async function stationedLookupCommander(commanderId) {
+    const r = await pool.query('SELECT playfab_id, commander_name FROM commander_highscore WHERE commander_id = $1', [commanderId]);
+    if (r.rows.length === 0 || !r.rows[0].playfab_id) return null;
+    return { playFabId: String(r.rows[0].playfab_id), name: r.rows[0].commander_name || '' };
+}
+
+async function stationedLoadCommanderData(playFabId) {
+    const res = await playfabServer('/Server/GetUserData', { PlayFabId: playFabId, Keys: ['commander_data'] });
+    return res && res.Data && res.Data.commander_data ? JSON.parse(res.Data.commander_data.Value) : null;
+}
+
+async function stationedSaveCommanderData(playFabId, commander) {
+    await playfabServer('/Server/UpdateUserData', { PlayFabId: playFabId, Data: { commander_data: JSON.stringify(commander) }, Permission: 'Private' });
+}
+
+// Mail an einen ANDEREN Commander (laedt und speichert seine Daten)
+async function stationedMailTo(commanderId, subject, body, category) {
+    try {
+        const info = await stationedLookupCommander(commanderId);
+        if (!info) return;
+        const commander = await stationedLoadCommanderData(info.playFabId);
+        if (!commander) return;
+        await sendMail(commander, subject, body, category || 1);
+        await stationedSaveCommanderData(info.playFabId, commander);
+    } catch (e) { console.error('[Stationieren] Mail an', commanderId, 'fehlgeschlagen:', e.message); }
+}
+
+function stationedTotal(fleet) { return sumArray(fleet.warships) + sumArray(fleet.ships); }
+
+// Rueckflug einer stationierten Flotte zu ihrem Besitzer: Ziel ist der Herkunftsplanet, sonst der naechste eigene. Aendert ownerCommander (Speichern macht der Aufrufer).
+function stationedBuildHomeFleet(ownerCommander, fromCoord, originCoord, fleet, warships, ships, ressources, now) {
+    let dest = (ownerCommander.colonies || []).includes(originCoord) ? originCoord : terraformNearestOwn(ownerCommander, fromCoord);
+    if (!dest) return null;
+    const flight = calculateFlightTime(fromCoord, dest, fleet.engineLevel || 1, fleet.fuelFactor || 1);
+    if (typeof ownerCommander.nextFleetCounter !== 'number') ownerCommander.nextFleetCounter = 1;
+    const home = {
+        fleetId: `${fleet.fleetId}-H${ownerCommander.nextFleetCounter++}`,
+        commanderId: ownerCommander.commanderId, commanderName: ownerCommander.visibleName,
+        originCoord: fromCoord, destinationCoord: dest,
+        departureUtc: now.toISOString(), arrivalUtc: new Date(now.getTime() + flight * 1000).toISOString(),
+        mission: 10, warships, ships, ressources: ressources || [0, 0, 0, 0, 0],
+        isReturnFlight: true, hasArrived: false, engineLevel: fleet.engineLevel || 1, fuelFactor: fleet.fuelFactor || 1
+    };
+    if (!Array.isArray(ownerCommander.activeFleets)) ownerCommander.activeFleets = [];
+    ownerCommander.activeFleets.push(home);
+    return home;
+}
+
+// ---- Ankunft einer Stationierungs-Flotte (Tick und /processFleet) ----
+// Rueckgabe: Rueckflug-Flotte (wenn die Stationierung nicht moeglich ist) oder null (stationiert). Aendert commander (Mail), Speichern macht der Aufrufer.
+async function processStationingArrival(playFabId, commander, fleet, now) {
+    let reason = null, hostRow = null;
+    try {
+        const r = await pool.query('SELECT owner_commander_id, kind, owner_name FROM planet_registry WHERE coord = $1', [fleet.destinationCoord]);
+        hostRow = r.rows[0] || null;
+        if (!hostRow || hostRow.kind !== 'player') reason = 'Das Ziel ist kein bewohnter Spielerplanet.';
+        else if (hostRow.owner_commander_id === commander.commanderId) reason = 'Auf eigenen Planeten werden Flotten verlegt, nicht stationiert.';
+        else {
+            const c = await pool.query('SELECT COUNT(*)::int AS n FROM stationed_fleets WHERE host_coord = $1', [fleet.destinationCoord]);
+            if (c.rows[0].n >= STATIONED_MAX_PER_PLANET) reason = `Bei diesem Planeten sind schon ${STATIONED_MAX_PER_PLANET} Flotten stationiert.`;
+        }
+    } catch (e) {
+        console.error('[Stationieren] Pruefung fehlgeschlagen:', e.message);
+        throw e;           // Flotte bleibt liegen, naechster Versuch (wie bei Rueckflug-Fehlern)
+    }
+
+    if (reason) {
+        await sendMail(commander, 'Stationierung nicht möglich', `Flotte ${fleet.fleetId}: ${reason} Die Flotte kehrt nach ${fleet.originCoord} zurück.`, 1); // LOCALIZE
+        return buildReturnFleet(fleet, now, fleet.warships, fleet.ressources);
+    }
+
+    const stored = Object.assign({}, fleet, { hasArrived: true });
+    const ins = await pool.query(
+        `INSERT INTO stationed_fleets (fleet_id, owner_commander_id, owner_playfab_id, owner_name, host_commander_id, host_name, host_coord, origin_coord, fleet)
+         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9::jsonb) ON CONFLICT (fleet_id) DO NOTHING RETURNING fleet_id`,
+        [fleet.fleetId, commander.commanderId, playFabId, commander.visibleName || '', hostRow.owner_commander_id, hostRow.owner_name || '',
+         fleet.destinationCoord, fleet.originCoord, JSON.stringify(stored)]);
+    if (ins.rows.length === 0) return null;     // schon verbucht (doppelte Verarbeitung)
+
+    let friendly = false;
+    try { friendly = await isAuthorizedToViewCommanderData(hostRow.owner_commander_id, commander.commanderId); } catch (e) { /* neutral */ }
+    await sendMail(commander, 'Flotte stationiert', // LOCALIZE
+        `Deine Flotte ${fleet.fleetId} ist bei ${fleet.destinationCoord} (${hostRow.owner_name}) stationiert. ` +
+        (friendly ? 'Als Freund/Verbündeter kämpft sie gemeinsam mit dem Planetenbesitzer, wenn der Planet angegriffen wird.'
+                  : 'Sie kämpft bei einem Angriff allein und zuerst. Du kannst sie jederzeit im Dashboard abziehen.'), 1);
+    await stationedMailTo(hostRow.owner_commander_id, 'Fremde Flotte stationiert', // LOCALIZE
+        `${commander.visibleName} hat eine Flotte (${stationedTotal(fleet)} Schiffe) bei ${fleet.destinationCoord} stationiert. ` +
+        (friendly ? 'Ihr seid befreundet/verbündet: sie verteidigt den Planeten gemeinsam mit dir.'
+                  : 'Ihr seid nicht befreundet: sie kämpft bei einem Angriff allein und zuerst. Du kannst sie im Dashboard ausweisen.'), 1);
+    return null;
+}
+
+// ---- Abziehen (Besitzer) und Ausweisen (Gastgeber) ----
+async function stationedEnd(fleetId, byOwnerId, byHostId, now) {
+    const del = await pool.query(
+        `DELETE FROM stationed_fleets WHERE fleet_id = $1 AND (owner_commander_id = $2 OR host_commander_id = $3) RETURNING *`,
+        [fleetId, byOwnerId || 0, byHostId || 0]);
+    if (del.rows.length === 0) return { status: 404, body: { success: false, error: 'Diese stationierte Flotte gibt es nicht (mehr).' } };
+    const row = del.rows[0];
+    const fleet = typeof row.fleet === 'string' ? JSON.parse(row.fleet) : row.fleet;
+
+    const owner = await stationedLoadCommanderData(row.owner_playfab_id);
+    if (!owner) return { status: 500, body: { success: false, error: 'Besitzer-Daten nicht lesbar.' } };
+    const home = stationedBuildHomeFleet(owner, row.host_coord, row.origin_coord, fleet, fleet.warships || new Array(10).fill(0), fleet.ships || new Array(6).fill(0), fleet.ressources, now);
+    const byHost = !!byHostId && row.host_commander_id === byHostId && row.owner_commander_id !== byOwnerId;
+    await sendMail(owner, byHost ? 'Flotte ausgewiesen' : 'Flotte abgezogen', // LOCALIZE
+        (byHost ? `Der Planetenbesitzer von ${row.host_coord} hat deine stationierte Flotte ausgewiesen.` : `Deine Flotte zieht von ${row.host_coord} ab.`)
+        + (home ? ` Sie fliegt nach ${home.destinationCoord} (Ankunft ${formatTimestamp(new Date(home.arrivalUtc))}).` : ' Du hast keinen Planeten, zu dem sie fliegen könnte - sie bleibt verloren.'), 1);
+    await stationedSaveCommanderData(row.owner_playfab_id, owner);
+    if (!byHost) await stationedMailTo(row.host_commander_id, 'Flotte abgezogen', `${row.owner_name} hat die stationierte Flotte von ${row.host_coord} abgezogen.`, 1);
+    return { status: 200, body: { success: true, fleet: home || null, ownerId: row.owner_commander_id } };
+}
+
+function stationedRowView(row, friendlyForHost) {
+    const f = typeof row.fleet === 'string' ? JSON.parse(row.fleet) : row.fleet;
+    return {
+        fleetId: row.fleet_id, ownerId: row.owner_commander_id, ownerName: row.owner_name,
+        hostId: row.host_commander_id, hostName: row.host_name, hostCoord: row.host_coord, originCoord: row.origin_coord,
+        warships: f.warships || [], ships: f.ships || [], ressources: f.ressources || [],
+        stationedAt: new Date(row.stationed_at).toISOString(), friendly: !!friendlyForHost
+    };
+}
+
+app.get('/fleets/stationed', async (req, res) => {
+    const commanderId = parseInt(req.query.commanderId, 10);
+    if (!commanderId) return res.status(400).json({ success: false, error: 'Ungültige Angaben.' });
+    const caller = await requireCaller(req, res, { commanderId });
+    if (!caller) return;
+    try {
+        const mine = await pool.query('SELECT * FROM stationed_fleets WHERE owner_commander_id = $1 ORDER BY stationed_at', [commanderId]);
+        const hosted = await pool.query('SELECT * FROM stationed_fleets WHERE host_commander_id = $1 ORDER BY stationed_at', [commanderId]);
+        const hostedViews = [];
+        for (const row of hosted.rows) {
+            let friendly = false;
+            try { friendly = await isAuthorizedToViewCommanderData(commanderId, row.owner_commander_id); } catch (e) { /* neutral */ }
+            hostedViews.push(stationedRowView(row, friendly));
+        }
+        res.json({ success: true, mine: mine.rows.map(r => stationedRowView(r, false)), hosted: hostedViews });
+    } catch (error) {
+        console.error('[Stationieren] list Fehler:', error.message);
+        res.status(500).json({ success: false, error: 'Liste nicht verfügbar.' });
+    }
+});
+
+app.post('/fleets/stationed/recall', async (req, res) => {
+    const commanderId = parseInt(req.body && req.body.commanderId, 10);
+    const fleetId = String(req.body && req.body.fleetId || '').slice(0, 80);
+    if (!commanderId || !fleetId) return res.status(400).json({ success: false, error: 'Ungültige Angaben.' });
+    const caller = await requireCaller(req, res, { commanderId });
+    if (!caller) return;
+    try {
+        const r = await stationedEnd(fleetId, commanderId, 0, new Date());
+        res.status(r.status).json(r.body);
+    } catch (error) {
+        console.error('[Stationieren] recall Fehler:', error.message);
+        res.status(500).json({ success: false, error: 'Abziehen gerade nicht möglich.' });
+    }
+});
+
+app.post('/fleets/stationed/expel', async (req, res) => {
+    const commanderId = parseInt(req.body && req.body.commanderId, 10);
+    const fleetId = String(req.body && req.body.fleetId || '').slice(0, 80);
+    if (!commanderId || !fleetId) return res.status(400).json({ success: false, error: 'Ungültige Angaben.' });
+    const caller = await requireCaller(req, res, { commanderId });
+    if (!caller) return;
+    try {
+        const r = await stationedEnd(fleetId, 0, commanderId, new Date());
+        res.status(r.status).json(r.body);
+    } catch (error) {
+        console.error('[Stationieren] expel Fehler:', error.message);
+        res.status(500).json({ success: false, error: 'Ausweisen gerade nicht möglich.' });
+    }
+});
+
+// ---- Kampf: Gaeste laden, einordnen, Ergebnisse zurueckschreiben ----
+function stationedTagFor(name, used) {
+    let base = '·' + String(name || '?').replace(/[^A-Za-z0-9ÄÖÜäöüß_-]/g, '').slice(0, 8);
+    let tag = base, n = 2;
+    while (used.has(tag)) tag = base + n++;
+    used.add(tag);
+    return tag;
+}
+
+// Rueckgabe null, wenn dort niemand stationiert ist. Sonst { foreign: [part], allied: [part] }; part = { row, fleet, ownerPfid, ownerCommander, tag, before:{w,s}, after, participant }
+async function stationedPrepareCombat(destCoord, hostCommanderId) {
+    const r = await pool.query('SELECT * FROM stationed_fleets WHERE host_coord = $1 ORDER BY stationed_at', [destCoord]);
+    if (r.rows.length === 0) return null;
+    const used = new Set(['·']);
+    const ctx = { foreign: [], allied: [] };
+    for (const row of r.rows) {
+        const fleet = typeof row.fleet === 'string' ? JSON.parse(row.fleet) : row.fleet;
+        let ownerCommander = null;
+        try { ownerCommander = await stationedLoadCommanderData(row.owner_playfab_id); } catch (e) { /* ohne Daten: Forschung 0 */ }
+        let friendly = false;
+        try { friendly = await isAuthorizedToViewCommanderData(hostCommanderId, row.owner_commander_id); } catch (e) { friendly = false; }
+        const part = {
+            row, fleet, ownerPfid: row.owner_playfab_id, ownerCommander, friendly,
+            tag: stationedTagFor(row.owner_name, used),
+            before: { w: (fleet.warships || []).slice(0, 10).concat(new Array(10).fill(0)).slice(0, 10), s: (fleet.ships || []).slice(0, 6).concat(new Array(6).fill(0)).slice(0, 6) },
+            after: null, participant: null, bonusPercent: 0
+        };
+        (friendly ? ctx.allied : ctx.foreign).push(part);
+    }
+    return ctx;
+}
+
+function stationedPartSpec(part) {
+    return { warships: part.before.w, ships: part.before.s, research: v2ResearchOf(part.ownerCommander), tag: part.tag };
+}
+
+function stationedAllParts(ctx) { return ctx ? ctx.foreign.concat(ctx.allied) : []; }
+
+function stationedLostWarships(ctx, i) {
+    let lost = 0;
+    for (const p of stationedAllParts(ctx)) if (p.after) lost += Math.max(0, (p.before.w[i] || 0) - (p.after.w[i] || 0));
+    return lost;
+}
+
+// Teilnehmer in den Bericht (je Gast ein eigener Eintrag, "stationiert")
+function stationedAddParticipants(report, ctx) {
+    for (const p of stationedAllParts(ctx)) {
+        if (!p.after) p.after = { w: p.before.w.slice(), s: p.before.s.slice() };
+        const info = p.ownerCommander || { commanderId: p.row.owner_commander_id, visibleName: p.row.owner_name };
+        p.participant = buildParticipant(info, p.row.fleet_id, false, true, false, p.before.w, p.before.s, p.after.w, p.after.s, (p.bonusPercent || 0) / 100, 'HP');
+        p.participant.commanderId = p.row.owner_commander_id;
+        p.participant.commanderName = (p.row.owner_name || 'Unbekannt') + (p.friendly ? ' (stationiert, verbündet)' : ' (stationiert)');   // LOCALIZE
+        report.defenders.push(p.participant);
+        report.totalDefenderShips += p.participant.totalShipsBefore;
+    }
+}
+
+// Reparatur je Gast mit SEINER Forschung
+function stationedRepair(ctx) {
+    for (const p of stationedAllParts(ctx)) {
+        const bonus = REPAIR_BASE + (((p.ownerCommander && p.ownerCommander.reparatur) || 0) * 0.01);
+        for (let i = 0; i < 10; i++) {
+            const losses = (p.before.w[i] || 0) - p.after.w[i];
+            if (losses <= 0) continue;
+            const repaired = Math.floor(losses * bonus);
+            if (repaired > 0) { p.after.w[i] += repaired; p.participant.warshipsRepaired[i] = repaired; p.participant.totalRepaired += repaired; }
+        }
+    }
+}
+
+// Verluste im Bericht neu rechnen (nach Reparatur) und zur Gesamtsumme der Verteidiger addieren
+function stationedRecalc(report, ctx) {
+    for (const p of stationedAllParts(ctx)) {
+        recalcParticipantLosses(p.participant, p.before.w, p.before.s, p.after.w, p.after.s);
+        report.totalDefenderLosses += p.participant.totalLosses;
+    }
+}
+
+// Ergebnisse speichern: Flotten aktualisieren/loeschen, Mail mit dem EINEN Kampfbericht an jeden Gast-Besitzer
+async function stationedFinalize(ctx, report, now, log) {
+    for (const p of stationedAllParts(ctx)) {
+        try {
+            const left = sumArray(p.after.w) + sumArray(p.after.s);
+            if (left <= 0) await pool.query('DELETE FROM stationed_fleets WHERE fleet_id = $1', [p.row.fleet_id]);
+            else {
+                const updated = Object.assign({}, p.fleet, { warships: p.after.w, ships: p.after.s });
+                await pool.query('UPDATE stationed_fleets SET fleet = $2::jsonb WHERE fleet_id = $1', [p.row.fleet_id, JSON.stringify(updated)]);
+            }
+            const owner = p.ownerCommander;
+            if (owner) {
+                await sendCombatMail(owner, report, false, p.participant, false);
+                await stationedSaveCommanderData(p.ownerPfid, owner);
+            }
+            log.push(`Stationierte Flotte ${p.row.fleet_id}: ${sumArray(p.before.w) + sumArray(p.before.s)} -> ${left} Schiffe`);
+        } catch (e) { console.error('[Stationieren] Ergebnis speichern fehlgeschlagen:', p.row.fleet_id, e.message); }
+    }
+}
+
+// Zusammenfassung "Truemmer" fuer die Mail an den Planetenbesitzer
+function stationedRecyclingText(report) {
+    const parts = [];
+    (report.recycling || []).forEach((n, i) => { if (n > 0) parts.push(`${n} ${STATIONED_RESOURCE_NAMES[i] || 'Ress0' + (i + 1)}`); });
+    return parts.length > 0 ? 'Nach dem Kampf konnten folgende Ressourcen sichergestellt werden: ' + parts.join(', ') + '.' : '';   // LOCALIZE
+}
 
 // #####################################################################
 // §21  SERVERSTART (app.listen)
