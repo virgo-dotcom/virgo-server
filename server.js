@@ -10216,6 +10216,18 @@ async function achvProgress(def, ctx) {
     }
 }
 
+// Hinweis fuer den Client, wie er seinen EIGENEN Stand zu dieser Bedingung ausrechnen kann (fuer den Abgleich beim Abholen):
+// building -> cparam = Gebaeude-Index; research -> Feld; researchAll -> "feld:stufe,feld:stufe"; researchSum -> ""; alles andere kennt nur der Server.
+function achvLocalHint(cond) {
+    switch (cond.t) {
+        case 'building': return { ctype: 'building', cparam: String(cond.i) };
+        case 'research': return { ctype: 'research', cparam: cond.f };
+        case 'researchAll': return { ctype: 'researchAll', cparam: cond.r.map(([f, l]) => f + ':' + l).join(',') };
+        case 'researchSum': return { ctype: 'researchSum', cparam: '' };
+        default: return { ctype: 'server', cparam: '' };
+    }
+}
+
 function achvRewardText(reward) {
     if (reward && reward.items) return reward.items.map(x => `${x.q}x ${inventoryItemLabel(x.i)}`).join(', ');
     if (reward && reward.random) return `${reward.random}x Zufällige Kleine Kiste`;
@@ -10277,8 +10289,8 @@ app.get('/achievements', async (req, res) => {
             else progress = await achvProgress(def, ctx);
             const met = progress.current >= progress.target;
             if (met && !(st && st.unlocked_at)) newlyUnlocked.push(def.id);
-            items.push({ id: def.id, cat: def.cat, current: progress.current, target: progress.target,
-                unlocked: met || !!(st && st.unlocked_at), claimed: !!(st && st.claimed_at), reward: achvRewardText(def.reward) });
+            items.push(Object.assign({ id: def.id, cat: def.cat, current: progress.current, target: progress.target,
+                unlocked: met || !!(st && st.unlocked_at), claimed: !!(st && st.claimed_at), reward: achvRewardText(def.reward) }, achvLocalHint(def.cond)));
         }
         for (const id of newlyUnlocked)
             await pool.query(`INSERT INTO achievement_state (commander_id, achievement_id, unlocked_at) VALUES ($1, $2, now()) ON CONFLICT (commander_id, achievement_id) DO NOTHING`, [caller.commanderId, id]);
