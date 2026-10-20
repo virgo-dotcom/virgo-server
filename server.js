@@ -10265,6 +10265,20 @@ function achvLocalHint(cond) {
     }
 }
 
+// Farbthema der Belohnung fuer die Anzeige: Index 0-4 = nur Kisten dieser EINEN Ressource (Energie gruen, Wasserstoff blau, Metalle silbern ...),
+// -1 = gemischt/zufaellig (der Client laesst den Schein dann durch alle Farben wechseln)
+function achvRewardTheme(reward) {
+    if (!reward || !reward.items || reward.items.length === 0) return -1;
+    let theme = null;
+    for (const x of reward.items) {
+        const m = /^crate_res_([0-4])$/.exec(x.i);
+        if (!m) return -1;
+        const idx = Number(m[1]);
+        if (theme === null) theme = idx; else if (theme !== idx) return -1;
+    }
+    return theme === null ? -1 : theme;
+}
+
 function achvRewardText(reward) {
     if (reward && reward.items) return reward.items.map(x => `${x.q}x ${inventoryItemLabel(x.i)}`).join(', ');
     if (reward && reward.random) return `${reward.random}x Zufällige Kleine Kiste`;
@@ -10327,7 +10341,7 @@ app.get('/achievements', async (req, res) => {
             const met = progress.current >= progress.target;
             if (met && !(st && st.unlocked_at)) newlyUnlocked.push(def.id);
             items.push(Object.assign({ id: def.id, cat: def.cat, current: progress.current, target: progress.target,
-                unlocked: met || !!(st && st.unlocked_at), claimed: !!(st && st.claimed_at), reward: achvRewardText(def.reward) }, achvLocalHint(def.cond)));
+                unlocked: met || !!(st && st.unlocked_at), claimed: !!(st && st.claimed_at), reward: achvRewardText(def.reward), theme: achvRewardTheme(def.reward) }, achvLocalHint(def.cond)));
         }
         for (const id of newlyUnlocked)
             await pool.query(`INSERT INTO achievement_state (commander_id, achievement_id, unlocked_at) VALUES ($1, $2, now()) ON CONFLICT (commander_id, achievement_id) DO NOTHING`, [caller.commanderId, id]);
