@@ -54,6 +54,7 @@
 //  §25  KAMPF V2 (Rundenkampf, Mischbonus, Zivile in letzter Reihe): steht VOR §21; aktiv nur bei COMBAT_ENGINE=shadow|v2
 //  §26  GALAXIE-REGISTER (planet_registry): serverautoritative Belegung, Schritt 1 (nur lesen/befuellen); steht VOR §21
 //  §28  INVENTAR (PlayFab Internal Data "inventory"): Kisten (Rohstoffe Ress01-10, Schiffe), Oeffnen, Admin-Vergabe "#inv"; steht VOR §21
+//  §35  ALLIANZKASSE (alliance_treasury/_log, /alliance-treasury, Einzahlen + Handelssteuer, nichts entnehmbar, Admin "#kasse"); steht VOR §21
 //  §34  ERFOLGE serverseitig (achievement_state/_locks/_log, GET /achievements, POST /achievements/claim, Admin "#achv"); steht VOR §21
 //  §33  STATIONIEREN + gemeinsames Verteidigen (stationed_fleets, /fleets/stationed, Kampf mit mehreren Teilnehmern); steht VOR §21
 //  §32  TERRAFORMING (Wartezeit, Abschluss, Abbruch durch Spieler/Angreifer, /planet/terraform-complete|abort); steht VOR §21
@@ -1205,6 +1206,18 @@ async function initDatabase() {
             id SERIAL PRIMARY KEY, commander_id INTEGER NOT NULL, achievement_id TEXT NOT NULL DEFAULT '', event TEXT NOT NULL,
             details JSONB, created_at TIMESTAMPTZ NOT NULL DEFAULT now());`);
         await pool.query(`CREATE INDEX IF NOT EXISTS idx_achievement_log_commander ON achievement_log (commander_id, id DESC);`);
+        // NEU 20.10.2026 (§35 Allianzkasse): haengt per CASCADE an der Allianz
+        await pool.query(`CREATE TABLE IF NOT EXISTS alliance_treasury (
+            alliance_id INTEGER PRIMARY KEY REFERENCES alliances(id) ON DELETE CASCADE,
+            res0 BIGINT NOT NULL DEFAULT 0, res1 BIGINT NOT NULL DEFAULT 0, res2 BIGINT NOT NULL DEFAULT 0, res3 BIGINT NOT NULL DEFAULT 0, res4 BIGINT NOT NULL DEFAULT 0,
+            updated_at TIMESTAMPTZ NOT NULL DEFAULT now());`);
+        await pool.query(`CREATE TABLE IF NOT EXISTS alliance_treasury_log (
+            id SERIAL PRIMARY KEY, alliance_id INTEGER NOT NULL REFERENCES alliances(id) ON DELETE CASCADE,
+            kind TEXT NOT NULL, commander_id INTEGER, commander_name TEXT NOT NULL DEFAULT '',
+            resource_index INTEGER NOT NULL, amount BIGINT NOT NULL, value_points BIGINT NOT NULL DEFAULT 0, balance_after BIGINT NOT NULL DEFAULT 0,
+            note TEXT NOT NULL DEFAULT '', created_at TIMESTAMPTZ NOT NULL DEFAULT now());`);
+        await pool.query(`CREATE INDEX IF NOT EXISTS idx_treasury_log_alliance ON alliance_treasury_log (alliance_id, id DESC);`);
+        await pool.query(`CREATE INDEX IF NOT EXISTS idx_treasury_log_commander ON alliance_treasury_log (commander_id);`);
         await pool.query(`CREATE TABLE IF NOT EXISTS planet_freed (id SERIAL PRIMARY KEY, coord TEXT NOT NULL, freed_at TIMESTAMPTZ NOT NULL DEFAULT now());`);
         await pool.query(`CREATE INDEX IF NOT EXISTS idx_planet_freed_time ON planet_freed (freed_at);`);
 
@@ -4366,7 +4379,7 @@ const DB_EXPORT_TABLES = ['alliances', 'alliance_ranks', 'alliance_members', 'al
     'alliance_relationships', 'player_relationships', 'commander_highscore', 'legal_texts', 'dev_todos', 'announcements', 'virgodom_messages',
     'support_messages', 'player_reports', 'shop_items', 'promo_codes', 'promo_redemptions', 'giftbox_claims', 'giftbox_golden_claims',
     'market_offers', 'transport_deliveries', 'planet_registry', 'combat_reports', 'attack_traces', 'processed_fleets',
-    'galaxy_sectors', 'galaxy_config', 'galaxy_texts', 'stationed_fleets', 'achievement_state', 'achievement_locks', 'achievement_log'];
+    'galaxy_sectors', 'galaxy_config', 'galaxy_texts', 'stationed_fleets', 'achievement_state', 'achievement_locks', 'achievement_log', 'alliance_treasury', 'alliance_treasury_log'];
 app.get('/admin/db-export', async (req, res) => {
     if (process.env.DB_EXPORT_ENABLED !== 'true') return res.status(404).json({ success: false, error: 'Nicht verfuegbar.' });
     if (!adminKeyOk(req.query.key)) return res.status(403).json({ success: false, error: 'Nicht autorisiert' });
@@ -6825,6 +6838,10 @@ async function buildPlayerInspectionReport(rawQuery) {
     if (/^\s*#inv\b/i.test(String(rawQuery || '')))
         return await buildInventoryAdminReport(String(rawQuery).trim());
 
+    // NEU 20.10.2026: Allianzkasse-Werkzeug (§35) — Befehle mit "#kasse" am Anfang
+    if (/^\s*#kasse\b/i.test(String(rawQuery || '')))
+        return await buildTreasuryAdminReport(String(rawQuery).trim());
+
     // NEU 20.10.2026: Erfolge-Werkzeug (§34) — Befehle mit "#achv" am Anfang
     if (/^\s*#achv\b/i.test(String(rawQuery || '')))
         return await buildAchievementAdminReport(String(rawQuery).trim());
@@ -8222,12 +8239,20 @@ async function marketSendSaleMail(offer, buyerName, payout, tax) {
         const coord = marketReturnCoord(commander, offer.seller_coord) || offer.seller_coord;
         const resName = marketItemName('resource', offer.price_resource);
         const article = `${marketNum(offer.amount)} ${marketItemName(offer.item_kind, offer.resource_index)}`;
+        // NEU 20.10.2026 (§35): gehoert der Verkaeufer einer Allianz an, geht die Steuer in deren Kasse
+        let taxLine = `Steuern an das Virgo Dominion (${MARKET_TAX_PERCENT} %): ${marketNum(tax)} ${resName}\n`;
+        try {
+            if (typeof treasuryAllianceOf === 'function') {
+                const al = await treasuryAllianceOf(offer.seller_commander_id);
+                if (al) taxLine = `Steuern (${MARKET_TAX_PERCENT} %) an die Kasse deiner Allianz [${al.tag}]: ${marketNum(tax)} ${resName}\n`;
+            }
+        } catch (e) { /* Mail darf nie am Allianz-Lookup scheitern */ }
         const body =
             `Dein Angebot wurde verkauft!\n\n` +
             `Artikel: ${article}\n` +
             `Käufer: ${buyerName}\n` +
             `Kaufpreis: ${marketNum(offer.price_amount)} ${resName}\n` +
-            `Steuern an das Virgo Dominion (${MARKET_TAX_PERCENT} %): ${marketNum(tax)} ${resName}\n` +
+            taxLine +
             `Dein Erlös: ${marketNum(payout)} ${resName}\n\n` +
             `Deine Kolonie ${coord} erhält: ${marketNum(payout)} ${resName}\n` +
             `Die Gutschrift erfolgt automatisch, spätestens wenn du den Handel öffnest.`;
@@ -8604,7 +8629,7 @@ app.post('/market/claim', async (req, res) => {
                  WHERE seller_commander_id = $1 AND settled = false
                    AND ((status = 'sold' AND sold_at <= now() - make_interval(secs => ${MARKET_SETTLE_DELAY_SECONDS}))
                         OR (status = 'active' AND expires_at <= now()))
-                 RETURNING id, status, seller_coord, item_kind, resource_index, amount, price_resource, payout_amount`, [who.commanderId]);
+                 RETURNING id, status, seller_coord, item_kind, resource_index, amount, price_resource, payout_amount, tax_amount`, [who.commanderId]);
             if (rows.rows.length === 0)
                 return { status: 200, body: { success: true, payouts: [], returns: [], settledCount: 0 } };
 
@@ -8658,6 +8683,13 @@ app.post('/market/claim', async (req, res) => {
                 const payoutsOut = Array.from(payoutsMap.values());
 
                 await marketSaveEntries(who.playFabId, entries);
+                // NEU 20.10.2026 (§35): die Steuer der verkauften Angebote fliesst in die Kasse der Allianz des Verkaeufers (ohne Allianz verfaellt sie wie bisher;
+                // ein Fehler dort darf die Abholung nie kippen - die Funktion faengt ihre Fehler selbst ab)
+                if (typeof allianceTreasuryDepositTax === 'function') {
+                    const taxMap = {};
+                    for (const r of rows.rows) if (r.status === 'sold' && r.tax_amount > 0) taxMap[r.price_resource] = (taxMap[r.price_resource] || 0) + r.tax_amount;
+                    if (Object.keys(taxMap).length > 0) await allianceTreasuryDepositTax(who.commanderId, taxMap, `Handelssteuer (${soldIds.length} Verkäufe)`);
+                }
                 console.log(`[Handel] Abholung Commander ${who.commanderId}: ${soldIds.length} verkauft, ${expiredIds.length} abgelaufen zurueck`);
                 return { status: 200, body: { success: true, payouts: payoutsOut, returns: returnsOut, settledCount: rows.rows.length } };
             } catch (error) {
@@ -10114,7 +10146,10 @@ const ACHV_CATALOG = [
     {"id":"exp_alliance","cat":"expansion","cond":{"t":"count","s":"alliance","n":1},"reward":{"random":1}},
     {"id":"exp_friend_1","cat":"expansion","cond":{"t":"count","s":"friends","n":1},"reward":{"random":1}},
     {"id":"exp_friend_5","cat":"expansion","cond":{"t":"count","s":"friends","n":5},"reward":{"random":2}},
-    {"id":"exp_stationed","cat":"expansion","cond":{"t":"count","s":"stationed","n":1},"reward":{"random":1}}
+    {"id":"exp_stationed","cat":"expansion","cond":{"t":"count","s":"stationed","n":1},"reward":{"random":1}},
+    {"id":"exp_treasury_1","cat":"expansion","cond":{"t":"count","s":"treasuryDeposits","n":1},"reward":{"random":1}},
+    {"id":"exp_treasury_10","cat":"expansion","cond":{"t":"count","s":"treasuryDeposits","n":10},"reward":{"random":2}},
+    {"id":"exp_treasury_value","cat":"expansion","cond":{"t":"count","s":"treasuryValue","n":100000},"reward":{"random":2}}
 ];
 // ACHV-KATALOG-ENDE
 
@@ -10127,7 +10162,9 @@ const ACHV_COUNTERS = {
     marketPurchases: `SELECT COUNT(*)::int AS n FROM market_offers WHERE buyer_commander_id = $1 AND status = 'sold'`,
     friends:         `SELECT COUNT(*)::int AS n FROM player_relationships WHERE status = 'friend' AND (commander_id_a = $1 OR commander_id_b = $1)`,
     alliance:        `SELECT COUNT(*)::int AS n FROM alliance_members WHERE commander_id = $1`,
-    stationed:       `SELECT COUNT(*)::int AS n FROM stationed_fleets WHERE owner_commander_id = $1`
+    stationed:       `SELECT COUNT(*)::int AS n FROM stationed_fleets WHERE owner_commander_id = $1`,
+    treasuryDeposits: `SELECT COUNT(*)::int AS n FROM alliance_treasury_log WHERE commander_id = $1 AND kind = 'deposit'`,
+    treasuryValue:   `SELECT COALESCE(SUM(value_points), 0)::bigint AS n FROM alliance_treasury_log WHERE commander_id = $1 AND kind IN ('deposit', 'tax')`
 };
 
 // Auswertungs-Kontext: laedt Spielerdaten erst, wenn eine Bedingung sie braucht (und nur einmal je Anfrage)
@@ -10410,6 +10447,299 @@ async function buildAchievementAdminReport(rawQuery) {
         return `Erfolge von ${id}:\n` + (lock ? `  GESPERRT bis ${lock.until}: ${lock.reason}\n` : '  nicht gesperrt\n') +
             (st.rows.length ? st.rows.map(r => `  ${r.claimed_at ? '[abgeholt]   ' : '[freigeschaltet]'} ${r.achievement_id}`).join('\n') : '  (noch nichts freigeschaltet)') +
             '\n\nLetzte Ereignisse:\n' + (log.rows.length ? log.rows.map(fmtLog).join('\n') : '  (keine)');
+    } catch (error) {
+        return 'Fehler: ' + error.message;
+    }
+}
+
+// #####################################################################
+// §35  ALLIANZKASSE — NEU 20.10.2026
+//      Jede Allianz hat eine eigene Kasse mit den fuenf Handelsressourcen (Energie, Wasserstoff, Metalle, Werkzeuge, Credits).
+//      GRUNDREGEL (Nutzer): NIEMAND darf Ressourcen aus der Kasse entnehmen. Sie waechst nur und finanziert spaeter Allianz-
+//      Forschungen und Megastrukturen (Minenfelder, Dyson-Sphaere, Todessterne) - dafuer gibt es treasurySpend(), das NUR der
+//      Server selbst fuer solche Projekte aufruft (kein Endpunkt, kein Recht dafuer).
+//
+//      Zufluss:
+//        - EINZAHLUNG durch jedes Mitglied (POST /alliance-treasury/deposit): Ware wird vom gewaehlten Planeten abgezogen
+//          (gleiche Sicherheit wie der Handel: Ticket-Identitaet, Sperre je Spieler, erst abziehen, dann gutschreiben, bei Fehler zurueck).
+//        - STEUERN: die 20 % Handelssteuer, die ein Verkaeufer zahlt, fliessen in die Kasse SEINER Allianz (beim Abholen des Erloeses,
+//          also erst wenn der Verkauf endgueltig ist, siehe /market/claim). Ohne Allianz verfallen sie wie bisher.
+//      Das Log (alliance_treasury_log) haelt jeden Zu-/Abfluss fest (Art, Commander, Ressource, Menge, Wert, Stand danach, Notiz) und ist
+//      fuer alle Mitglieder einsehbar und filterbar (Art: Steuern/Einzahlungen/Ausgaben; Commander: alle, Name oder ID).
+//      Die Kasse haengt per CASCADE an der Allianz (wird sie aufgeloest, ist die Kasse weg). Austritt/Rauswurf: Beitraege bleiben.
+//
+//      Routen (Praefix /alliance-treasury, NICHT /alliances/..., das faengt /alliances/:id ab):
+//        GET  /alliance-treasury?commanderId=            Stand, Wert, eigener Beitrag, Beitragsliste
+//        GET  /alliance-treasury/log?commanderId=&kind=&who=&beforeId=&limit=
+//        POST /alliance-treasury/deposit { commanderId, coord, resourceIndex, amount }
+//      Admin: Befehl "#kasse" im Spieler-Info-Feld.
+// #####################################################################
+
+const TREASURY_MIN_DEPOSIT = [100, 100, 100, 100, 10];     // je Ressource (Ress01-05); verhindert Log-Muell durch Kleinstbetraege
+const TREASURY_MAX_DEPOSIT = 2000000000;
+const TREASURY_LOG_PAGE = 30;
+const TREASURY_KINDS = ['deposit', 'tax', 'spend', 'admin'];
+const TREASURY_TITLES = [[10000000, 'Großmäzen'], [1000000, 'Mäzen'], [100000, 'Gönner'], [10000, 'Förderer']];   // nach Gesamtwert (Wertpunkte)
+
+function treasuryValuePoints(resourceIndex, amount) {
+    return Math.floor(Number(amount) * (MARKET_VALUE_WEIGHT[resourceIndex] || 0));
+}
+
+function treasuryTitle(totalValue) {
+    for (const [min, name] of TREASURY_TITLES) if (totalValue >= min) return name;
+    return '';
+}
+
+// Allianz eines Commanders (oder null)
+async function treasuryAllianceOf(commanderId) {
+    const r = await pool.query(
+        `SELECT a.id, a.name, a.tag FROM alliance_members m JOIN alliances a ON a.id = m.alliance_id WHERE m.commander_id = $1`, [commanderId]);
+    return r.rows[0] ? { id: r.rows[0].id, name: r.rows[0].name, tag: r.rows[0].tag } : null;
+}
+
+async function treasuryEnsure(allianceId) {
+    await pool.query('INSERT INTO alliance_treasury (alliance_id) VALUES ($1) ON CONFLICT (alliance_id) DO NOTHING', [allianceId]);
+}
+
+async function treasuryBalances(allianceId) {
+    await treasuryEnsure(allianceId);
+    const r = await pool.query('SELECT res0, res1, res2, res3, res4 FROM alliance_treasury WHERE alliance_id = $1', [allianceId]);
+    const row = r.rows[0] || {};
+    return [0, 1, 2, 3, 4].map(i => Number(row['res' + i]) || 0);
+}
+
+// Atomar gutschreiben (+ Log). kind: deposit | tax | admin. Rueckgabe: neuer Bestand dieser Ressource.
+async function treasuryCredit(allianceId, resourceIndex, amount, kind, commanderId, commanderName, note) {
+    if (!(resourceIndex >= 0 && resourceIndex <= 4) || !Number.isInteger(resourceIndex)) throw new Error('Ungültige Ressource.');
+    if (!Number.isFinite(amount) || amount < 1 || Math.floor(amount) !== amount) throw new Error('Ungültige Menge.');
+    if (!TREASURY_KINDS.includes(kind)) throw new Error('Ungültige Art.');
+    await treasuryEnsure(allianceId);
+    const col = 'res' + resourceIndex;
+    const r = await pool.query(`UPDATE alliance_treasury SET ${col} = ${col} + $2, updated_at = now() WHERE alliance_id = $1 RETURNING ${col} AS balance`, [allianceId, amount]);
+    if (r.rows.length === 0) throw new Error('Kasse nicht gefunden.');
+    const balance = Number(r.rows[0].balance);
+    await pool.query(
+        `INSERT INTO alliance_treasury_log (alliance_id, kind, commander_id, commander_name, resource_index, amount, value_points, balance_after, note)
+         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)`,
+        [allianceId, kind, commanderId || null, String(commanderName || '').slice(0, 32), resourceIndex, amount, treasuryValuePoints(resourceIndex, amount), balance, String(note || '').slice(0, 120)]);
+    return balance;
+}
+
+// Fuer SPAETERE Allianz-Projekte (Forschung, Megastrukturen): zieht Kosten (Array von 5 Mengen) atomar ab, nur wenn alles da ist.
+// Wird NUR vom Server aufgerufen (kein Endpunkt!). Rueckgabe { ok, balances }.
+async function treasurySpend(allianceId, costs, reason, commanderId, commanderName) {
+    const c = [0, 1, 2, 3, 4].map(i => Math.max(0, Math.floor(Number(costs && costs[i]) || 0)));
+    if (c.every(x => x === 0)) return { ok: false, balances: await treasuryBalances(allianceId) };
+    await treasuryEnsure(allianceId);
+    const r = await pool.query(
+        `UPDATE alliance_treasury SET res0 = res0 - $2, res1 = res1 - $3, res2 = res2 - $4, res3 = res3 - $5, res4 = res4 - $6, updated_at = now()
+         WHERE alliance_id = $1 AND res0 >= $2 AND res1 >= $3 AND res2 >= $4 AND res3 >= $5 AND res4 >= $6
+         RETURNING res0, res1, res2, res3, res4`, [allianceId, c[0], c[1], c[2], c[3], c[4]]);
+    if (r.rows.length === 0) return { ok: false, balances: await treasuryBalances(allianceId) };
+    const balances = [0, 1, 2, 3, 4].map(i => Number(r.rows[0]['res' + i]));
+    for (let i = 0; i < 5; i++) {
+        if (c[i] === 0) continue;
+        await pool.query(
+            `INSERT INTO alliance_treasury_log (alliance_id, kind, commander_id, commander_name, resource_index, amount, value_points, balance_after, note)
+             VALUES ($1, 'spend', $2, $3, $4, $5, $6, $7, $8)`,
+            [allianceId, commanderId || null, String(commanderName || '').slice(0, 32), i, c[i], treasuryValuePoints(i, c[i]), balances[i], String(reason || '').slice(0, 120)]);
+    }
+    return { ok: true, balances };
+}
+
+// Handelssteuer in die Kasse der Allianz des Zahlers (aufgerufen von /market/claim). taxByResource: { '2': 1500, ... }.
+// Rueckgabe: { allianceTag, perResource } oder null (keine Allianz / Fehler - der Handel darf davon NIE beeintraechtigt werden).
+async function allianceTreasuryDepositTax(commanderId, taxByResource, note) {
+    try {
+        const alliance = await treasuryAllianceOf(commanderId);
+        if (!alliance) return null;
+        const nameRow = await pool.query('SELECT commander_name FROM commander_highscore WHERE commander_id = $1', [commanderId]);
+        const name = nameRow.rows[0] ? nameRow.rows[0].commander_name : ('Commander ' + commanderId);
+        const done = {};
+        for (const key of Object.keys(taxByResource || {})) {
+            const idx = Number(key), amount = Math.floor(Number(taxByResource[key]) || 0);
+            if (!(idx >= 0 && idx <= 4) || amount < 1) continue;
+            await treasuryCredit(alliance.id, idx, amount, 'tax', commanderId, name, note || 'Handelssteuer');
+            done[idx] = amount;
+        }
+        return { allianceTag: alliance.tag, perResource: done };
+    } catch (e) {
+        console.error('[Kasse] Steuer konnte nicht gutgeschrieben werden (Commander ' + commanderId + '):', e.message);
+        return null;
+    }
+}
+
+// Beitraege je Commander (nur Einzahlungen + Steuern), nach Gesamtwert absteigend
+async function treasuryContributors(allianceId) {
+    const r = await pool.query(
+        `SELECT commander_id, (array_agg(commander_name ORDER BY id DESC))[1] AS name,
+                COALESCE(SUM(value_points) FILTER (WHERE kind = 'deposit'), 0)::bigint AS deposit_value,
+                COALESCE(SUM(value_points) FILTER (WHERE kind = 'tax'), 0)::bigint AS tax_value
+         FROM alliance_treasury_log WHERE alliance_id = $1 AND commander_id IS NOT NULL AND kind IN ('deposit', 'tax')
+         GROUP BY commander_id`, [allianceId]);
+    return r.rows.map(x => ({ commanderId: x.commander_id, name: x.name || '', depositValue: Number(x.deposit_value), taxValue: Number(x.tax_value) }))
+        .map(x => Object.assign(x, { total: x.depositValue + x.taxValue, title: treasuryTitle(x.depositValue + x.taxValue) }))
+        .sort((a, b) => b.total - a.total || a.commanderId - b.commanderId);
+}
+
+app.get('/alliance-treasury', async (req, res) => {
+    const commanderId = parseInt(req.query.commanderId, 10);
+    if (!commanderId) return res.status(400).json({ success: false, error: 'Ungültige Angaben.' });
+    const caller = await requireCaller(req, res, { commanderId });
+    if (!caller) return;
+    try {
+        const alliance = await treasuryAllianceOf(caller.commanderId);
+        if (!alliance) return res.status(404).json({ success: false, noAlliance: true, error: 'Du bist in keiner Allianz.' });
+        const balances = await treasuryBalances(alliance.id);
+        const values = balances.map((b, i) => treasuryValuePoints(i, b));
+        const contributors = await treasuryContributors(alliance.id);
+        const myIndex = contributors.findIndex(x => x.commanderId === caller.commanderId);
+        const mine = myIndex >= 0 ? contributors[myIndex] : { depositValue: 0, taxValue: 0, total: 0, title: '' };
+        const day = await pool.query(
+            `SELECT COALESCE(SUM(value_points) FILTER (WHERE kind IN ('deposit', 'tax', 'admin')), 0)::bigint AS inflow,
+                    COALESCE(SUM(value_points) FILTER (WHERE kind = 'spend'), 0)::bigint AS outflow
+             FROM alliance_treasury_log WHERE alliance_id = $1 AND created_at > now() - interval '24 hours'`, [alliance.id]);
+        res.json({
+            success: true, allianceId: alliance.id, allianceName: alliance.name, allianceTag: alliance.tag,
+            balances, values, totalValue: values.reduce((s, v) => s + v, 0),
+            valueIn24h: Number(day.rows[0].inflow), valueOut24h: Number(day.rows[0].outflow),
+            myDepositValue: mine.depositValue, myTaxValue: mine.taxValue, myTotalValue: mine.total, myTitle: mine.title,
+            myRank: myIndex >= 0 ? myIndex + 1 : 0, contributorCount: contributors.length,
+            top: contributors.slice(0, 10).map((x, i) => ({ rank: i + 1, commanderId: x.commanderId, name: x.name, depositValue: x.depositValue, taxValue: x.taxValue, total: x.total, title: x.title })),
+            minDeposit: TREASURY_MIN_DEPOSIT, weights: MARKET_VALUE_WEIGHT, taxPercent: MARKET_TAX_PERCENT
+        });
+    } catch (error) {
+        console.error('[Kasse] Stand Fehler:', error.message);
+        res.status(500).json({ success: false, error: 'Die Kasse ist gerade nicht erreichbar.' });
+    }
+});
+
+app.get('/alliance-treasury/log', async (req, res) => {
+    const commanderId = parseInt(req.query.commanderId, 10);
+    if (!commanderId) return res.status(400).json({ success: false, error: 'Ungültige Angaben.' });
+    const caller = await requireCaller(req, res, { commanderId });
+    if (!caller) return;
+    try {
+        const alliance = await treasuryAllianceOf(caller.commanderId);
+        if (!alliance) return res.status(404).json({ success: false, noAlliance: true, error: 'Du bist in keiner Allianz.' });
+
+        const kind = String(req.query.kind || 'all').toLowerCase();
+        const who = String(req.query.who || '').trim().slice(0, 32);
+        const beforeId = parseInt(req.query.beforeId, 10) || 0;
+        const limit = Math.min(Math.max(parseInt(req.query.limit, 10) || TREASURY_LOG_PAGE, 1), 50);
+        const params = [alliance.id];
+        let where = 'alliance_id = $1';
+        if (TREASURY_KINDS.includes(kind)) { params.push(kind); where += ` AND kind = $${params.length}`; }
+        if (who) {
+            if (/^\d{1,9}$/.test(who)) { params.push(parseInt(who, 10)); where += ` AND commander_id = $${params.length}`; }
+            else { params.push('%' + who.replace(/[\\%_]/g, m => '\\' + m) + '%'); where += ` AND commander_name ILIKE $${params.length}`; }
+        }
+        if (beforeId > 0) { params.push(beforeId); where += ` AND id < $${params.length}`; }
+        params.push(limit + 1);
+        const r = await pool.query(
+            `SELECT id, kind, commander_id, commander_name, resource_index, amount, value_points, note,
+                    EXTRACT(EPOCH FROM (now() - created_at))::int AS ago_seconds, created_at
+             FROM alliance_treasury_log WHERE ${where} ORDER BY id DESC LIMIT $${params.length}`, params);
+        const rows = r.rows.slice(0, limit);
+        res.json({
+            success: true, hasMore: r.rows.length > limit,
+            entries: rows.map(x => ({
+                id: x.id, kind: x.kind, commanderId: x.commander_id || 0, name: x.commander_name || '', resourceIndex: x.resource_index,
+                amount: Number(x.amount), value: Number(x.value_points), note: x.note || '', agoSeconds: x.ago_seconds, ts: new Date(x.created_at).toISOString()
+            }))
+        });
+    } catch (error) {
+        console.error('[Kasse] Log Fehler:', error.message);
+        res.status(500).json({ success: false, error: 'Das Kassenbuch ist gerade nicht erreichbar.' });
+    }
+});
+
+app.post('/alliance-treasury/deposit', async (req, res) => {
+    const who = await marketIdentity(req);
+    if (!who) return marketFail(res, 401, 'Nicht angemeldet.');
+    const coord  = normalizeRegistryCoord(req.body && req.body.coord);
+    const index  = marketStrictInt(req.body && req.body.resourceIndex);
+    const amount = marketStrictInt(req.body && req.body.amount);
+    if (!coord) return marketFail(res, 400, 'Bitte einen Planeten wählen.');
+    if (!(index >= 0 && index <= 4)) return marketFail(res, 400, 'In die Kasse können Energie, Wasserstoff, Metalle, Werkzeuge und Credits eingezahlt werden.');
+    if (!(amount >= TREASURY_MIN_DEPOSIT[index] && amount <= TREASURY_MAX_DEPOSIT))
+        return marketFail(res, 400, `Menge: mindestens ${marketNum(TREASURY_MIN_DEPOSIT[index])} ${MARKET_RESOURCE_NAMES[index]}.`);
+
+    try {
+        const outcome = await withMarketLock(who.playFabId, async () => {
+            const alliance = await treasuryAllianceOf(who.commanderId);
+            if (!alliance) return { status: 403, body: { success: false, error: 'Du bist in keiner Allianz.' } };
+
+            const player = await marketLoadPlayer(who.playFabId, [coord]);
+            if (!player) return { status: 404, body: { success: false, error: 'Commander nicht gefunden.' } };
+            const { commander, planets } = player;
+            if (!commander.colonies.includes(coord)) return { status: 403, body: { success: false, error: 'Dieser Planet gehört dir nicht.' } };
+            const planet = planets[coord];
+            if (!planet) return { status: 404, body: { success: false, error: 'Planet nicht gefunden.' } };
+            const have = marketHave(planet, 'resource', index);
+            if (have < amount)
+                return { status: 400, body: { success: false, error: `Nicht genug ${MARKET_RESOURCE_NAMES[index]} auf diesem Planeten (vorhanden: ${marketNum(have)}).`, have } };
+
+            // erst vom Planeten abziehen, dann gutschreiben; scheitert das Gutschreiben, wird zurueckgebucht
+            marketRemove(planet, 'resource', index, amount);
+            await marketSaveEntries(who.playFabId, { [marketPlanetKey(coord)]: planet });
+            const name = String(commander.visibleName || ('Commander ' + who.commanderId)).slice(0, 32);
+            let balance;
+            try {
+                balance = await treasuryCredit(alliance.id, index, amount, 'deposit', who.commanderId, name, 'Einzahlung von ' + coord);
+            } catch (creditError) {
+                console.error('[Kasse] Gutschrift fehlgeschlagen, buche zurueck (Commander ' + who.commanderId + '):', creditError.message);
+                try {
+                    marketAdd(planet, 'resource', index, amount);
+                    await marketSaveEntries(who.playFabId, { [marketPlanetKey(coord)]: planet });
+                } catch (refundError) {
+                    console.error('[Kasse] RUECKBUCHUNG FEHLGESCHLAGEN (Commander ' + who.commanderId + ', ' + amount + 'x Ress' + (index + 1) + '):', refundError.message);
+                }
+                throw creditError;
+            }
+            console.log(`[Kasse] Einzahlung: Commander ${who.commanderId} -> Allianz ${alliance.id}: ${amount}x Ress${index + 1} (Bestand ${balance})`);
+            return { status: 200, body: { success: true, coord, resourceIndex: index, amount, balance, value: treasuryValuePoints(index, amount), allianceTag: alliance.tag } };
+        });
+        res.status(outcome.status).json(outcome.body);
+    } catch (error) {
+        console.error('[Kasse] Einzahlung Fehler:', error.message);
+        marketFail(res, 500, 'Einzahlung konnte nicht abgeschlossen werden.');
+    }
+});
+
+// -------------------------------------------------------
+// ADMIN-Befehl "#kasse":  #kasse <Allianz>  |  #kasse log <Allianz>  |  #kasse give <Allianz> <Ressource 1-5 oder Name> <Menge>
+// <Allianz> = Anzeige-ID oder Tag
+// -------------------------------------------------------
+async function buildTreasuryAdminReport(rawQuery) {
+    const tokens = String(rawQuery || '').trim().split(/\s+/).slice(1);
+    const help = 'ALLIANZKASSE-Admin:\n  #kasse <Allianz>                          Stand + letzte Eintraege\n  #kasse log <Allianz>                      letzte 30 Eintraege\n' +
+        '  #kasse give <Allianz> <Ress 1-5|Name> <Menge>   Testgutschrift (Art "admin", im Log sichtbar)\n(<Allianz> = Anzeige-ID oder Tag)';
+    if (tokens.length === 0 || /^(help|hilfe|\?)$/i.test(tokens[0])) return help;
+    const find = async term => {
+        const r = await pool.query('SELECT id, name, tag FROM alliances WHERE display_id::text = $1 OR LOWER(tag) = LOWER($1) LIMIT 1', [String(term)]);
+        return r.rows[0] || null;
+    };
+    const line = x => `  #${x.id}  ${new Date(x.created_at).toISOString().replace('T', ' ').slice(0, 19)}  ${x.kind}  ${x.commander_name || '-'}(${x.commander_id || '-'})  ${marketNum(Number(x.amount))} ${MARKET_RESOURCE_NAMES[x.resource_index]}  Stand ${marketNum(Number(x.balance_after))}  ${x.note || ''}`;
+    try {
+        if (/^give$/i.test(tokens[0])) {
+            const a = await find(tokens[1]);
+            if (!a) return `Allianz "${tokens[1]}" nicht gefunden.`;
+            let idx = parseInt(tokens[2], 10) - 1;
+            if (!(idx >= 0 && idx <= 4)) idx = MARKET_RESOURCE_NAMES.findIndex(n => n.toLowerCase() === String(tokens[2] || '').toLowerCase());
+            const amount = parseInt(tokens[3], 10);
+            if (!(idx >= 0 && idx <= 4) || !(amount >= 1)) return 'Aufruf: #kasse give <Allianz> <Ressource 1-5|Name> <Menge>';
+            const balance = await treasuryCredit(a.id, idx, amount, 'admin', null, 'Admin', 'Testgutschrift');
+            return `[${a.tag}] ${a.name}: +${marketNum(amount)} ${MARKET_RESOURCE_NAMES[idx]} -> Bestand ${marketNum(balance)}.`;
+        }
+        const isLog = /^log$/i.test(tokens[0]);
+        const a = await find(isLog ? tokens[1] : tokens[0]);
+        if (!a) return `Allianz "${isLog ? tokens[1] : tokens[0]}" nicht gefunden.`;
+        const balances = await treasuryBalances(a.id);
+        const log = await pool.query('SELECT * FROM alliance_treasury_log WHERE alliance_id = $1 ORDER BY id DESC LIMIT $2', [a.id, isLog ? 30 : 12]);
+        return `Kasse von [${a.tag}] ${a.name} (Allianz ${a.id}):\n` + balances.map((b, i) => `  ${MARKET_RESOURCE_NAMES[i]}: ${marketNum(b)}`).join('\n') +
+            `\n  Gesamtwert: ${marketNum(balances.reduce((s, b, i) => s + treasuryValuePoints(i, b), 0))} Punkte\n\nLetzte Eintraege:\n` +
+            (log.rows.length ? log.rows.map(line).join('\n') : '  (leer)');
     } catch (error) {
         return 'Fehler: ' + error.message;
     }
