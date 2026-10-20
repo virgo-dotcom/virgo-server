@@ -54,6 +54,7 @@
 //  §25  KAMPF V2 (Rundenkampf, Mischbonus, Zivile in letzter Reihe): steht VOR §21; aktiv nur bei COMBAT_ENGINE=shadow|v2
 //  §26  GALAXIE-REGISTER (planet_registry): serverautoritative Belegung, Schritt 1 (nur lesen/befuellen); steht VOR §21
 //  §28  INVENTAR (PlayFab Internal Data "inventory"): Kisten (Rohstoffe Ress01-10, Schiffe), Oeffnen, Admin-Vergabe "#inv"; steht VOR §21
+//  §34  ERFOLGE serverseitig (achievement_state/_locks/_log, GET /achievements, POST /achievements/claim, Admin "#achv"); steht VOR §21
 //  §33  STATIONIEREN + gemeinsames Verteidigen (stationed_fleets, /fleets/stationed, Kampf mit mehreren Teilnehmern); steht VOR §21
 //  §32  TERRAFORMING (Wartezeit, Abschluss, Abbruch durch Spieler/Angreifer, /planet/terraform-complete|abort); steht VOR §21
 //  §31  KOLONISATIONS-REGELN (Verwaltung/Habitat/Kosten, Pruefung in /planet/claim und beim Forschungs-Abschluss); steht VOR §21
@@ -1193,6 +1194,17 @@ async function initDatabase() {
         `);
         await pool.query(`CREATE INDEX IF NOT EXISTS idx_stationed_host ON stationed_fleets (host_coord);`);
         await pool.query(`CREATE INDEX IF NOT EXISTS idx_stationed_owner ON stationed_fleets (owner_commander_id);`);
+        // NEU 20.10.2026 (§34 Erfolge)
+        await pool.query(`CREATE TABLE IF NOT EXISTS achievement_state (
+            commander_id INTEGER NOT NULL, achievement_id TEXT NOT NULL,
+            unlocked_at TIMESTAMPTZ, claimed_at TIMESTAMPTZ, reward JSONB,
+            PRIMARY KEY (commander_id, achievement_id));`);
+        await pool.query(`CREATE TABLE IF NOT EXISTS achievement_locks (
+            commander_id INTEGER PRIMARY KEY, locked_until TIMESTAMPTZ NOT NULL, reason TEXT NOT NULL DEFAULT '', strikes INTEGER NOT NULL DEFAULT 1);`);
+        await pool.query(`CREATE TABLE IF NOT EXISTS achievement_log (
+            id SERIAL PRIMARY KEY, commander_id INTEGER NOT NULL, achievement_id TEXT NOT NULL DEFAULT '', event TEXT NOT NULL,
+            details JSONB, created_at TIMESTAMPTZ NOT NULL DEFAULT now());`);
+        await pool.query(`CREATE INDEX IF NOT EXISTS idx_achievement_log_commander ON achievement_log (commander_id, id DESC);`);
         await pool.query(`CREATE TABLE IF NOT EXISTS planet_freed (id SERIAL PRIMARY KEY, coord TEXT NOT NULL, freed_at TIMESTAMPTZ NOT NULL DEFAULT now());`);
         await pool.query(`CREATE INDEX IF NOT EXISTS idx_planet_freed_time ON planet_freed (freed_at);`);
 
@@ -4354,7 +4366,7 @@ const DB_EXPORT_TABLES = ['alliances', 'alliance_ranks', 'alliance_members', 'al
     'alliance_relationships', 'player_relationships', 'commander_highscore', 'legal_texts', 'dev_todos', 'announcements', 'virgodom_messages',
     'support_messages', 'player_reports', 'shop_items', 'promo_codes', 'promo_redemptions', 'giftbox_claims', 'giftbox_golden_claims',
     'market_offers', 'transport_deliveries', 'planet_registry', 'combat_reports', 'attack_traces', 'processed_fleets',
-    'galaxy_sectors', 'galaxy_config', 'galaxy_texts', 'stationed_fleets'];
+    'galaxy_sectors', 'galaxy_config', 'galaxy_texts', 'stationed_fleets', 'achievement_state', 'achievement_locks', 'achievement_log'];
 app.get('/admin/db-export', async (req, res) => {
     if (process.env.DB_EXPORT_ENABLED !== 'true') return res.status(404).json({ success: false, error: 'Nicht verfuegbar.' });
     if (!adminKeyOk(req.query.key)) return res.status(403).json({ success: false, error: 'Nicht autorisiert' });
@@ -6812,6 +6824,10 @@ async function buildPlayerInspectionReport(rawQuery) {
     // NEU 04.10.2026: Inventar-Werkzeug (§28) — Befehle mit "#inv" am Anfang
     if (/^\s*#inv\b/i.test(String(rawQuery || '')))
         return await buildInventoryAdminReport(String(rawQuery).trim());
+
+    // NEU 20.10.2026: Erfolge-Werkzeug (§34) — Befehle mit "#achv" am Anfang
+    if (/^\s*#achv\b/i.test(String(rawQuery || '')))
+        return await buildAchievementAdminReport(String(rawQuery).trim());
 
     // NEU 26.09.2026: Register-Werkzeug (§26) — Befehle mit "#register" am Anfang
     if (/^\s*#register\b/i.test(String(rawQuery || '')))
@@ -10024,6 +10040,367 @@ function stationedRecyclingText(report) {
     const parts = [];
     (report.recycling || []).forEach((n, i) => { if (n > 0) parts.push(`${n} ${STATIONED_RESOURCE_NAMES[i] || 'Ress0' + (i + 1)}`); });
     return parts.length > 0 ? 'Nach dem Kampf konnten folgende Ressourcen sichergestellt werden: ' + parts.join(', ') + '.' : '';   // LOCALIZE
+}
+
+// #####################################################################
+// §34  ERFOLGE (serverseitig geprueft) — NEU 20.10.2026
+//      Ob ein Erfolg erreicht ist und WELCHE Belohnung es gibt, entscheidet allein der Server. Der Client (Unity) kennt nur Anzeige-
+//      Daten (Assets: Name, Text, Bild) und zeigt an, was der Server liefert. Die Belohnung sind Kisten im Inventar (§28), die der
+//      Spieler selbst oeffnet (also keine Lagergrenze, nichts verfaellt).
+//
+//      Pruefungen beim Abholen (POST /achievements/claim):
+//        1) Spieler muss angemeldet sein (Ticket) und nicht gesperrt (achievement_locks).
+//        2) Der Server wertet die Bedingung SELBST aus: Zaehler aus Postgres (Kaempfe, Handel, Allianz, Freunde, Kolonien, Stationierung =
+//           nur Server-Daten) und Forschung/Gebaeude aus den gespeicherten Spielerdaten (PlayFab, vom Client geschrieben - daher die
+//           Plausibilitaetspruefung unten). E-Mail-Bestaetigung kommt von PlayFab (GetPlayerProfile).
+//        3) Abgleich mit dem Client: der Client meldet seinen eigenen Stand (reported.current). Behauptet er "erreicht", der Server findet
+//           es aber NICHT, gilt das als Abweichung: beim ersten Mal "gleich nochmal versuchen" (der Client speichert evtl. noch), tritt
+//           sie innerhalb von ACHV_MISMATCH_WINDOW_MINUTES erneut auf, wird der Spieler ACHV_LOCK_HOURS Stunden gesperrt (alle
+//           Belohnungs-Knoepfe), und der Vorfall steht in achievement_log (Admin: "#achv log"). Das Abholen ist atomar (UPDATE ... WHERE
+//           claimed_at IS NULL), eine Belohnung gibt es nie doppelt.
+//        Grenze (ehrlich): Forschung/Gebaeude liegen in client-schreibbaren Spielerdaten; wer die direkt faelscht, sieht fuer den Server
+//        konsistent aus. Das wird erst durch serverseitigen Besitz behoben (Sicherheits-Etappe "Besitz serverseitig"). Darum nur kleine
+//        Belohnungen (Kleine Kisten) und alles Messbare aus Server-Daten (Kampf, Handel, Allianz, Freunde, Kolonien, Stationierung).
+//
+//      Tabellen: achievement_state (je Spieler+Erfolg: freigeschaltet/abgeholt), achievement_locks, achievement_log.
+//      Routen: GET /achievements?commanderId=, POST /achievements/claim. Admin: Befehl "#achv" im Spieler-Info-Feld.
+//      Katalog: Tools/Erfolge/erfolge_katalog.js (einzige Quelle; sync.js schreibt Assets UND den Katalog unten).
+// #####################################################################
+
+const ACHV_LOCK_HOURS = 24;
+const ACHV_MISMATCH_WINDOW_MINUTES = 10;
+const ACHV_TUTORIAL_DONE_STEP = 100;      // = TutorialManager.StepDone im Client
+const ACHV_SMALL_CRATES = ['crate_res_0', 'crate_res_1', 'crate_res_2', 'crate_res_3', 'crate_res_4'];
+const ACHV_RESEARCH_FIELDS = ['ress01', 'ress02', 'ress03', 'ress04', 'ress05', 'weapon01', 'weapon02', 'weapon03', 'shield01', 'shield02', 'shield03',
+    'engine01', 'engine02', 'engine03', 'engine04', 'recycling', 'reparatur', 'terraforming', 'verwaltung', 'architektur', 'ingenieurwesen', 'wirtschaftslehre'];
+
+// ACHV-KATALOG-START (erzeugt von Tools/Erfolge/sync.js aus erfolge_katalog.js - NICHT von Hand aendern)
+const ACHV_CATALOG = [
+    {"id":"eco_energy_5","cat":"wirtschaft","cond":{"t":"building","i":1,"l":5},"reward":{"items":[{"i":"crate_res_0","q":1}]}},
+    {"id":"eco_energy_10","cat":"wirtschaft","cond":{"t":"building","i":1,"l":10},"reward":{"items":[{"i":"crate_res_0","q":2}]}},
+    {"id":"eco_energy_15","cat":"wirtschaft","cond":{"t":"building","i":1,"l":15},"reward":{"items":[{"i":"crate_res_0","q":3}]}},
+    {"id":"eco_water_5","cat":"wirtschaft","cond":{"t":"building","i":2,"l":5},"reward":{"items":[{"i":"crate_res_1","q":1}]}},
+    {"id":"eco_water_10","cat":"wirtschaft","cond":{"t":"building","i":2,"l":10},"reward":{"items":[{"i":"crate_res_1","q":2}]}},
+    {"id":"eco_water_15","cat":"wirtschaft","cond":{"t":"building","i":2,"l":15},"reward":{"items":[{"i":"crate_res_1","q":3}]}},
+    {"id":"eco_metal_5","cat":"wirtschaft","cond":{"t":"building","i":3,"l":5},"reward":{"items":[{"i":"crate_res_2","q":1}]}},
+    {"id":"eco_metal_10","cat":"wirtschaft","cond":{"t":"building","i":3,"l":10},"reward":{"items":[{"i":"crate_res_2","q":2}]}},
+    {"id":"eco_metal_15","cat":"wirtschaft","cond":{"t":"building","i":3,"l":15},"reward":{"items":[{"i":"crate_res_2","q":3}]}},
+    {"id":"eco_tools_5","cat":"wirtschaft","cond":{"t":"building","i":4,"l":5},"reward":{"items":[{"i":"crate_res_3","q":1}]}},
+    {"id":"eco_tools_10","cat":"wirtschaft","cond":{"t":"building","i":4,"l":10},"reward":{"items":[{"i":"crate_res_3","q":2}]}},
+    {"id":"eco_tools_15","cat":"wirtschaft","cond":{"t":"building","i":4,"l":15},"reward":{"items":[{"i":"crate_res_3","q":3}]}},
+    {"id":"eco_hq_5","cat":"wirtschaft","cond":{"t":"building","i":0,"l":5},"reward":{"random":1}},
+    {"id":"eco_hq_10","cat":"wirtschaft","cond":{"t":"building","i":0,"l":10},"reward":{"random":2}},
+    {"id":"eco_sale_1","cat":"wirtschaft","cond":{"t":"count","s":"marketSales","n":1},"reward":{"random":1}},
+    {"id":"eco_sale_10","cat":"wirtschaft","cond":{"t":"count","s":"marketSales","n":10},"reward":{"random":2}},
+    {"id":"eco_buy_1","cat":"wirtschaft","cond":{"t":"count","s":"marketPurchases","n":1},"reward":{"random":1}},
+    {"id":"first_warship","cat":"militaer","cond":{"t":"researchAll","r":[["weapon01",1],["shield01",1]]},"reward":{"random":1}},
+    {"id":"mil_win_1","cat":"militaer","cond":{"t":"count","s":"combatWins","n":1},"reward":{"random":1}},
+    {"id":"mil_win_10","cat":"militaer","cond":{"t":"count","s":"combatWins","n":10},"reward":{"random":2}},
+    {"id":"mil_win_50","cat":"militaer","cond":{"t":"count","s":"combatWins","n":50},"reward":{"items":[{"i":"crate_warship_0","q":1}]}},
+    {"id":"mil_def_1","cat":"militaer","cond":{"t":"count","s":"defenseWins","n":1},"reward":{"random":1}},
+    {"id":"mil_def_10","cat":"militaer","cond":{"t":"count","s":"defenseWins","n":10},"reward":{"random":2}},
+    {"id":"mil_yard_5","cat":"militaer","cond":{"t":"building","i":5,"l":5},"reward":{"random":1}},
+    {"id":"tech_first","cat":"technologie","cond":{"t":"researchSum","l":1},"reward":{"random":1}},
+    {"id":"tech_lab_5","cat":"technologie","cond":{"t":"building","i":6,"l":5},"reward":{"random":1}},
+    {"id":"tech_lab_10","cat":"technologie","cond":{"t":"building","i":6,"l":10},"reward":{"random":2}},
+    {"id":"tech_habitat_1","cat":"technologie","cond":{"t":"research","f":"terraforming","l":1},"reward":{"random":1}},
+    {"id":"tech_habitat_5","cat":"technologie","cond":{"t":"research","f":"terraforming","l":5},"reward":{"random":2}},
+    {"id":"tech_admin_3","cat":"technologie","cond":{"t":"research","f":"verwaltung","l":3},"reward":{"random":1}},
+    {"id":"tech_engine_1","cat":"technologie","cond":{"t":"research","f":"engine01","l":1},"reward":{"random":1}},
+    {"id":"tutorial_done","cat":"expansion","cond":{"t":"tutorial"},"reward":{"items":[{"i":"crate_res_0","q":1},{"i":"crate_res_1","q":1},{"i":"crate_res_2","q":1},{"i":"crate_res_3","q":1},{"i":"crate_warship_0","q":1}]}},
+    {"id":"exp_email","cat":"expansion","cond":{"t":"emailVerified"},"reward":{"random":1}},
+    {"id":"exp_colony_3","cat":"expansion","cond":{"t":"count","s":"colonies","n":3},"reward":{"random":2}},
+    {"id":"exp_colony_5","cat":"expansion","cond":{"t":"count","s":"colonies","n":5},"reward":{"random":3}},
+    {"id":"exp_alliance","cat":"expansion","cond":{"t":"count","s":"alliance","n":1},"reward":{"random":1}},
+    {"id":"exp_friend_1","cat":"expansion","cond":{"t":"count","s":"friends","n":1},"reward":{"random":1}},
+    {"id":"exp_friend_5","cat":"expansion","cond":{"t":"count","s":"friends","n":5},"reward":{"random":2}},
+    {"id":"exp_stationed","cat":"expansion","cond":{"t":"count","s":"stationed","n":1},"reward":{"random":1}}
+];
+// ACHV-KATALOG-ENDE
+
+// Zaehler aus der Datenbank (alles Server-Daten)
+const ACHV_COUNTERS = {
+    colonies:        `SELECT COUNT(*)::int AS n FROM planet_registry WHERE owner_commander_id = $1 AND kind = 'player' AND terraform_until IS NULL`,
+    combatWins:      `SELECT COUNT(*)::int AS n FROM combat_reports WHERE attacker_commander_id = $1 AND attacker_wins = true AND defender_commander_id IS DISTINCT FROM $1`,
+    defenseWins:     `SELECT COUNT(*)::int AS n FROM combat_reports WHERE defender_commander_id = $1 AND attacker_wins = false AND attacker_commander_id IS DISTINCT FROM $1`,
+    marketSales:     `SELECT COUNT(*)::int AS n FROM market_offers WHERE seller_commander_id = $1 AND status = 'sold'`,
+    marketPurchases: `SELECT COUNT(*)::int AS n FROM market_offers WHERE buyer_commander_id = $1 AND status = 'sold'`,
+    friends:         `SELECT COUNT(*)::int AS n FROM player_relationships WHERE status = 'friend' AND (commander_id_a = $1 OR commander_id_b = $1)`,
+    alliance:        `SELECT COUNT(*)::int AS n FROM alliance_members WHERE commander_id = $1`,
+    stationed:       `SELECT COUNT(*)::int AS n FROM stationed_fleets WHERE owner_commander_id = $1`
+};
+
+// Auswertungs-Kontext: laedt Spielerdaten erst, wenn eine Bedingung sie braucht (und nur einmal je Anfrage)
+function achvContext(playFabId, commanderId) {
+    const cache = {};
+    return {
+        playFabId, commanderId,
+        async commander() {
+            if (!cache.commander) {
+                const r = await playfabServer('/Server/GetUserData', { PlayFabId: playFabId, Keys: ['commander_data'] });
+                cache.commander = r && r.Data && r.Data.commander_data ? JSON.parse(r.Data.commander_data.Value) : {};
+            }
+            return cache.commander;
+        },
+        async planets() {
+            if (!cache.planets) {
+                const reg = await pool.query(`SELECT coord FROM planet_registry WHERE owner_commander_id = $1 AND kind = 'player'`, [commanderId]);
+                const coords = reg.rows.map(x => x.coord);
+                cache.planets = coords.length > 0 ? Object.values(await marketLoadPlanets(playFabId, coords)) : [];
+            }
+            return cache.planets;
+        },
+        async emailVerified() {
+            if (cache.email === undefined) {
+                try {
+                    const r = await playfabServer('/Server/GetPlayerProfile', { PlayFabId: playFabId, ProfileConstraints: { ShowContactEmailAddresses: true } });
+                    const list = (r && r.PlayerProfile && r.PlayerProfile.ContactEmailAddresses) || [];
+                    cache.email = list.some(e => e && e.VerificationStatus === 'Confirmed');
+                } catch (e) {
+                    console.error('[Erfolge] E-Mail-Status nicht lesbar:', e.message);
+                    cache.email = false;
+                }
+            }
+            return cache.email;
+        },
+        async count(source) {
+            const sql = ACHV_COUNTERS[source];
+            if (!sql) return 0;
+            const r = await pool.query(sql, [commanderId]);
+            return r.rows[0] ? Number(r.rows[0].n) || 0 : 0;
+        }
+    };
+}
+
+function achvTarget(cond) {
+    switch (cond.t) {
+        case 'building': case 'research': case 'researchSum': return cond.l;
+        case 'researchAll': return cond.r.length;
+        case 'count': return cond.n;
+        case 'tutorial': return 4;
+        default: return 1;
+    }
+}
+
+// Fortschritt: { current, target }; current ist auf target begrenzt
+async function achvProgress(def, ctx) {
+    const c = def.cond;
+    const clamp = (cur, target) => ({ current: Math.max(0, Math.min(Number(cur) || 0, target)), target });
+    switch (c.t) {
+        case 'building': {
+            let best = 0;
+            for (const p of await ctx.planets()) best = Math.max(best, Number(p.buildings && p.buildings[c.i]) || 0);
+            return clamp(best, c.l);
+        }
+        case 'research': return clamp((await ctx.commander())[c.f], c.l);
+        case 'researchAll': {
+            const cm = await ctx.commander();
+            return clamp(c.r.filter(([f, l]) => (Number(cm[f]) || 0) >= l).length, c.r.length);
+        }
+        case 'researchSum': {
+            const cm = await ctx.commander();
+            return clamp(ACHV_RESEARCH_FIELDS.reduce((s, f) => s + (Number(cm[f]) || 0), 0), c.l);
+        }
+        case 'count': return clamp(await ctx.count(c.s), c.n);
+        case 'emailVerified': return clamp(await ctx.emailVerified() ? 1 : 0, 1);
+        case 'tutorial': {
+            const cm = await ctx.commander();
+            const planets = await ctx.planets();
+            const hq = planets.some(p => (Number(p.buildings && p.buildings[0]) || 0) >= 2);
+            const energy = planets.some(p => (Number(p.buildings && p.buildings[1]) || 0) >= 1);
+            const done = (Number(cm.tutorialStep) || 0) >= ACHV_TUTORIAL_DONE_STEP;
+            const email = await ctx.emailVerified();
+            return clamp([hq, energy, done, email].filter(Boolean).length, 4);
+        }
+        default: return { current: 0, target: 1 };
+    }
+}
+
+function achvRewardText(reward) {
+    if (reward && reward.items) return reward.items.map(x => `${x.q}x ${inventoryItemLabel(x.i)}`).join(', ');
+    if (reward && reward.random) return `${reward.random}x Zufällige Kleine Kiste`;
+    return '';
+}
+
+// Kisten auswuerfeln (zufaellig: Kleine Kisten Ress01-05) und gutschreiben. Rueckgabe: [{ itemId, qty, label }]
+async function achvGrantReward(playFabId, reward) {
+    let list = [];
+    if (reward.items) list = reward.items.map(x => ({ itemId: x.i, qty: x.q }));
+    else for (let k = 0; k < (reward.random || 0); k++) list.push({ itemId: ACHV_SMALL_CRATES[Math.floor(Math.random() * ACHV_SMALL_CRATES.length)], qty: 1 });
+    const merged = new Map();
+    for (const x of list) merged.set(x.itemId, (merged.get(x.itemId) || 0) + x.qty);
+    const granted = [];
+    for (const [itemId, qty] of merged) {
+        await inventoryGrant(playFabId, itemId, qty);
+        granted.push({ itemId, qty, label: inventoryItemLabel(itemId) });
+    }
+    return granted;
+}
+
+async function achvLog(commanderId, achievementId, event, details) {
+    try {
+        await pool.query('INSERT INTO achievement_log (commander_id, achievement_id, event, details) VALUES ($1, $2, $3, $4)',
+            [commanderId, achievementId || '', event, JSON.stringify(details || {})]);
+    } catch (e) { console.error('[Erfolge] Log-Fehler:', e.message); }
+}
+
+async function achvActiveLock(commanderId) {
+    const r = await pool.query('SELECT locked_until, reason FROM achievement_locks WHERE commander_id = $1 AND locked_until > now()', [commanderId]);
+    return r.rows[0] ? { until: new Date(r.rows[0].locked_until).toISOString(), reason: r.rows[0].reason } : null;
+}
+
+async function achvSetLock(commanderId, reason) {
+    const r = await pool.query(
+        `INSERT INTO achievement_locks (commander_id, locked_until, reason, strikes) VALUES ($1, now() + make_interval(hours => $2), $3, 1)
+         ON CONFLICT (commander_id) DO UPDATE SET locked_until = now() + make_interval(hours => $2), reason = $3, strikes = achievement_locks.strikes + 1
+         RETURNING locked_until`, [commanderId, ACHV_LOCK_HOURS, reason]);
+    return new Date(r.rows[0].locked_until).toISOString();
+}
+
+app.get('/achievements', async (req, res) => {
+    const commanderId = parseInt(req.query.commanderId, 10);
+    if (!commanderId) return res.status(400).json({ success: false, error: 'Ungültige Angaben.' });
+    const caller = await requireCaller(req, res, { commanderId });
+    if (!caller) return;
+    try {
+        const ctx = achvContext(caller.playFabId, caller.commanderId);
+        const stRows = await pool.query('SELECT achievement_id, unlocked_at, claimed_at FROM achievement_state WHERE commander_id = $1', [caller.commanderId]);
+        const states = new Map(stRows.rows.map(r => [r.achievement_id, r]));
+        const lock = await achvActiveLock(caller.commanderId);
+        const items = [];
+        const newlyUnlocked = [];
+        for (const def of ACHV_CATALOG) {
+            const st = states.get(def.id);
+            const target = achvTarget(def.cond);
+            let progress;
+            if (st && st.claimed_at) progress = { current: target, target };
+            else progress = await achvProgress(def, ctx);
+            const met = progress.current >= progress.target;
+            if (met && !(st && st.unlocked_at)) newlyUnlocked.push(def.id);
+            items.push({ id: def.id, cat: def.cat, current: progress.current, target: progress.target,
+                unlocked: met || !!(st && st.unlocked_at), claimed: !!(st && st.claimed_at), reward: achvRewardText(def.reward) });
+        }
+        for (const id of newlyUnlocked)
+            await pool.query(`INSERT INTO achievement_state (commander_id, achievement_id, unlocked_at) VALUES ($1, $2, now()) ON CONFLICT (commander_id, achievement_id) DO NOTHING`, [caller.commanderId, id]);
+        res.json({ success: true, serverTime: new Date().toISOString(), lockedUntil: lock ? lock.until : '', lockReason: lock ? lock.reason : '', items });
+    } catch (error) {
+        console.error('[Erfolge] Liste Fehler:', error.message);
+        res.status(500).json({ success: false, error: 'Erfolge gerade nicht verfügbar.' });
+    }
+});
+
+app.post('/achievements/claim', async (req, res) => {
+    const commanderId = parseInt(req.body && req.body.commanderId, 10);
+    const achievementId = String(req.body && req.body.achievementId || '').slice(0, 60);
+    const reportedCurrent = Number(req.body && req.body.reported && req.body.reported.current);
+    if (!commanderId || !achievementId) return res.status(400).json({ success: false, error: 'Ungültige Angaben.' });
+    const caller = await requireCaller(req, res, { commanderId });
+    if (!caller) return;
+    const def = ACHV_CATALOG.find(x => x.id === achievementId);
+    if (!def) return res.status(404).json({ success: false, error: 'Diesen Erfolg gibt es nicht.' });
+    const cid = caller.commanderId;
+    try {
+        const lock = await achvActiveLock(cid);
+        if (lock) {
+            await achvLog(cid, achievementId, 'GESPERRT-VERSUCH', { until: lock.until });
+            return res.status(423).json({ success: false, error: 'Belohnungen sind vorübergehend gesperrt.', lockedUntil: lock.until });
+        }
+
+        const st = (await pool.query('SELECT unlocked_at, claimed_at FROM achievement_state WHERE commander_id = $1 AND achievement_id = $2', [cid, achievementId])).rows[0];
+        if (st && st.claimed_at) return res.status(409).json({ success: false, error: 'Diese Belohnung hast du schon abgeholt.' });
+
+        // Pruefung 2: der Server wertet die Bedingung selbst aus (oder hat sie schon einmal als erreicht gesehen)
+        const ctx = achvContext(caller.playFabId, cid);
+        const target = achvTarget(def.cond);
+        const progress = await achvProgress(def, ctx);
+        const met = progress.current >= target || !!(st && st.unlocked_at);
+
+        if (!met) {
+            // Pruefung 3: Abgleich mit dem Client
+            const clientSaysMet = Number.isFinite(reportedCurrent) && reportedCurrent >= target;
+            if (!clientSaysMet) {
+                await achvLog(cid, achievementId, 'NICHT-ERREICHT', { server: progress.current, target, client: Number.isFinite(reportedCurrent) ? reportedCurrent : null });
+                return res.status(400).json({ success: false, error: 'Dieser Erfolg ist noch nicht erreicht.', current: progress.current, target });
+            }
+            const recent = await pool.query(
+                `SELECT COUNT(*)::int AS n FROM achievement_log WHERE commander_id = $1 AND achievement_id = $2 AND event = 'ABWEICHUNG'
+                   AND created_at > now() - make_interval(mins => $3)`, [cid, achievementId, ACHV_MISMATCH_WINDOW_MINUTES]);
+            const details = { server: progress.current, client: reportedCurrent, target };
+            if ((recent.rows[0] ? recent.rows[0].n : 0) >= 1) {
+                await achvLog(cid, achievementId, 'ABWEICHUNG', details);
+                const until = await achvSetLock(cid, `Abweichung bei ${achievementId}: Client meldet ${reportedCurrent}, Server findet ${progress.current} (Ziel ${target})`);
+                await achvLog(cid, achievementId, 'SPERRE', Object.assign({ until }, details));
+                console.warn(`[Erfolge] SPERRE ${cid}: ${achievementId} Client ${reportedCurrent} / Server ${progress.current} / Ziel ${target}`);
+                return res.status(423).json({ success: false, error: 'Dein Spielstand passt nicht zu den Servern. Belohnungen sind für 24 Stunden gesperrt.', lockedUntil: until });
+            }
+            await achvLog(cid, achievementId, 'ABWEICHUNG', details);
+            return res.status(409).json({ success: false, retry: true, error: 'Dein Stand wird abgeglichen. Versuche es in einer Minute noch einmal.' });
+        }
+
+        // atomar abholen: nur wer die Zeile von "nicht abgeholt" auf "abgeholt" setzt, bekommt die Belohnung
+        await pool.query(`INSERT INTO achievement_state (commander_id, achievement_id, unlocked_at) VALUES ($1, $2, now()) ON CONFLICT (commander_id, achievement_id) DO NOTHING`, [cid, achievementId]);
+        const claim = await pool.query('UPDATE achievement_state SET claimed_at = now() WHERE commander_id = $1 AND achievement_id = $2 AND claimed_at IS NULL RETURNING achievement_id', [cid, achievementId]);
+        if (claim.rows.length === 0) return res.status(409).json({ success: false, error: 'Diese Belohnung hast du schon abgeholt.' });
+
+        let granted;
+        try {
+            granted = await achvGrantReward(caller.playFabId, def.reward);
+        } catch (e) {
+            await pool.query('UPDATE achievement_state SET claimed_at = NULL WHERE commander_id = $1 AND achievement_id = $2', [cid, achievementId]);
+            await achvLog(cid, achievementId, 'BELOHNUNG-FEHLER', { error: e.message });
+            console.error('[Erfolge] Belohnung Fehler:', e.message);
+            return res.status(500).json({ success: false, error: 'Belohnung konnte nicht gutgeschrieben werden. Bitte später erneut versuchen.' });
+        }
+        await pool.query('UPDATE achievement_state SET reward = $3 WHERE commander_id = $1 AND achievement_id = $2', [cid, achievementId, JSON.stringify(granted)]);
+        await achvLog(cid, achievementId, 'ABGEHOLT', { granted, server: progress.current, client: Number.isFinite(reportedCurrent) ? reportedCurrent : null });
+        res.json({ success: true, achievementId, granted, text: granted.map(g => `${g.qty}x ${g.label}`).join('\n') });
+    } catch (error) {
+        console.error('[Erfolge] Abholen Fehler:', error.message);
+        res.status(500).json({ success: false, error: 'Abholen gerade nicht möglich.' });
+    }
+});
+
+// -------------------------------------------------------
+// ADMIN-Befehl "#achv" (Spieler-Info-Feld):  #achv <Commander-ID>  |  #achv log [<Commander-ID>]  |  #achv unlock <Commander-ID>  |  #achv reset <Commander-ID> <erfolgId>
+// -------------------------------------------------------
+async function buildAchievementAdminReport(rawQuery) {
+    const tokens = String(rawQuery || '').trim().split(/\s+/).slice(1);
+    const help = 'ERFOLGE-Admin:\n  #achv <Commander-ID>                 Stand, Sperre und letzte Ereignisse\n  #achv log [<Commander-ID>]           letzte 30 Ereignisse (alle oder ein Spieler)\n' +
+        '  #achv unlock <Commander-ID>          Sperre aufheben\n  #achv reset <Commander-ID> <erfolgId>  Abholung zuruecksetzen (zum Testen)\n\nErfolge: ' + ACHV_CATALOG.map(d => d.id).join(', ');
+    if (tokens.length === 0 || /^(help|hilfe|\?)$/i.test(tokens[0])) return help;
+    const fmtLog = r => `  ${new Date(r.created_at).toISOString().replace('T', ' ').slice(0, 19)}  ${r.commander_id}  ${r.event}  ${r.achievement_id}  ${typeof r.details === 'string' ? r.details : JSON.stringify(r.details)}`;
+    try {
+        if (/^log$/i.test(tokens[0])) {
+            const id = tokens[1] ? parseInt(tokens[1], 10) : null;
+            const r = id ? await pool.query('SELECT * FROM achievement_log WHERE commander_id = $1 ORDER BY id DESC LIMIT 30', [id])
+                         : await pool.query('SELECT * FROM achievement_log ORDER BY id DESC LIMIT 30');
+            return 'Erfolge-Log (neueste zuerst):\n' + (r.rows.length ? r.rows.map(fmtLog).join('\n') : '  (leer)');
+        }
+        if (/^unlock$/i.test(tokens[0])) {
+            const id = parseInt(tokens[1], 10);
+            if (!id) return 'Commander-ID fehlt.';
+            const r = await pool.query('UPDATE achievement_locks SET locked_until = now() WHERE commander_id = $1 AND locked_until > now() RETURNING commander_id', [id]);
+            await achvLog(id, '', 'ADMIN-ENTSPERRT', {});
+            return r.rows.length ? `Sperre von ${id} aufgehoben.` : `${id} war nicht gesperrt.`;
+        }
+        if (/^reset$/i.test(tokens[0])) {
+            const id = parseInt(tokens[1], 10), ach = tokens[2];
+            if (!id || !ach) return 'Aufruf: #achv reset <Commander-ID> <erfolgId>';
+            const r = await pool.query('DELETE FROM achievement_state WHERE commander_id = $1 AND achievement_id = $2 RETURNING achievement_id', [id, ach]);
+            await achvLog(id, ach, 'ADMIN-ZURUECKGESETZT', {});
+            return r.rows.length ? `${ach} von ${id} zurückgesetzt (Kisten bleiben beim Spieler).` : 'Kein Eintrag gefunden.';
+        }
+        const id = parseInt(tokens[0], 10);
+        if (!id) return help;
+        const st = await pool.query('SELECT achievement_id, unlocked_at, claimed_at FROM achievement_state WHERE commander_id = $1 ORDER BY achievement_id', [id]);
+        const lock = await achvActiveLock(id);
+        const log = await pool.query('SELECT * FROM achievement_log WHERE commander_id = $1 ORDER BY id DESC LIMIT 15', [id]);
+        return `Erfolge von ${id}:\n` + (lock ? `  GESPERRT bis ${lock.until}: ${lock.reason}\n` : '  nicht gesperrt\n') +
+            (st.rows.length ? st.rows.map(r => `  ${r.claimed_at ? '[abgeholt]   ' : '[freigeschaltet]'} ${r.achievement_id}`).join('\n') : '  (noch nichts freigeschaltet)') +
+            '\n\nLetzte Ereignisse:\n' + (log.rows.length ? log.rows.map(fmtLog).join('\n') : '  (keine)');
+    } catch (error) {
+        return 'Fehler: ' + error.message;
+    }
 }
 
 // #####################################################################
