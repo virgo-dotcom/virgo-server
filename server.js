@@ -870,13 +870,13 @@ async function initDatabase() {
             // Stueck ueber das Mengenfeld im Shop). ICC-Wert = Baukosten (Summe Ress x Wertgewicht) / 1.200 Wertpunkte je ICC x 10 (Aufschlag:
             // der Spieler spart sich Bauzeit, ICC ist Pay-to-Accelerate), dann wie im Einzelhandel auf eine 9 am Ende aufgerundet
             // (shopShipIccPrice, §28). Frueher pauschal 250 ICC je Paket mit 1-100 Schiffen.
-            ['fleet_warship01', '1x Orbitaljaeger (Warship01)',   'flotten',    shopShipIccPrice('warship', 0, 1),    'warship',  0, 1],
-            ['fleet_warship02', '1x Raumjaeger (Warship02)',      'flotten',    shopShipIccPrice('warship', 1, 1),    'warship',  1, 1],
-            ['fleet_warship03', '1x Kosmosjaeger (Warship03)',    'flotten',    shopShipIccPrice('warship', 2, 1),    'warship',  2, 1],
-            ['fleet_warship04', '1x Sternkreuzer (Warship04)',    'flotten',    shopShipIccPrice('warship', 3, 1),    'warship',  3, 1],
-            ['fleet_ship01',    '1x Containerschiff (Ship01)',    'flotten',    shopShipIccPrice('ship', 1, 1),       'ship',     1, 1],
-            ['fleet_ship03',    '1x Kolonisationsschiff (Ship03)','flotten',    shopShipIccPrice('ship', 3, 1),       'ship',     3, 1],
-            ['item_ship05',     '1x Kernbombe (Ship05)',          'gegenstaende', 100000, 'ship', 5, 1],   // Nutzer-Vorgabe 04.10.2026: 100.000 ICC (vorher 1.000)
+            ['fleet_warship01', '1x Orbitaljaeger',   'flotten',    shopShipIccPrice('warship', 0, 1),    'warship',  0, 1],
+            ['fleet_warship02', '1x Raumjaeger',      'flotten',    shopShipIccPrice('warship', 1, 1),    'warship',  1, 1],
+            ['fleet_warship03', '1x Kosmosjaeger',    'flotten',    shopShipIccPrice('warship', 2, 1),    'warship',  2, 1],
+            ['fleet_warship04', '1x Sternkreuzer',    'flotten',    shopShipIccPrice('warship', 3, 1),    'warship',  3, 1],
+            ['fleet_ship01',    '1x Containerschiff',    'flotten',    shopShipIccPrice('ship', 1, 1),       'ship',     1, 1],
+            ['fleet_ship03',    '1x Kolonisationsschiff','flotten',    shopShipIccPrice('ship', 3, 1),       'ship',     3, 1],
+            ['item_ship05',     '1x Kernbombe',          'gegenstaende', 100000, 'ship', 5, 1],   // Nutzer-Vorgabe 04.10.2026: 100.000 ICC (vorher 1.000)
             // NEU (04.10.2026): KISTEN fuer das Inventar (§28). reward_kind 'inventory': item_id = Inventar-Gegenstand, reward_amount =
             // Anzahl Kisten je Kauf; sie landen im Inventar des Kaeufers (nicht auf einem Planeten). "Kleine Kiste" (erste Serie, Nutzer-Vorgabe):
             // Inhalt = Ressourcenpaket des Shops (Energie 5.000, Wasserstoff 7.500, Metalle 10.000, Werkzeuge 7.500, Credits 2.500) fuer
@@ -887,12 +887,12 @@ async function initDatabase() {
             ['crate_res_2',     'Kleine Kiste: Metalle (10.000)',      'gegenstaende', 100,  'inventory', 0, 1],
             ['crate_res_3',     'Kleine Kiste: Werkzeuge (7.500)',     'gegenstaende', 100,  'inventory', 0, 1],
             ['crate_res_4',     'Kleine Kiste: Credits (2.500)',       'gegenstaende', 100,  'inventory', 0, 1],
-            ['crate_warship_0', 'Schiffskiste Orbitaljaeger (Warship01)', 'gegenstaende', shopShipIccPrice('warship', 0, 1), 'inventory', 0, 1],
-            ['crate_warship_1', 'Schiffskiste Raumjaeger (Warship02)',    'gegenstaende', shopShipIccPrice('warship', 1, 1), 'inventory', 0, 1],
-            ['crate_warship_2', 'Schiffskiste Kosmosjaeger (Warship03)',  'gegenstaende', shopShipIccPrice('warship', 2, 1), 'inventory', 0, 1],
-            ['crate_warship_3', 'Schiffskiste Sternkreuzer (Warship04)',  'gegenstaende', shopShipIccPrice('warship', 3, 1), 'inventory', 0, 1],
-            ['crate_ship_1',    'Schiffskiste Containerschiff (Ship01)',  'gegenstaende', shopShipIccPrice('ship', 1, 1),    'inventory', 0, 1],
-            ['crate_ship_3',    'Schiffskiste Kolonisationsschiff (Ship03)', 'gegenstaende', shopShipIccPrice('ship', 3, 1),   'inventory', 0, 1]
+            ['crate_warship_0', 'Schiffskiste Orbitaljaeger', 'gegenstaende', shopShipIccPrice('warship', 0, 1), 'inventory', 0, 1],
+            ['crate_warship_1', 'Schiffskiste Raumjaeger',    'gegenstaende', shopShipIccPrice('warship', 1, 1), 'inventory', 0, 1],
+            ['crate_warship_2', 'Schiffskiste Kosmosjaeger',  'gegenstaende', shopShipIccPrice('warship', 2, 1), 'inventory', 0, 1],
+            ['crate_warship_3', 'Schiffskiste Sternkreuzer',  'gegenstaende', shopShipIccPrice('warship', 3, 1), 'inventory', 0, 1],
+            ['crate_ship_1',    'Schiffskiste Containerschiff',  'gegenstaende', shopShipIccPrice('ship', 1, 1),    'inventory', 0, 1],
+            ['crate_ship_3',    'Schiffskiste Kolonisationsschiff', 'gegenstaende', shopShipIccPrice('ship', 3, 1),   'inventory', 0, 1]
         ];
         for (const row of defaultShopItems) {
             await pool.query(
@@ -919,6 +919,12 @@ async function initDatabase() {
                 `UPDATE shop_items SET cost_icc = $2, display_name = $3, reward_amount = $5 WHERE item_id = $1 AND cost_icc = ANY($4::int[])`,
                 [row[0], row[3], row[1], previous, row[6]]
             );
+        }
+
+        // NEU (20.10.2026): Keine internen Kennungen ("(Warship01)", "(Ship03)") mehr in Shop-Namen (Regel: ingame nur Namen). Nur Zeilen mit dem alten Standardnamen.
+        const shopNameFixes = [["1x Orbitaljaeger (Warship01)","1x Orbitaljaeger"],["1x Raumjaeger (Warship02)","1x Raumjaeger"],["1x Kosmosjaeger (Warship03)","1x Kosmosjaeger"],["1x Sternkreuzer (Warship04)","1x Sternkreuzer"],["1x Containerschiff (Ship01)","1x Containerschiff"],["1x Kolonisationsschiff (Ship03)","1x Kolonisationsschiff"],["1x Kernbombe (Ship05)","1x Kernbombe"],["Schiffskiste Orbitaljaeger (Warship01)","Schiffskiste Orbitaljaeger"],["Schiffskiste Raumjaeger (Warship02)","Schiffskiste Raumjaeger"],["Schiffskiste Kosmosjaeger (Warship03)","Schiffskiste Kosmosjaeger"],["Schiffskiste Sternkreuzer (Warship04)","Schiffskiste Sternkreuzer"],["Schiffskiste Containerschiff (Ship01)","Schiffskiste Containerschiff"],["Schiffskiste Kolonisationsschiff (Ship03)","Schiffskiste Kolonisationsschiff"]];
+        for (const [oldName, newName] of shopNameFixes) {
+            await pool.query('UPDATE shop_items SET display_name = $2 WHERE display_name = $1', [oldName, newName]);
         }
 
         // NEU (04.10.2026): Ressourcen umbenannt (vorher Werkzeug/Daten; seit der zweiten Umstellung am selben Tag: Index 3 = Werkzeuge, Index 4 = Credits) UND
@@ -4799,7 +4805,7 @@ async function serverTickHandler(req, res) {
                                     const tf = await terraformCompleteForPlanet(playFabId, coord, planet, now);
                                     if (tf.completed) {
                                         await sendMail(commander, 'Terraforming abgeschlossen', // LOCALIZE
-                                            `Das Terraforming von ${coord} ist abgeschlossen. Der Planet ist jetzt voll nutzbar (Kommandozentrale Stufe 1, ${COLONY_START_RESOURCES} Einheiten Ress01-04 gutgeschrieben).`, 1);
+                                            `Das Terraforming von ${coord} ist abgeschlossen. Der Planet ist jetzt voll nutzbar (Kommandozentrale Stufe 1, ${COLONY_START_RESOURCES} Einheiten ${MARKET_RESOURCE_NAMES.slice(0, 3).join(', ')} und ${MARKET_RESOURCE_NAMES[3]} gutgeschrieben).`, 1);
                                         changed = true;
                                     }
                                 } catch (e) { console.error('[Terraforming] Tick-Abschluss Fehler:', e.message); }
@@ -9690,7 +9696,7 @@ app.post('/planet/terraform-complete', async (req, res) => {
         const r = await terraformCompleteForPlanet(caller.playFabId, coord, planet, new Date());
         if (r.completed) {
             await sendMail(own.commander, 'Terraforming abgeschlossen', // LOCALIZE
-                `Das Terraforming von ${coord} ist abgeschlossen. Der Planet ist jetzt voll nutzbar (Kommandozentrale Stufe 1, ${COLONY_START_RESOURCES} Einheiten Ress01-04 gutgeschrieben).`, 1);
+                `Das Terraforming von ${coord} ist abgeschlossen. Der Planet ist jetzt voll nutzbar (Kommandozentrale Stufe 1, ${COLONY_START_RESOURCES} Einheiten ${MARKET_RESOURCE_NAMES.slice(0, 3).join(', ')} und ${MARKET_RESOURCE_NAMES[3]} gutgeschrieben).`, 1);
             await marketSaveEntries(caller.playFabId, { commander_data: own.commander });
         }
         res.json({ success: true, completed: !!r.completed, pending: !!planet.terraformUntilUtc, remainingSeconds: r.remainingSeconds || 0 });
