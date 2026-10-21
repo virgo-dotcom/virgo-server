@@ -5796,20 +5796,22 @@ function recalcParticipantLosses(participant, before10, beforeShips, after10, af
 // #####################################################################
 // §38  KAMPFPUNKTE (Allianz-Pool) — NEU 22.10.2026
 //      Ersetzt die alte "Erfahrung" (die schrieb Credits gut). Nach jedem Kampf mit MENSCHEN auf beiden Seiten bekommt jeder menschliche
-//      Teilnehmer Punkte: Sieg +10 / Niederlage -5, je zerstoertes gegnerisches (menschliches) Kampfschiff +2, je verlorenes eigenes -1.
+//      Teilnehmer Punkte: Sieg +10 / Niederlage -5, je zerstoertes gegnerisches (menschliches) Kampfschiff +2, je verlorenes eigenes -1 - Schiffe zaehlen nach Kampfkraft (Warship01-04 = 1/3/7/100 mal).
 //      Die Punkte gehen in den Pool der Allianz des Teilnehmers (alliances.combat_points, darf negativ werden); ohne Allianz werden sie
 //      nur protokolliert (combat_points_log). NPC-Schiffe (Piraten, verlassene Planeten) zaehlen NIE: reine PvE-Kaempfe geben keine Punkte,
 //      bei Kaempfen mit NPC + zwei Menschen (z.B. eigene Falle bei einem NPC) zaehlen nur die menschlichen Schiffe.
 //      Anti-Farm: Wiederholte Kaempfe DESSELBEN Paares binnen 24 h bringen weniger Pluspunkte (Faktoren unten); Minuspunkte bleiben voll.
 //      Zahlen nur hier (COMBAT_POINTS). Reine Rechnung: combatPointsCompute (testbar), Speichern: combatPointsApply.
 // #####################################################################
-const COMBAT_POINTS = { win: 10, loss: -5, kill: 2, lost: -1, repeatFactors: [1.0, 0.5, 0.25, 0.1], repeatWindowHours: 24 };
+// weights = Kampfkraft je Schiffstyp (Warship01-04 = 1:3:7:100, Nutzer 22.10.2026); Warship05+ (noch nicht im Spiel) vorlaeufig wie Warship04
+const COMBAT_POINTS = { win: 10, loss: -5, kill: 2, lost: -1, weights: [1, 3, 7, 100, 100, 100, 100, 100, 100, 100], repeatFactors: [1.0, 0.5, 0.25, 0.1], repeatWindowHours: 24 };
 
 function combatPointsIsHuman(id) { return Number(id) >= 1000000; }
 
+// Verlorene Kampfschiffe, nach Kampfkraft gewichtet (ein Warship04 = 100 Warship01)
 function combatPointsLostWarships(p) {
     let n = 0;
-    for (let i = 0; i < 10; i++) n += Math.max(0, ((p.warshipsBefore || [])[i] || 0) - ((p.warshipsAfter || [])[i] || 0));
+    for (let i = 0; i < 10; i++) n += Math.max(0, ((p.warshipsBefore || [])[i] || 0) - ((p.warshipsAfter || [])[i] || 0)) * (COMBAT_POINTS.weights[i] || 1);
     return n;
 }
 
@@ -5866,6 +5868,37 @@ async function combatPointsApply(report, now, log) {
         if (log) log.push('Kampfpunkte Fehler: ' + e.message);
     }
 }
+
+// Allianzinterne Kampfpunkte-Liste (nur fuer Mitglieder): Gesamtpool + wie viele Punkte jeder Spieler EINGEBRACHT hat.
+// Die Liste bleibt bestehen, wenn ein Spieler die Allianz verlaesst (er steht dann als "ehemalig" darin) und laeuft bei einem Wiedereintritt weiter,
+// weil das Protokoll je (Allianz, Commander) gefuehrt wird. Oeffentlich (Allianzprofil) gibt es nur die Gesamtsumme (alliances.combat_points).
+app.get('/alliance-combat-points', async (req, res) => {
+    const commanderId = parseInt(req.query.commanderId, 10);
+    if (!commanderId) return res.status(400).json({ success: false, error: 'Ungültige Angaben.' });
+    const caller = await requireCaller(req, res, { commanderId });
+    if (!caller) return;
+    try {
+        const allianceId = await getAllianceIdForCommander(caller.commanderId);
+        if (!allianceId) return res.status(404).json({ success: false, noAlliance: true, error: 'Du bist in keiner Allianz.' });
+        const a = await pool.query('SELECT name, tag, combat_points FROM alliances WHERE id = $1', [allianceId]);
+        if (a.rows.length === 0) return res.status(404).json({ success: false, error: 'Allianz nicht gefunden.' });
+        const sums = await pool.query(
+            `SELECT l.commander_id, SUM(l.points)::int AS points, COUNT(*)::int AS fights, MAX(h.commander_name) AS name
+             FROM combat_points_log l LEFT JOIN commander_highscore h ON h.commander_id = l.commander_id
+             WHERE l.alliance_id = $1 GROUP BY l.commander_id`, [allianceId]);
+        const members = await pool.query('SELECT commander_id, commander_name FROM alliance_members WHERE alliance_id = $1', [allianceId]);
+        const current = new Map(members.rows.map(m => [m.commander_id, m.commander_name || '']));
+        const byId = new Map();
+        for (const r of sums.rows) byId.set(r.commander_id, { commanderId: r.commander_id, name: r.name || current.get(r.commander_id) || '', points: r.points, fights: r.fights, member: current.has(r.commander_id) });
+        for (const [id, name] of current) if (!byId.has(id)) byId.set(id, { commanderId: id, name: name || '', points: 0, fights: 0, member: true });
+        const list = [...byId.values()].sort((x, y) => y.points - x.points || x.commanderId - y.commanderId);
+        list.forEach((e, i) => { e.rank = i + 1; if (!e.name) e.name = 'Gelöschter Commander'; });   // LOCALIZE
+        res.json({ success: true, allianceId, allianceName: a.rows[0].name, allianceTag: a.rows[0].tag, total: a.rows[0].combat_points || 0, members: list });
+    } catch (error) {
+        console.error('[Kampfpunkte] Liste Fehler:', error.message);
+        res.status(500).json({ success: false, error: 'Die Kampfpunkte sind gerade nicht erreichbar.' });
+    }
+});
 
 // WICHTIG: Der Render-Server läuft in UTC, nicht in deutscher Zeit.
 // date.getHours() etc. würden also die Serverzeit zeigen (im Sommer
