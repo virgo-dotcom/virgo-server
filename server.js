@@ -5448,7 +5448,7 @@ function getCapacityMultiplier(level) {
 // =====================================================================
 // NEU 21.10.2026 (Nutzer-Vorgaben): WIRTSCHAFTS-REGELN
 //   1) Kommandozentrale: feste Tagesproduktion je Ressource = Inhalt der Kleinen Kisten, egal welche Stufe (BUILDING_ECONOMY[0]).
-//   2) Lager (je Ressource) = ECON_STORAGE_DAYS (5) Tagesertraege des Planeten (HQ + Farm-Gebaeude, ohne Forschung) - die Produktion stoppt, sobald der Bestand
+//   2) Lager (je Ressource) = ECON_STORAGE_DAYS (3) Tagesertraege des Planeten (HQ + Farm-Gebaeude, ohne Forschung) - die Produktion stoppt, sobald der Bestand
 //      die Kapazitaet erreicht; Beute/Handel/Shop duerfen weiter drueber hinaus (wie bisher). UNTERGRENZE: das Lager fasst immer mindestens
 //      den teuersten ANSTEHENDEN Ausbau (naechste Stufe aller Gebaeude auf diesem Planeten) - sonst waere z. B. die Werft nie bezahlbar.
 //      Solange die Gebaeude-Baukosten mehr als 3 Tagesertraege kosten, greift diese Untergrenze (siehe Vault "Wirtschaft - Lager und Ertrag").
@@ -5457,8 +5457,7 @@ function getCapacityMultiplier(level) {
 // =====================================================================
 // WIRTSCHAFT-KATALOG-START (erzeugt von Tools/Wirtschaft/sync_wirtschaft.js - NICHT von Hand aendern)
 const ECON_HQ_DAILY = [5000,7500,10000,7500,2500];      // Kommandozentrale: feste Tagesproduktion Ress01-05 (= Kleine Kisten)
-const ECON_STORAGE_DAYS = 5;                         // Lager = so viele Tagesertraege (Ress01-04)
-const ECON_CREDITS_CAP = 125000;                   // Credits-Lager (feste Basis; Wertpaket Credits)
+const ECON_STORAGE_DAYS = 3;                         // Lager = so viele Tagesertraege (Ress01-04)
 const ECON_SHIP_BUILD_MINUTES = {"warship":{"0":300,"1":360,"2":420,"3":1800},"ship":{"1":120,"3":0.25}};   // Bauzeit je Schiff in Minuten (Basis aus den Schiffs-Assets, ohne Werft-Bonus) - Grundlage des ICC-Zeitaufschlags
 const ECON_MAX_BUILDING_LEVEL = 18;
 const ECON_BUILDING_COSTS = {   // Baukosten je Gebaeude-Index, Zeile = Zielstufe 1..18, Spalte = Ress01-05
@@ -5489,8 +5488,7 @@ function econStorageCaps(planet) {
     const b = (planet && planet.buildings) || [];
     const caps = [0, 0, 0, 0, 0];
     for (let r = 0; r < 5; r++) {
-        // Ress01-04: ECON_STORAGE_DAYS Tagesertraege; Credits (r = 4): feste Basis (kommen nur aus der HQ, ein Wertpaket waere sonst 50 Tage Ertrag)
-        let cap = r === 4 ? ((b[0] || 0) > 0 ? ECON_CREDITS_CAP : 0) : Math.round(econPlanetDailyYield(planet || {}, r) * ECON_STORAGE_DAYS);
+        let cap = Math.round(econPlanetDailyYield(planet || {}, r) * ECON_STORAGE_DAYS);
         for (const key of Object.keys(ECON_BUILDING_COSTS)) {
             const next = (b[Number(key)] || 0) + 1;
             if (next > ECON_MAX_BUILDING_LEVEL) continue;
