@@ -865,11 +865,11 @@ async function initDatabase() {
         );
 
         const defaultShopItems = [
-            ['ress00', '5.000 Energie',       'ressourcen', 100, 'resource', 0, 5000],
-            ['ress01', '7.500 Wasserstoff',   'ressourcen', 100, 'resource', 1, 7500],
-            ['ress02', '10.000 Metalle',      'ressourcen', 100, 'resource', 2, 10000],
-            ['ress03', '7.500 Werkzeuge',     'ressourcen', 100, 'resource', 3, 7500],
-            ['ress04', '2.500 Credits',       'ressourcen', 100, 'resource', 4, 2500],
+            ['ress00', '5.000 Energie',       'ressourcen', shopResourceIccPrice(0, 5000),  'resource', 0, 5000],     // NEU 21.10.2026: je 10 ICC (Wertpaket-Skala, vorher 100)
+            ['ress01', '7.500 Wasserstoff',   'ressourcen', shopResourceIccPrice(1, 7500),  'resource', 1, 7500],
+            ['ress02', '10.000 Metalle',      'ressourcen', shopResourceIccPrice(2, 10000), 'resource', 2, 10000],
+            ['ress03', '7.500 Werkzeuge',     'ressourcen', shopResourceIccPrice(3, 7500),  'resource', 3, 7500],
+            ['ress04', '2.500 Credits',       'ressourcen', shopResourceIccPrice(4, 2500),  'resource', 4, 2500],
             // Schiffe (Kampfschiffe UND zivile Schiffe) gibt es im Shop immer als EINZELPREIS fuer 1 Stueck (Nutzer-Vorgabe 04.10.2026; mehr
             // Stueck ueber das Mengenfeld im Shop). ICC-Wert = Baukosten (Summe Ress x Wertgewicht) / 1.200 Wertpunkte je ICC x 10 (Aufschlag:
             // der Spieler spart sich Bauzeit, ICC ist Pay-to-Accelerate), dann wie im Einzelhandel auf eine 9 am Ende aufgerundet
@@ -886,11 +886,11 @@ async function initDatabase() {
             // Inhalt = Ressourcenpaket des Shops (Energie 5.000, Wasserstoff 7.500, Metalle 10.000, Werkzeuge 7.500, Credits 2.500) fuer
             // dieselben 100 ICC. Schiffskisten (1 Schiff) kosten wie die Flotten-Pakete: Bauwert x 10, auf eine 9 aufgerundet.
             // Kisten fuer Ress06-10 gibt es bewusst NICHT im Shop (ICC kauft man nicht mit ICC; Ress06-09 sind ungenutzt).
-            ['crate_res_0',     'Kleine Kiste: Energie (5.000)',       'gegenstaende', 100,  'inventory', 0, 1],
-            ['crate_res_1',     'Kleine Kiste: Wasserstoff (7.500)',   'gegenstaende', 100,  'inventory', 0, 1],
-            ['crate_res_2',     'Kleine Kiste: Metalle (10.000)',      'gegenstaende', 100,  'inventory', 0, 1],
-            ['crate_res_3',     'Kleine Kiste: Werkzeuge (7.500)',     'gegenstaende', 100,  'inventory', 0, 1],
-            ['crate_res_4',     'Kleine Kiste: Credits (2.500)',       'gegenstaende', 100,  'inventory', 0, 1],
+            ['crate_res_0',     'Kleine Kiste: Energie (5.000)',       'gegenstaende', shopResourceIccPrice(0, 5000),  'inventory', 0, 1],
+            ['crate_res_1',     'Kleine Kiste: Wasserstoff (7.500)',   'gegenstaende', shopResourceIccPrice(1, 7500),  'inventory', 0, 1],
+            ['crate_res_2',     'Kleine Kiste: Metalle (10.000)',      'gegenstaende', shopResourceIccPrice(2, 10000), 'inventory', 0, 1],
+            ['crate_res_3',     'Kleine Kiste: Werkzeuge (7.500)',     'gegenstaende', shopResourceIccPrice(3, 7500),  'inventory', 0, 1],
+            ['crate_res_4',     'Kleine Kiste: Credits (2.500)',       'gegenstaende', shopResourceIccPrice(4, 2500),  'inventory', 0, 1],
             ['crate_warship_0', 'Schiffskiste Orbitaljaeger', 'gegenstaende', shopShipIccPrice('warship', 0, 1), 'inventory', 0, 1],
             ['crate_warship_1', 'Schiffskiste Raumjaeger',    'gegenstaende', shopShipIccPrice('warship', 1, 1), 'inventory', 0, 1],
             ['crate_warship_2', 'Schiffskiste Kosmosjaeger',  'gegenstaende', shopShipIccPrice('warship', 2, 1), 'inventory', 0, 1],
@@ -912,10 +912,12 @@ async function initDatabase() {
         const shopPreviousSeedCosts = {
             // Flotten-Angebote: frueher pauschal 250 ICC, danach (gleicher Tag) die Paketpreise 14.569 / 31.339 / 24.209 / 6.469 / 26.479 / 10.819
             // 21.10.2026: Aufschlag 10 -> 0,1 (Preise ca. /100); als "frueher" gelten auch die Preise vom 04.10. (149/629/2.429/6.469/2.649/10.819) und die Zwischenstaende vom 21.10. (1.019/4.369/16.849/45.009)
-            fleet_warship01: [250, 14569, 149, 1019], fleet_warship02: [250, 31339, 629, 4369], fleet_warship03: [250, 24209, 2429, 16849], fleet_warship04: [250, 6469, 45009], fleet_ship01: [250, 26479, 2649], fleet_ship03: [250, 10819],
+            // 21.10.2026 spaet: Zeitaufschlag (1 ICC je 5 Min.) - als frueher gelten auch 9/19/39/459/29 (Zwischenstand "2 Nullen weg")
+            fleet_warship01: [250, 14569, 149, 1019, 9], fleet_warship02: [250, 31339, 629, 4369, 19], fleet_warship03: [250, 24209, 2429, 16849, 39], fleet_warship04: [250, 6469, 45009, 459], fleet_ship01: [250, 26479, 2649, 29], fleet_ship03: [250, 10819],
+            ress00: [100], ress01: [100], ress02: [100], ress03: [100], ress04: [100],
             item_ship05: [1000],
-            crate_res_0: [200], crate_res_1: [134], crate_res_2: [100], crate_res_3: [134], crate_res_4: [400],
-            crate_warship_0: [15, 149, 1019], crate_warship_1: [63, 629, 4369], crate_warship_2: [242, 2429, 16849], crate_warship_3: [647, 6469, 45009], crate_ship_1: [265, 2649], crate_ship_3: [1082, 10819]
+            crate_res_0: [200, 100], crate_res_1: [134, 100], crate_res_2: [100], crate_res_3: [134, 100], crate_res_4: [400, 100],
+            crate_warship_0: [15, 149, 1019, 9], crate_warship_1: [63, 629, 4369, 19], crate_warship_2: [242, 2429, 16849, 39], crate_warship_3: [647, 6469, 45009, 459], crate_ship_1: [265, 2649, 29], crate_ship_3: [1082, 10819]
         };
         for (const row of defaultShopItems) {
             const previous = shopPreviousSeedCosts[row[0]];
@@ -5446,7 +5448,7 @@ function getCapacityMultiplier(level) {
 // =====================================================================
 // NEU 21.10.2026 (Nutzer-Vorgaben): WIRTSCHAFTS-REGELN
 //   1) Kommandozentrale: feste Tagesproduktion je Ressource = Inhalt der Kleinen Kisten, egal welche Stufe (BUILDING_ECONOMY[0]).
-//   2) Lager (je Ressource) = 3 Tagesertraege des Planeten (HQ + Farm-Gebaeude, ohne Forschung) - die Produktion stoppt, sobald der Bestand
+//   2) Lager (je Ressource) = ECON_STORAGE_DAYS (5) Tagesertraege des Planeten (HQ + Farm-Gebaeude, ohne Forschung) - die Produktion stoppt, sobald der Bestand
 //      die Kapazitaet erreicht; Beute/Handel/Shop duerfen weiter drueber hinaus (wie bisher). UNTERGRENZE: das Lager fasst immer mindestens
 //      den teuersten ANSTEHENDEN Ausbau (naechste Stufe aller Gebaeude auf diesem Planeten) - sonst waere z. B. die Werft nie bezahlbar.
 //      Solange die Gebaeude-Baukosten mehr als 3 Tagesertraege kosten, greift diese Untergrenze (siehe Vault "Wirtschaft - Lager und Ertrag").
@@ -5455,7 +5457,9 @@ function getCapacityMultiplier(level) {
 // =====================================================================
 // WIRTSCHAFT-KATALOG-START (erzeugt von Tools/Wirtschaft/sync_wirtschaft.js - NICHT von Hand aendern)
 const ECON_HQ_DAILY = [5000,7500,10000,7500,2500];      // Kommandozentrale: feste Tagesproduktion Ress01-05 (= Kleine Kisten)
-const ECON_STORAGE_DAYS = 3;                         // Lager = so viele Tagesertraege
+const ECON_STORAGE_DAYS = 5;                         // Lager = so viele Tagesertraege (Ress01-04)
+const ECON_CREDITS_CAP = 125000;                   // Credits-Lager (feste Basis; Wertpaket Credits)
+const ECON_SHIP_BUILD_MINUTES = {"warship":{"0":300,"1":360,"2":420,"3":1800},"ship":{"1":120,"3":0.25}};   // Bauzeit je Schiff in Minuten (Basis aus den Schiffs-Assets, ohne Werft-Bonus) - Grundlage des ICC-Zeitaufschlags
 const ECON_MAX_BUILDING_LEVEL = 18;
 const ECON_BUILDING_COSTS = {   // Baukosten je Gebaeude-Index, Zeile = Zielstufe 1..18, Spalte = Ress01-05
     0: [[25,50,200,100,1],[25,50,200,100,1],[50,100,400,200,2],[100,200,800,400,4],[300,600,2400,1200,12],[600,1200,4800,2400,24],[1200,2400,9600,4800,48],[2400,4800,19200,9600,96],[4800,9600,38400,19200,192],[24000,48000,192000,96000,960],[48000,96000,384000,192000,1920],[96000,192000,768000,384000,3840],[192000,384000,1536000,768000,7680],[384000,768000,3072000,1536000,15360],[3072000,6144000,24576000,12288000,122880],[6144000,12288000,49152000,24576000,245760],[12288000,24576000,98304000,49152000,491520],[24576000,49152000,196608000,98304000,983040]],
@@ -5485,7 +5489,8 @@ function econStorageCaps(planet) {
     const b = (planet && planet.buildings) || [];
     const caps = [0, 0, 0, 0, 0];
     for (let r = 0; r < 5; r++) {
-        let cap = Math.round(econPlanetDailyYield(planet || {}, r) * ECON_STORAGE_DAYS);
+        // Ress01-04: ECON_STORAGE_DAYS Tagesertraege; Credits (r = 4): feste Basis (kommen nur aus der HQ, ein Wertpaket waere sonst 50 Tage Ertrag)
+        let cap = r === 4 ? ((b[0] || 0) > 0 ? ECON_CREDITS_CAP : 0) : Math.round(econPlanetDailyYield(planet || {}, r) * ECON_STORAGE_DAYS);
         for (const key of Object.keys(ECON_BUILDING_COSTS)) {
             const next = (b[Number(key)] || 0) + 1;
             if (next > ECON_MAX_BUILDING_LEVEL) continue;
@@ -8891,10 +8896,13 @@ const INVENTORY_ITEMS = (() => {
 //   3) x 10 Aufschlag: ICC ist Pay-to-Win UND Pay-to-Accelerate - die gesparte Bauzeit wird mitbezahlt
 //   4) wie im Einzelhandel auf eine 9 am Ende AUFgerundet (1.453 -> 1.459; 83 -> 89; 91 -> 99)
 // -------------------------------------------------------
-// NEU 21.10.2026 (Nutzer, Balancing-Phase): "2 Nullen weg" - Aufschlag 10 -> 0,1 (also ICC = Bauwert / 12.000), damit ein Warship04 ~450 ICC kostet
-// (bei 100 ICC = 1 EUR ca. 4,50 EUR). Bis 21.10. war es x10 (Pay-to-Accelerate). Gilt fuer ALLE Schiffe im Shop (Flotten-Pakete und Schiffskisten).
-const SHOP_SHIP_ICC_MARKUP   = 0.1;
-const SHOP_ICC_VALUE_POINTS  = 1200;
+// NEU 21.10.2026 (Nutzer, spaet): EINE Skala fuer alles im Shop. 100 ICC = 1 EUR. WERTPAKET = 500 ICC = 5 EUR = 6,0 Mio Wertpunkte = 500.000 Metalle /
+// 375.000 Wasserstoff / 375.000 Werkzeuge / 250.000 Energie / 125.000 Credits -> 12.000 Wertpunkte je ICC (SHOP_ICC_VALUE_POINTS).
+//   Rohstoffe/Kisten: nur Materialwert (Kleine Kiste = 120.000 Punkte = 10 ICC), etwas aufgerundet.
+//   Schiffe: Materialwert + ZEITAUFSCHLAG fuer die gesparte Bauzeit: 1 ICC (= 1 Cent) je 5 Minuten Bauzeit am Dock (ECON_SHIP_BUILD_MINUTES, aus den
+//   Schiffs-Assets, ohne Werft-Bonus), dann auf eine 9 am Ende aufgerundet. Vorher: 1.200 Punkte je ICC (Kisten 100 ICC) und fuer Schiffe x10 bzw. (bis 21.10.) x0,1.
+const SHOP_ICC_VALUE_POINTS     = 12000;
+const SHOP_TIME_MINUTES_PER_ICC = 5;
 
 function shopRetailRoundUp9(value) {
     const n = Math.ceil(value - 1e-9);
@@ -8903,7 +8911,13 @@ function shopRetailRoundUp9(value) {
 }
 
 function shopShipIccPrice(kind, index, count) {
-    return shopRetailRoundUp9(marketValuePerUnit(kind, index) * count / SHOP_ICC_VALUE_POINTS * SHOP_SHIP_ICC_MARKUP);
+    const minutes = (ECON_SHIP_BUILD_MINUTES[kind] && ECON_SHIP_BUILD_MINUTES[kind][index]) || 0;
+    return shopRetailRoundUp9(marketValuePerUnit(kind, index) * count / SHOP_ICC_VALUE_POINTS + minutes * count / SHOP_TIME_MINUTES_PER_ICC);
+}
+
+// Rohstoffe (Pakete, Kleine Kisten): nur Materialwert, auf ganze ICC aufgerundet (mindestens 1)
+function shopResourceIccPrice(resourceIndex, amount) {
+    return Math.max(1, Math.ceil(amount * (MARKET_VALUE_WEIGHT[resourceIndex] || 0) / SHOP_ICC_VALUE_POINTS - 1e-9));
 }
 
 function inventoryItemLabel(itemId) {
