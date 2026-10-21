@@ -897,7 +897,7 @@ async function initDatabase() {
             ['crate_warship_3', 'Schiffskiste Sternkreuzer',  'gegenstaende', shopShipIccPrice('warship', 3, 1), 'inventory', 0, 1],
             // NEU 21.10.2026 (Nutzer): SCHIFFSKISTEN-PAKETE = so viele Jaeger, wie in einen Warship04 passen (20 Slots): feste Preise, in etwa 8,2-8,5 EUR.
             // item_id = <Inventar-Gegenstand>_x<Anzahl>; reward_amount = Kisten je Kauf (shopInventoryItemId liest den Gegenstand aus der Kennung).
-            ['crate_warship_2_x5',  '5x Schiffskiste Kosmosjaeger', 'gegenstaende', 829, 'inventory', 0, 5],     // 8,29 EUR
+            ['crate_warship_2_x6',  '6x Schiffskiste Kosmosjaeger', 'gegenstaende', 829, 'inventory', 0, 6],     // 8,29 EUR (22.10.2026: 6 statt 5 Kisten - naeher an der Formel)
             ['crate_warship_1_x10', '10x Schiffskiste Raumjaeger',  'gegenstaende', 839, 'inventory', 0, 10],    // 8,39 EUR
             ['crate_warship_0_x20', '20x Schiffskiste Orbitaljaeger', 'gegenstaende', 849, 'inventory', 0, 20],  // 8,49 EUR
             ['crate_ship_1',    'Schiffskiste Containerschiff',  'gegenstaende', shopShipIccPrice('ship', 1, 1),    'inventory', 0, 1],
@@ -911,6 +911,8 @@ async function initDatabase() {
                 row
             );
         }
+        // 22.10.2026: das Kosmosjaeger-Paket hat jetzt 6 statt 5 Kisten (neue Kennung ..._x6) - das alte Angebot (_x5) wird abgeschaltet (Kaufhistorie bleibt)
+        await pool.query("UPDATE shop_items SET active = false WHERE item_id = 'crate_warship_2_x5'");
 
         // NEU (04.10.2026): Preise der Flotten-Pakete und Kisten (siehe Seeds oben). Bestehende Zeilen werden NUR aktualisiert, wenn sie noch
         // einen frueheren Standardpreis dieses Artikels haben - spaetere manuelle Aenderungen in der Datenbank bleiben erhalten.
