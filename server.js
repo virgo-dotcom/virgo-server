@@ -7879,7 +7879,8 @@ async function pickStartPlanet(sector, commanderId, ownerName) {
         const system = 1 + Math.floor(Math.random() * systemCount);
         const rows = await pool.query(
             'SELECT planet_number, owner_commander_id FROM planet_registry WHERE galaxy_id = 1 AND sector_id = $1 AND system_id = $2', [sector, system]);
-        if (new Set(rows.rows.map(r => r.owner_commander_id)).size >= START_MAX_OWNERS_PER_SYSTEM) continue;
+        // Piratenclans (Besitzer 910001+, §36) zaehlen nicht als "Bewohner" des Systems (sie stehen auf den gesperrten Planeten 1-3)
+        if (new Set(rows.rows.filter(r => !(r.owner_commander_id > 910000 && r.owner_commander_id < 1000000)).map(r => r.owner_commander_id)).size >= START_MAX_OWNERS_PER_SYSTEM) continue;
         const taken = new Set(rows.rows.map(r => r.planet_number));
         const free = [];
         for (let n = START_PLANET_MIN; n <= START_PLANET_MAX; n++) if (!taken.has(n)) free.push(n);
@@ -9360,7 +9361,8 @@ async function galaxyStartCapacity(sector) {
     for (const row of r.rows) {
         if (!perSystem.has(row.system_id)) perSystem.set(row.system_id, { owners: new Set(), taken: new Set() });
         const e = perSystem.get(row.system_id);
-        e.owners.add(row.owner_commander_id); e.taken.add(row.planet_number);
+        if (!(row.owner_commander_id > 910000 && row.owner_commander_id < 1000000)) e.owners.add(row.owner_commander_id);   // Piraten (§36) zaehlen nicht mit
+        e.taken.add(row.planet_number);
     }
     let free = 0;
     for (let sys = 1; sys <= systems; sys++) {
