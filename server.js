@@ -54,6 +54,8 @@
 //  §25  KAMPF V2 (Rundenkampf, Mischbonus, Zivile in letzter Reihe): steht VOR §21; aktiv nur bei COMBAT_ENGINE=shadow|v2
 //  §26  GALAXIE-REGISTER (planet_registry): serverautoritative Belegung, Schritt 1 (nur lesen/befuellen); steht VOR §21
 //  §28  INVENTAR (PlayFab Internal Data "inventory"): Kisten (Rohstoffe Ress01-10, Schiffe), Oeffnen, Admin-Vergabe "#inv"; steht VOR §21
+//  §37  TAEGLICHE AUFGABEN (daily_quest_state, GET /daily, POST /daily/claim; Katalog von Tools/Daily/sync_daily.js); steht VOR §21
+//  §36  PIRATEN / EnemyNPC (npc_clans/_bases/_raids/_events, ein Clan je Sektor, GET /npc/..., NPC-Verteidiger in resolveCombat, Admin "#npc"); steht VOR §21
 //  §35  ALLIANZKASSE (alliance_treasury/_log, /alliance-treasury, Einzahlen + Handelssteuer, nichts entnehmbar, Admin "#kasse"); steht VOR §21
 //  §34  ERFOLGE serverseitig (achievement_state/_locks/_log, GET /achievements, POST /achievements/claim, Admin "#achv"); steht VOR §21
 //  §33  STATIONIEREN + gemeinsames Verteidigen (stationed_fleets, /fleets/stationed, Kampf mit mehreren Teilnehmern); steht VOR §21
@@ -1218,6 +1220,27 @@ async function initDatabase() {
             note TEXT NOT NULL DEFAULT '', created_at TIMESTAMPTZ NOT NULL DEFAULT now());`);
         await pool.query(`CREATE INDEX IF NOT EXISTS idx_treasury_log_alliance ON alliance_treasury_log (alliance_id, id DESC);`);
         await pool.query(`CREATE INDEX IF NOT EXISTS idx_treasury_log_commander ON alliance_treasury_log (commander_id);`);
+        // NEU 21.10.2026 (§36 Piraten, §37 Daily): Clans (einer je Sektor), Stuetzpunkte, Angriffs-Protokoll, Chronik, taegliche Aufgaben
+        await pool.query(`CREATE TABLE IF NOT EXISTS npc_clans (
+            sector_id INTEGER PRIMARY KEY, founded_at TIMESTAMPTZ NOT NULL DEFAULT now(), stage_seen INTEGER NOT NULL DEFAULT 0,
+            takeovers INTEGER NOT NULL DEFAULT 0, last_takeover_at TIMESTAMPTZ NULL);`);
+        await pool.query(`CREATE TABLE IF NOT EXISTS npc_bases (
+            coord TEXT PRIMARY KEY, sector_id INTEGER NOT NULL, system_id INTEGER NOT NULL, planet_number INTEGER NOT NULL,
+            origin TEXT NOT NULL DEFAULT 'slot', name TEXT NOT NULL DEFAULT '', founded_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+            ships JSONB NOT NULL DEFAULT '[]', stock JSONB NOT NULL DEFAULT '[0,0,0,0,0]', last_update TIMESTAMPTZ NOT NULL DEFAULT now(),
+            last_fight TIMESTAMPTZ NULL, raids INTEGER NOT NULL DEFAULT 0, defeats INTEGER NOT NULL DEFAULT 0);`);
+        await pool.query(`CREATE INDEX IF NOT EXISTS idx_npc_bases_sector ON npc_bases (sector_id);`);
+        await pool.query(`CREATE TABLE IF NOT EXISTS npc_raids (
+            id SERIAL PRIMARY KEY, commander_id INTEGER NOT NULL, coord TEXT NOT NULL, sector_id INTEGER NOT NULL, won BOOLEAN NOT NULL DEFAULT false,
+            loot_total BIGINT NOT NULL DEFAULT 0, kills INTEGER NOT NULL DEFAULT 0, day_key TEXT NOT NULL DEFAULT '', created_at TIMESTAMPTZ NOT NULL DEFAULT now());`);
+        await pool.query(`CREATE INDEX IF NOT EXISTS idx_npc_raids_commander ON npc_raids (commander_id, day_key);`);
+        await pool.query(`CREATE INDEX IF NOT EXISTS idx_npc_raids_coord ON npc_raids (coord, commander_id, created_at);`);
+        await pool.query(`CREATE TABLE IF NOT EXISTS npc_events (
+            id SERIAL PRIMARY KEY, sector_id INTEGER NOT NULL, kind TEXT NOT NULL DEFAULT '', text TEXT NOT NULL DEFAULT '', created_at TIMESTAMPTZ NOT NULL DEFAULT now());`);
+        await pool.query(`CREATE INDEX IF NOT EXISTS idx_npc_events_sector ON npc_events (sector_id, id DESC);`);
+        await pool.query(`CREATE TABLE IF NOT EXISTS daily_quest_state (
+            commander_id INTEGER NOT NULL, day_key TEXT NOT NULL, quest_id TEXT NOT NULL, claimed_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+            reward JSONB NULL, PRIMARY KEY (commander_id, day_key, quest_id));`);
         await pool.query(`CREATE TABLE IF NOT EXISTS planet_freed (id SERIAL PRIMARY KEY, coord TEXT NOT NULL, freed_at TIMESTAMPTZ NOT NULL DEFAULT now());`);
         await pool.query(`CREATE INDEX IF NOT EXISTS idx_planet_freed_time ON planet_freed (freed_at);`);
 
@@ -4379,7 +4402,8 @@ const DB_EXPORT_TABLES = ['alliances', 'alliance_ranks', 'alliance_members', 'al
     'alliance_relationships', 'player_relationships', 'commander_highscore', 'legal_texts', 'dev_todos', 'announcements', 'virgodom_messages',
     'support_messages', 'player_reports', 'shop_items', 'promo_codes', 'promo_redemptions', 'giftbox_claims', 'giftbox_golden_claims',
     'market_offers', 'transport_deliveries', 'planet_registry', 'combat_reports', 'attack_traces', 'processed_fleets',
-    'galaxy_sectors', 'galaxy_config', 'galaxy_texts', 'stationed_fleets', 'achievement_state', 'achievement_locks', 'achievement_log', 'alliance_treasury', 'alliance_treasury_log'];
+    'galaxy_sectors', 'galaxy_config', 'galaxy_texts', 'stationed_fleets', 'achievement_state', 'achievement_locks', 'achievement_log', 'alliance_treasury', 'alliance_treasury_log',
+    'npc_clans', 'npc_bases', 'npc_raids', 'npc_events', 'daily_quest_state'];
 app.get('/admin/db-export', async (req, res) => {
     if (process.env.DB_EXPORT_ENABLED !== 'true') return res.status(404).json({ success: false, error: 'Nicht verfuegbar.' });
     if (!adminKeyOk(req.query.key)) return res.status(403).json({ success: false, error: 'Nicht autorisiert' });
@@ -4980,6 +5004,8 @@ async function serverTickHandler(req, res) {
     await updateAllianceHighscore(log);
     await expireOldFriendships(log);
     await expireOldApplications(log);
+    // NEU 21.10.2026 (§36): Piratenclans - neue Sektoren, Stufen-Chronik, Uebernahmen verlassener Planeten (Fehler hier beruehren den Tick nie)
+    try { await npcTick(log); } catch (e) { log.push(`Piraten-Tick Fehler: ${e.message}`); console.error('[Piraten] Tick:', e.message); }
 
     res.json({ success: true, log, timestamp: now.toISOString() });
 }
@@ -5826,6 +5852,25 @@ async function resolveCombat(attackerPlayFabId, attackerCommander, attackerFleet
         }
     }
 
+    // NEU 21.10.2026 (§36): steht auf dem Ziel ein Piratenstuetzpunkt, verteidigt er mit Schiffen + Forschung seines Clans.
+    // Scheitert die Datenbank dabei, wird NICHT gegen "nichts" gekaempft (wuerde einen Gratis-Sieg bedeuten): die Flotte fliegt unveraendert heim.
+    let npcCtx = null;
+    if (!defenderPfid) {
+        try {
+            npcCtx = await npcPrepareDefense(destCoord, attackerCommander.commanderId, now);
+        } catch (e) {
+            console.error('[Piraten] Verteidiger nicht ladbar, Flotte kehrt um:', e.message);
+            log.push(`Piraten-Verteidiger nicht ladbar: ${e.message}`);
+            await upsertAttackTrace(attackerFleet.fleetId, { combat_processed_at: new Date(), combat_success: false });
+            return buildReturnFleet(attackerFleet, now, [...attackerFleet.warships], attackerFleet.ressources || [0,0,0,0,0]);
+        }
+        if (npcCtx) {
+            ownerInfo = npcCtx.ownerInfo;
+            defenderCommander = npcCtx.commander;
+            defenderPlanet = npcCtx.planet;
+        }
+    }
+
     // Ohne echte Verteidiger-Planetendaten (NPC oder Fehler) bleibt die
     // Verteidigung bei 0 — bekannte, dokumentierte Einschränkung.
     const defWarships  = defenderPlanet ? [...defenderPlanet.warships] : [0,0,0,0,0,0,0,0,0,0];
@@ -6084,7 +6129,7 @@ async function resolveCombat(attackerPlayFabId, attackerCommander, attackerFleet
             if (remaining <= 0) break;
             const stock = defenderPlanet.ressources[idx] || 0;
             const available = Math.max(0, stock - ironReserve);
-            const shareCap = Math.floor(stock * LOOT_MAX_SHARE); // max. 33 % des Bestands je Angriff
+            const shareCap = Math.floor(stock * LOOT_MAX_SHARE * (npcCtx ? npcCtx.lootFactor : 1)); // max. 33 % des Bestands je Angriff (Piraten: weniger bei Wiederholung, §36)
             const taken = Math.min(available, shareCap, remaining);
             if (taken > 0) {
                 defenderPlanet.ressources[idx] -= taken;
@@ -6096,8 +6141,8 @@ async function resolveCombat(attackerPlayFabId, attackerCommander, attackerFleet
         }
     }
 
-    // PHASE 7: Recycling (geht an den Verteidiger-Planeten, nur wenn bekannt)
-    if (defenderPlanet) {
+    // PHASE 7: Recycling (geht an den Verteidiger-Planeten, nur wenn bekannt; Piraten bekommen keine Truemmer)
+    if (defenderPlanet && !npcCtx) {
         const recyclingBonus = RECYCLING_BASE + ((defenderCommander?.recycling || 0) * 0.01);
         let totalRecycled = 0;
         for (let i = 0; i < 10; i++) {
@@ -6129,7 +6174,7 @@ async function resolveCombat(attackerPlayFabId, attackerCommander, attackerFleet
             attackerParticipant.totalRepaired += repaired;
         }
     }
-    if (defenderPlanet) {
+    if (defenderPlanet && !npcCtx) {
         const defRepairBonus = REPAIR_BASE + ((defenderCommander?.reparatur || 0) * 0.01);
         for (let i = 0; i < 10; i++) {
             const losses = (defWarships[i] || 0) - defenderAfterWarships[i];
@@ -6155,7 +6200,7 @@ async function resolveCombat(attackerPlayFabId, attackerCommander, attackerFleet
     // PHASE 9: Erfahrung (Ress05)
     const attackerExp = 10 + (attackerWins ? 10 : 0);
     report.ress05Attacker = attackerExp;
-    if (defenderPlanet) {
+    if (defenderPlanet && !npcCtx) {
         const defenderExp = 10 + (!attackerWins ? 10 : 0);
         defenderPlanet.ressources[4] = (defenderPlanet.ressources[4] || 0) + defenderExp;
         report.ress05Defender = defenderExp;
@@ -6195,6 +6240,16 @@ async function resolveCombat(attackerPlayFabId, attackerCommander, attackerFleet
                 log.push(`Terraforming auf ${destCoord} vereitelt`);
             }
         } catch (e) { console.error('[Terraforming] Abbruch durch Angriff fehlgeschlagen:', e.message); }
+    }
+
+    // NEU 21.10.2026 (§36): Piratenstuetzpunkt: Verluste + Beute zurueckschreiben, Angriff protokollieren
+    if (npcCtx) {
+        try {
+            await npcFinalizeCombat(npcCtx, defenderAfterWarships, lootedRessources, attackerWins, attackerCommander.commanderId, now);
+        } catch (e) {
+            console.error('[Piraten] Rueckschreiben fehlgeschlagen:', e.message);
+            log.push(`Piraten-Rueckschreiben Fehler: ${e.message}`);
+        }
     }
 
     // Verteidiger-Planet + Commander speichern (falls bekannt)
@@ -6837,6 +6892,10 @@ async function buildPlayerInspectionReport(rawQuery) {
     // NEU 04.10.2026: Inventar-Werkzeug (§28) — Befehle mit "#inv" am Anfang
     if (/^\s*#inv\b/i.test(String(rawQuery || '')))
         return await buildInventoryAdminReport(String(rawQuery).trim());
+
+    // NEU 21.10.2026: Piraten-Werkzeug (§36) — Befehle mit "#npc" am Anfang
+    if (/^\s*#npc\b/i.test(String(rawQuery || '')))
+        return await buildNpcAdminReport(String(rawQuery).trim());
 
     // NEU 20.10.2026: Allianzkasse-Werkzeug (§35) — Befehle mit "#kasse" am Anfang
     if (/^\s*#kasse\b/i.test(String(rawQuery || '')))
@@ -10131,6 +10190,17 @@ const ACHV_CATALOG = [
     {"id":"mil_win_50","cat":"militaer","cond":{"t":"count","s":"combatWins","n":50},"reward":{"items":[{"i":"crate_warship_0","q":1}]}},
     {"id":"mil_def_1","cat":"militaer","cond":{"t":"count","s":"defenseWins","n":1},"reward":{"random":1}},
     {"id":"mil_def_10","cat":"militaer","cond":{"t":"count","s":"defenseWins","n":10},"reward":{"random":2}},
+    {"id":"mil_npc_1","cat":"militaer","cond":{"t":"count","s":"npcWins","n":1},"reward":{"random":1}},
+    {"id":"mil_npc_10","cat":"militaer","cond":{"t":"count","s":"npcWins","n":10},"reward":{"random":2}},
+    {"id":"mil_npc_50","cat":"militaer","cond":{"t":"count","s":"npcWins","n":50},"reward":{"random":2}},
+    {"id":"mil_npc_250","cat":"militaer","cond":{"t":"count","s":"npcWins","n":250},"reward":{"items":[{"i":"crate_warship_0","q":2}]}},
+    {"id":"mil_npckill_100","cat":"militaer","cond":{"t":"count","s":"npcKills","n":100},"reward":{"random":1}},
+    {"id":"mil_npckill_1000","cat":"militaer","cond":{"t":"count","s":"npcKills","n":1000},"reward":{"random":2}},
+    {"id":"mil_npckill_10000","cat":"militaer","cond":{"t":"count","s":"npcKills","n":10000},"reward":{"items":[{"i":"crate_warship_1","q":1}]}},
+    {"id":"mil_npcclan_3","cat":"militaer","cond":{"t":"count","s":"npcClans","n":3},"reward":{"random":2}},
+    {"id":"mil_npcclan_6","cat":"militaer","cond":{"t":"count","s":"npcClans","n":6},"reward":{"items":[{"i":"crate_warship_0","q":1}]}},
+    {"id":"mil_npcloot_100k","cat":"militaer","cond":{"t":"count","s":"npcLoot","n":100000},"reward":{"random":2}},
+    {"id":"mil_npcloot_1m","cat":"militaer","cond":{"t":"count","s":"npcLoot","n":1000000},"reward":{"random":3}},
     {"id":"mil_yard_5","cat":"militaer","cond":{"t":"building","i":5,"l":5},"reward":{"random":1}},
     {"id":"tech_first","cat":"technologie","cond":{"t":"researchSum","l":1},"reward":{"random":1}},
     {"id":"tech_lab_5","cat":"technologie","cond":{"t":"building","i":6,"l":5},"reward":{"random":1}},
@@ -10156,7 +10226,11 @@ const ACHV_CATALOG = [
 // Zaehler aus der Datenbank (alles Server-Daten)
 const ACHV_COUNTERS = {
     colonies:        `SELECT COUNT(*)::int AS n FROM planet_registry WHERE owner_commander_id = $1 AND kind = 'player' AND terraform_until IS NULL`,
-    combatWins:      `SELECT COUNT(*)::int AS n FROM combat_reports WHERE attacker_commander_id = $1 AND attacker_wins = true AND defender_commander_id IS DISTINCT FROM $1`,
+    combatWins:      `SELECT COUNT(*)::int AS n FROM combat_reports WHERE attacker_commander_id = $1 AND attacker_wins = true AND defender_commander_id IS DISTINCT FROM $1 AND defender_commander_id >= 1000000`,
+    npcWins:         `SELECT COUNT(*)::int AS n FROM npc_raids WHERE commander_id = $1 AND won = true`,
+    npcClans:        `SELECT COUNT(DISTINCT sector_id)::int AS n FROM npc_raids WHERE commander_id = $1 AND won = true`,
+    npcKills:        `SELECT COALESCE(SUM(kills), 0)::bigint AS n FROM npc_raids WHERE commander_id = $1`,
+    npcLoot:         `SELECT COALESCE(SUM(loot_total), 0)::bigint AS n FROM npc_raids WHERE commander_id = $1 AND won = true`,
     defenseWins:     `SELECT COUNT(*)::int AS n FROM combat_reports WHERE defender_commander_id = $1 AND attacker_wins = false AND attacker_commander_id IS DISTINCT FROM $1`,
     marketSales:     `SELECT COUNT(*)::int AS n FROM market_offers WHERE seller_commander_id = $1 AND status = 'sold'`,
     marketPurchases: `SELECT COUNT(*)::int AS n FROM market_offers WHERE buyer_commander_id = $1 AND status = 'sold'`,
@@ -10758,6 +10832,660 @@ async function buildTreasuryAdminReport(rawQuery) {
         return 'Fehler: ' + error.message;
     }
 }
+
+// #####################################################################
+// §36  PIRATEN (EnemyNPC) — NEU 21.10.2026
+//      Plan 2 (Nutzer): EIN EIGENER PIRATENCLAN JE SEKTOR (Rostklauen, Funkenjaeger ...), jeder mit eigenem Profil, sichtbarer Entwicklung
+//      und eigenem Unity-Asset (Namen/Texte/Bilder spaeter aenderbar). Einzige Quelle der Zahlen: Tools/Piraten/piraten_katalog.js
+//      (sync_piraten.js schreibt den Katalog zwischen PIRATEN-KATALOG-START/ENDE und die Assets).
+//      Aufbau:
+//        * Stuetzpunkte stehen auf den inneren Planeten 1-3 (fuer Spieler lange gesperrt), alle 2-3 Systeme, Position aus den Koordinaten
+//          (galaxyHash, deterministisch). Jeder Sektor bekommt sein Netz automatisch (Start, Tick, Sektor-Eroeffnung, Abfrage).
+//        * Entwicklung nach ALTER des Clans (Stufe 0-7, Tabelle NPC_STAGES); Schiffe, Forschung und Ertrag wachsen, gewichtet je Clan.
+//        * Alles LAZY: Flotte fuellt sich 1 h nach einem Kampf wieder auf, das Lager fuellt sich nach Stundenertrag (max. 24 h).
+//        * Kampf: resolveCombat bekommt einen NPC-Verteidiger (Schiffe + Forschung aus der Tabelle), Beute nur Ress02-04 (max. 33 %
+//          vom Lager, je Wiederholung desselben Spielers auf denselben Stuetzpunkt weniger), nie ICC; Verluste/Lager werden zurueckgeschrieben.
+//        * Voll entwickelte Clans (Stufe 7) uebernehmen nach und nach VERLASSENE Planeten ihres Sektors (geloeschter Account -> Piraten).
+//        * Besitzer-ID eines Clans = NPC_OWNER_BASE + Sektor (910001 ...), im Register kind='pirate'. (900002 = "verlassen", nicht verwenden.)
+//      Tabellen: npc_clans, npc_bases, npc_raids, npc_events (alle in DB_EXPORT_TABLES). Admin: "#npc" im Spieler-Info-Feld.
+//      Oeffentlich: GET /npc/clans, /npc/clan/:sektor, /npc/base/:koordinate.
+// #####################################################################
+
+// PIRATEN-KATALOG-START (erzeugt von Tools/Piraten/sync_piraten.js aus piraten_katalog.js - NICHT von Hand aendern)
+const NPC_STAGES = [
+    {"name":"Schlupfwinkel","days":0,"ships":[4,0,0,0],"research":0,"metal":30},
+    {"name":"Lager","days":2,"ships":[8,2,0,0],"research":0,"metal":45},
+    {"name":"Stützpunkt","days":5,"ships":[14,5,0,0],"research":2,"metal":60},
+    {"name":"Bastion","days":10,"ships":[24,10,2,0],"research":4,"metal":90},
+    {"name":"Festung","days":18,"ships":[40,18,6,0],"research":6,"metal":140},
+    {"name":"Zitadelle","days":30,"ships":[60,30,12,1],"research":8,"metal":210},
+    {"name":"Hochburg","days":50,"ships":[90,45,20,3],"research":11,"metal":320},
+    {"name":"Machtzentrum","days":80,"ships":[130,70,32,6],"research":14,"metal":480}
+];
+const NPC_CLANS = [
+    {"sector":1,"id":"Clan01","name":"Rostklauen","motto":"Was rostet, das hält.","lore":"Schrottsammler und Wracktaucher aus den alten Frachterrouten. Sie flicken zusammen, was andere zurückgelassen haben, und fliegen Rudel kleiner, zäher Schiffe. Die ältesten Stützpunkte der Galaxie gehören ihnen.","color":"C8742E","strength":1,"mix":[1.5,1,0.5,0.5],"focus":"shield","counter":"Viele schwere Treffer: wenige, dicke Schiffe schlagen ihre Masse."},
+    {"sector":2,"id":"Clan02","name":"Funkenjäger","motto":"Schneller als jeder Funkspruch.","lore":"Ehemalige Kurierpiloten, die mit gestohlenen Antrieben die Handelsrouten jagen. Ihre Schiffe sind schnell, leicht gepanzert und gefährlich im Verbund.","color":"F2D13C","strength":1.15,"mix":[0.7,1.5,1,0.8],"focus":"weapon","counter":"Gute Panzerung nimmt ihnen den Biss; Flächenfeuer räumt ihre Schwärme auf."},
+    {"sector":3,"id":"Clan03","name":"Nebelwölfe","motto":"Du siehst uns erst, wenn es zu spät ist.","lore":"Sie verstecken sich in den Gasnebeln der Randsysteme und schlagen im Rudel zu. Ihre Flotten sind ausgewogen und diszipliniert - eine echte Herausforderung für Anfänger.","color":"7FA6B8","strength":1.3,"mix":[0.8,1,1.5,0.8],"focus":"balanced","counter":"Eine gemischte Flotte aus allen Schiffsklassen ist ihre schwächste Stelle."},
+    {"sector":4,"id":"Clan04","name":"Eisenbrut","motto":"Eisen bricht nicht.","lore":"Abtrünnige Werftarbeiter, die ganze Kreuzer aus Panzerplatten gebaut haben. Wenige, aber schwere Schiffe - wer sie knacken will, braucht Durchschlagskraft.","color":"8A93A6","strength":1.45,"mix":[0.5,0.7,1.2,1.5],"focus":"shield","counter":"Schwere Waffen und starke Schiffe; leichte Jäger prallen ab."},
+    {"sector":5,"id":"Clan05","name":"Glutkorsaren","motto":"Wir brennen heller.","lore":"Sonnenräuber, die nahe an den Sternen fliegen und deren Energie anzapfen. Ihre Waffen glühen, ihre Schilde auch - und sie werden mit jedem Tag frecher.","color":"E8553A","strength":1.6,"mix":[1,1.2,1.2,1.2],"focus":"weapon","counter":"Hohe Schutzwerte; kurze, harte Gefechte, bevor ihre Waffen warm werden."},
+    {"sector":6,"id":"Clan06","name":"Leerenschwarm","motto":"Wir sind viele.","lore":"Niemand weiß, woher sie kommen. Sie fliegen in riesigen Schwärmen kleiner Schiffe und überrennen jeden, der nicht genug Feuerkraft mitbringt.","color":"9B6BD6","strength":1.75,"mix":[2,0.8,0.6,0.6],"focus":"weapon","counter":"Flächenwaffen und Trägerverbände: gegen Schwärme zählt die Zahl der Treffer."}
+];
+const NPC_SHIP_POWER = [10,30,70,1000];
+const NPC_RULES = {"dangerSteps":[100,300,1000,4000],"stockHours":24,"regenMinutes":60,"baseSpacingMin":2,"baseSpacingMax":3,"basePlanetMax":3,"lootFactors":[1,0.5,0.25,0.1],"takeoverMinStage":7,"takeoverAbandonedHours":48,"takeoverPerDay":1,"takeoverMax":8,"outpostShare":0.5};
+// PIRATEN-KATALOG-ENDE
+
+const NPC_OWNER_BASE = 910000;
+const NPC_REGISTRY_KIND = 'pirate';
+
+function npcOwnerId(sector) { return NPC_OWNER_BASE + sector; }
+function npcSectorOfOwner(ownerId) { const s = ownerId - NPC_OWNER_BASE; return s >= 1 && s < 90000 ? s : 0; }
+
+function npcClanDef(sector) {
+    const c = NPC_CLANS.find(x => x.sector === sector);
+    if (c) return c;
+    return { sector, id: 'Clan' + String(sector).padStart(2, '0'), name: 'Freibeuter von Sektor ' + sector, motto: '', lore: '',
+        color: '9AA0A6', strength: Math.min(3, 1.75 + 0.15 * (sector - 6)), mix: [1, 1, 1, 1], focus: 'balanced',
+        counter: 'Eine gemischte Flotte ist die sicherste Wahl.' };
+}
+
+function npcStageIndex(foundedAt, now) {
+    const days = (now.getTime() - new Date(foundedAt).getTime()) / 86400000;
+    let idx = 0;
+    for (let i = 0; i < NPC_STAGES.length; i++) if (days >= NPC_STAGES[i].days) idx = i;
+    return idx;
+}
+
+// Schiffe eines Stuetzpunkts bei dieser Stufe (Warship01-04). Aussenposten (Uebernahmen) haben nur einen Teil.
+function npcStrengthAt(clan, stageIdx) {
+    const f = Math.max(0, Math.min(NPC_STAGES.length - 1, stageIdx)) / (NPC_STAGES.length - 1);
+    return 1 + (clan.strength - 1) * f;
+}
+
+function npcShipsFor(clan, stageIdx, outpost) {
+    const st = NPC_STAGES[Math.max(0, Math.min(NPC_STAGES.length - 1, stageIdx))];
+    const share = outpost ? NPC_RULES.outpostShare : 1;
+    const strength = npcStrengthAt(clan, stageIdx);
+    const out = [0, 0, 0, 0, 0, 0, 0, 0, 0, 0];
+    for (let i = 0; i < 4; i++) {
+        const base = st.ships[i] || 0;
+        if (base <= 0) continue;
+        out[i] = Math.max(1, Math.round(base * strength * (clan.mix[i] || 1) * share));
+    }
+    return out;
+}
+
+// Ertrag je Stunde (Index 0-4 = Ress01-05): Wasserstoff 50 %, Metalle 100 %, Werkzeuge 30 % des Metall-Ertrags
+function npcRatesFor(clan, stageIdx, outpost) {
+    const st = NPC_STAGES[Math.max(0, Math.min(NPC_STAGES.length - 1, stageIdx))];
+    const m = Math.max(1, Math.round(st.metal * npcStrengthAt(clan, stageIdx) * (outpost ? NPC_RULES.outpostShare : 1)));
+    return [0, Math.round(m * 0.5), m, Math.round(m * 0.3), 0];
+}
+
+function npcResearchFor(clan, stageIdx) {
+    const lvl = NPC_STAGES[Math.max(0, Math.min(NPC_STAGES.length - 1, stageIdx))].research;
+    if (clan.focus === 'weapon') return { w: lvl, s: Math.floor(lvl / 2) };
+    if (clan.focus === 'shield') return { w: Math.floor(lvl / 2), s: lvl };
+    return { w: Math.floor(lvl * 0.75), s: Math.floor(lvl * 0.75) };
+}
+
+function npcPowerOf(ships) {
+    let p = 0;
+    for (let i = 0; i < 4; i++) p += (Number(ships && ships[i]) || 0) * NPC_SHIP_POWER[i];
+    return p;
+}
+function npcDangerOf(power) {
+    let d = 1;
+    for (const step of NPC_RULES.dangerSteps) if (power >= step) d++;
+    return d;
+}
+
+// Aktueller Zustand eines Stuetzpunkts (rein rechnerisch, ohne Datenbank)
+function npcBaseState(base, clan, stageIdx, now) {
+    const outpost = base.origin === 'takeover';
+    const target = npcShipsFor(clan, stageIdx, outpost);
+    const stored = Array.isArray(base.ships) ? base.ships : [];
+    const ships = new Array(10).fill(0);
+    if (!base.last_fight) {
+        for (let i = 0; i < 4; i++) ships[i] = target[i];
+    } else {
+        const regenMs = Math.max(1, NPC_RULES.regenMinutes * 60000);
+        const f = Math.min(1, Math.max(0, (now.getTime() - new Date(base.last_fight).getTime()) / regenMs));
+        for (let i = 0; i < 4; i++) {
+            const have = Math.min(Number(stored[i]) || 0, target[i]);
+            ships[i] = have + Math.ceil((target[i] - have) * f);
+        }
+    }
+    const rates = npcRatesFor(clan, stageIdx, outpost);
+    const hours = Math.max(0, (now.getTime() - new Date(base.last_update).getTime()) / 3600000);
+    const storedStock = Array.isArray(base.stock) ? base.stock : [];
+    const stock = [0, 0, 0, 0, 0], cap = [0, 0, 0, 0, 0];
+    for (let i = 0; i < 5; i++) {
+        cap[i] = rates[i] * NPC_RULES.stockHours;
+        stock[i] = Math.min(cap[i], Math.floor((Number(storedStock[i]) || 0) + rates[i] * hours));
+    }
+    const power = npcPowerOf(ships);
+    return { ships, target, rates, stock, cap, power, danger: npcDangerOf(power), outpost, stageIdx };
+}
+
+function npcBerlinDayKey(now) {
+    const p = getBerlinParts(now);
+    return `${p.year}-${p.month}-${p.day}`;
+}
+
+// ---- Platzierung: deterministisch aus den Koordinaten (Systeme mit Abstand 2-3, Planet 1-3) ----
+function npcSlotsForSector(sector, systems) {
+    const slots = [];
+    let sys = 1 + (galaxyHash(1, sector, 7001, 1) % 2);
+    while (sys <= systems) {
+        slots.push({ system: sys, planet: 1 + (galaxyHash(1, sector, sys, 7002) % NPC_RULES.basePlanetMax) });
+        sys += NPC_RULES.baseSpacingMin + (galaxyHash(1, sector, sys, 7003) % (NPC_RULES.baseSpacingMax - NPC_RULES.baseSpacingMin + 1));
+    }
+    return slots;
+}
+
+async function npcEnsureClanRow(sector, now) {
+    await pool.query('INSERT INTO npc_clans (sector_id, founded_at) VALUES ($1, $2) ON CONFLICT (sector_id) DO NOTHING', [sector, now]);
+    const r = await pool.query('SELECT * FROM npc_clans WHERE sector_id = $1', [sector]);
+    return r.rows[0];
+}
+
+async function npcLogEvent(sector, kind, text) {
+    try { await pool.query('INSERT INTO npc_events (sector_id, kind, text) VALUES ($1, $2, $3)', [sector, kind, String(text).slice(0, 300)]); }
+    catch (e) { console.error('[Piraten] Ereignis-Log:', e.message); }
+}
+
+// Legt (falls noetig) Register-Eintrag + Stuetzpunkt-Zeile an. true = Stuetzpunkt steht (jetzt oder schon vorher).
+async function npcPlaceBase(clan, clanRow, sector, system, planet, name, origin, now) {
+    const coord = `1:${sector}:${system}:${planet}`;
+    const have = await pool.query('SELECT coord FROM npc_bases WHERE coord = $1', [coord]);
+    if (have.rows.length > 0) return true;
+    const ownerId = npcOwnerId(sector);
+    const ins = await pool.query(
+        `INSERT INTO planet_registry (coord, galaxy_id, sector_id, system_id, planet_number, owner_commander_id, kind, owner_name, planet_name)
+         VALUES ($1, 1, $2, $3, $4, $5, $6, $7, $8) ON CONFLICT (coord) DO NOTHING RETURNING coord`,
+        [coord, sector, system, planet, ownerId, NPC_REGISTRY_KIND, clan.name, name]);
+    if (ins.rows.length === 0) {
+        const cur = await pool.query('SELECT owner_commander_id FROM planet_registry WHERE coord = $1', [coord]);
+        if (!cur.rows[0] || cur.rows[0].owner_commander_id !== ownerId) return false;   // gehoert schon jemand anderem
+    }
+    const stageIdx = npcStageIndex(clanRow.founded_at, now);
+    const outpost = origin === 'takeover';
+    const rates = npcRatesFor(clan, stageIdx, outpost);
+    const startStock = rates.map(r => Math.floor(r * NPC_RULES.stockHours * 0.5));
+    await pool.query(
+        `INSERT INTO npc_bases (coord, sector_id, system_id, planet_number, origin, name, founded_at, ships, stock, last_update)
+         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $7) ON CONFLICT (coord) DO NOTHING`,
+        [coord, sector, system, planet, origin, name, now, JSON.stringify(npcShipsFor(clan, stageIdx, outpost)), JSON.stringify(startStock)]);
+    return true;
+}
+
+const npcEnsuredSectors = new Set();
+
+// Sorgt dafuer, dass ein (offener) Sektor seinen Clan und sein Stuetzpunkt-Netz hat. Idempotent.
+async function npcEnsureSector(sector, now) {
+    now = now || new Date();
+    const clanRow = await npcEnsureClanRow(sector, now);
+    const clan = npcClanDef(sector);
+    const systems = galaxySystemsIn(sector);
+    if (systems <= 0) return 0;
+    const slots = npcSlotsForSector(sector, systems);
+    let placed = 0, index = 0;
+    for (const s of slots) {
+        index++;
+        const name = `${clan.name}-Posten ${index}`;
+        const order = [s.planet];
+        for (let p = 1; p <= NPC_RULES.basePlanetMax; p++) if (p !== s.planet) order.push(p);   // Ersatz, falls der Wunschplanet schon belegt ist
+        for (const p of order) {
+            if (await npcPlaceBase(clan, clanRow, sector, s.system, p, name, 'slot', now)) { placed++; break; }
+        }
+    }
+    npcEnsuredSectors.add(sector);
+    return placed;
+}
+
+async function npcEnsureAll(log) {
+    const now = new Date();
+    for (const sec of galaxyOpenSectorList()) {
+        if (npcEnsuredSectors.has(sec.id)) continue;
+        try {
+            const n = await npcEnsureSector(sec.id, now);
+            if (log) log.push(`Piraten: Sektor ${sec.id} ${n} Stuetzpunkte`);
+            console.log(`[Piraten] Sektor ${sec.id}: ${n} Stuetzpunkte (Clan ${npcClanDef(sec.id).name})`);
+        } catch (e) { console.error(`[Piraten] Sektor ${sec.id} konnte nicht angelegt werden:`, e.message); }
+    }
+}
+
+// ---- Stufen-Wechsel melden + Uebernahmen verlassener Planeten (laeuft im Server-Tick) ----
+async function npcTakeOne(clan, clanRow, now, force) {
+    const sector = clanRow.sector_id;
+    const hours = force ? 0 : NPC_RULES.takeoverAbandonedHours;
+    const cand = await pool.query(
+        `SELECT coord, system_id, planet_number FROM planet_registry
+         WHERE galaxy_id = 1 AND sector_id = $1 AND kind = 'abandoned' AND updated_at < $2::timestamptz - make_interval(hours => $3)
+         ORDER BY updated_at ASC LIMIT 1`, [sector, now, hours]);
+    const row = cand.rows[0];
+    if (!row) return null;
+    const count = (await pool.query("SELECT COUNT(*)::int AS n FROM npc_bases WHERE sector_id = $1 AND origin = 'takeover'", [sector])).rows[0].n;
+    const name = `${clan.name}-Außenposten ${count + 1}`;
+    const upd = await pool.query(
+        `UPDATE planet_registry SET owner_commander_id = $2, kind = $3, owner_name = $4, planet_name = $5, updated_at = now()
+         WHERE coord = $1 AND kind = 'abandoned' RETURNING coord`, [row.coord, npcOwnerId(sector), NPC_REGISTRY_KIND, clan.name, name]);
+    if (upd.rows.length === 0) return null;
+    const stageIdx = npcStageIndex(clanRow.founded_at, now);
+    const rates = npcRatesFor(clan, stageIdx, true);
+    await pool.query(
+        `INSERT INTO npc_bases (coord, sector_id, system_id, planet_number, origin, name, founded_at, ships, stock, last_update)
+         VALUES ($1, $2, $3, $4, 'takeover', $5, $6, $7, $8, $6) ON CONFLICT (coord) DO NOTHING`,
+        [row.coord, sector, row.system_id, row.planet_number, name, now, JSON.stringify(npcShipsFor(clan, stageIdx, true)),
+         JSON.stringify(rates.map(r => Math.floor(r * NPC_RULES.stockHours * 0.5)))]);
+    await pool.query('UPDATE npc_clans SET takeovers = takeovers + 1, last_takeover_at = $2 WHERE sector_id = $1', [sector, now]);
+    await npcLogEvent(sector, 'takeover', `${clan.name} haben den verlassenen Planeten ${row.coord} übernommen.`);
+    console.log(`[Piraten] ${clan.name} uebernehmen ${row.coord}`);
+    return row.coord;
+}
+
+async function npcTick(log) {
+    const now = new Date();
+    await npcEnsureAll(log);
+    const clans = (await pool.query('SELECT * FROM npc_clans ORDER BY sector_id')).rows;
+    for (const cr of clans) {
+        if (!galaxyOpenSectorList().some(x => x.id === cr.sector_id)) continue;
+        const clan = npcClanDef(cr.sector_id);
+        const stageIdx = npcStageIndex(cr.founded_at, now);
+        if (stageIdx > cr.stage_seen) {
+            const upd = await pool.query('UPDATE npc_clans SET stage_seen = $2 WHERE sector_id = $1 AND stage_seen < $2 RETURNING sector_id', [cr.sector_id, stageIdx]);
+            if (upd.rows.length > 0)
+                await npcLogEvent(cr.sector_id, 'stage', `${clan.name} erreichen Stufe ${stageIdx}: ${NPC_STAGES[stageIdx].name}.`);
+        }
+        if (stageIdx >= NPC_RULES.takeoverMinStage && cr.takeovers < NPC_RULES.takeoverMax) {
+            const waitMs = 86400000 / Math.max(1, NPC_RULES.takeoverPerDay);
+            if (!cr.last_takeover_at || now.getTime() - new Date(cr.last_takeover_at).getTime() >= waitMs) {
+                try {
+                    const taken = await npcTakeOne(clan, cr, now, false);
+                    if (taken && log) log.push(`Piraten: ${clan.name} uebernehmen ${taken}`);
+                } catch (e) { console.error('[Piraten] Uebernahme:', e.message); }
+            }
+        }
+    }
+}
+
+// ---- Kampf-Anbindung (resolveCombat) ----
+async function npcLoadBase(coord) {
+    const r = await pool.query('SELECT * FROM npc_bases WHERE coord = $1', [coord]);
+    return r.rows[0] || null;
+}
+
+// Liefert null, wenn auf dem Ziel KEIN Piratenstuetzpunkt steht. Wirft bei Datenbankfehlern (der Aufrufer bricht dann ab statt gegen "nichts" zu kaempfen).
+async function npcPrepareDefense(coord, attackerCommanderId, now) {
+    const reg = await pool.query('SELECT owner_commander_id, kind, owner_name, planet_name FROM planet_registry WHERE coord = $1', [coord]);
+    const row = reg.rows[0];
+    if (!row || row.kind !== NPC_REGISTRY_KIND) return null;
+    const sector = npcSectorOfOwner(row.owner_commander_id) || Number(coord.split(':')[1]);
+    let base = await npcLoadBase(coord);
+    if (!base) {          // Register sagt Pirat, Zeile fehlt: aus dem Register nachtragen
+        const p = coord.split(':').map(Number);
+        const clanRow0 = await npcEnsureClanRow(sector, now);
+        await pool.query(
+            `INSERT INTO npc_bases (coord, sector_id, system_id, planet_number, origin, name, founded_at, ships, stock, last_update)
+             VALUES ($1, $2, $3, $4, 'slot', $5, $6, '[]', '[0,0,0,0,0]', $6) ON CONFLICT (coord) DO NOTHING`,
+            [coord, sector, p[2], p[3], row.planet_name || 'Posten', now]);
+        base = await npcLoadBase(coord);
+        if (!base) throw new Error('Piratenstuetzpunkt nicht anlegbar: ' + coord);
+        void clanRow0;
+    }
+    const clanRow = await npcEnsureClanRow(base.sector_id, now);
+    const clan = npcClanDef(base.sector_id);
+    const stageIdx = npcStageIndex(clanRow.founded_at, now);
+    const st = npcBaseState(base, clan, stageIdx, now);
+
+    const done = await pool.query(
+        `SELECT COUNT(*)::int AS n FROM npc_raids WHERE commander_id = $1 AND coord = $2 AND won = true AND created_at > $3::timestamptz - interval '24 hours'`,
+        [attackerCommanderId, coord, now]);
+    const n = done.rows[0] ? done.rows[0].n : 0;
+    const lootFactor = NPC_RULES.lootFactors[Math.min(n, NPC_RULES.lootFactors.length - 1)];
+
+    const research = npcResearchFor(clan, stageIdx);
+    const ownerId = npcOwnerId(base.sector_id);
+    return {
+        coord, clan, stageIdx, base, state: st, lootFactor, raidsToday: n,
+        ownerInfo: { ownerCommanderId: ownerId, ownerName: clan.name, planetName: base.name || '', pfid: null, hqLevel: 0 },
+        planet: { warships: st.ships.slice(), ships: [0, 0, 0, 0, 0, 0], buildings: [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0], ressources: st.stock.slice(), terraformUntilUtc: null },
+        commander: { commanderId: ownerId, visibleName: clan.name, weapon01: research.w, weapon02: research.w, weapon03: research.w,
+                     shield01: research.s, shield02: research.s, shield03: research.s, recycling: 0, reparatur: 0 },
+        before: st.ships.slice(), stockBefore: st.stock.slice()
+    };
+}
+
+// Schreibt Verluste und Beute zurueck (als Differenz zum aktuellen Stand - gleichzeitige Angriffe ueberschreiben sich nicht) und protokolliert den Angriff.
+async function npcFinalizeCombat(ctx, afterWarships, looted, attackerWins, attackerCommanderId, now) {
+    const client = await pool.connect();
+    try {
+        await client.query('BEGIN');
+        const cur = (await client.query('SELECT * FROM npc_bases WHERE coord = $1 FOR UPDATE', [ctx.coord])).rows[0];
+        if (cur) {
+            const clanRow = (await client.query('SELECT founded_at FROM npc_clans WHERE sector_id = $1', [cur.sector_id])).rows[0];
+            const stageIdx = npcStageIndex(clanRow ? clanRow.founded_at : cur.founded_at, now);
+            const st = npcBaseState(cur, ctx.clan, stageIdx, now);
+            const ships = new Array(10).fill(0), stock = [0, 0, 0, 0, 0];
+            for (let i = 0; i < 10; i++) ships[i] = Math.max(0, st.ships[i] - Math.max(0, (ctx.before[i] || 0) - (afterWarships[i] || 0)));
+            for (let i = 0; i < 5; i++) stock[i] = Math.max(0, st.stock[i] - (looted[i] || 0));
+            await client.query(
+                `UPDATE npc_bases SET ships = $2, stock = $3, last_update = $4, last_fight = $4, raids = raids + 1, defeats = defeats + $5 WHERE coord = $1`,
+                [ctx.coord, JSON.stringify(ships), JSON.stringify(stock), now, attackerWins ? 1 : 0]);
+        }
+        const total = looted.reduce((a, b) => a + (b || 0), 0);
+        let kills = 0;
+        for (let i = 0; i < 10; i++) kills += Math.max(0, (ctx.before[i] || 0) - (afterWarships[i] || 0));
+        await client.query(
+            'INSERT INTO npc_raids (commander_id, coord, sector_id, won, loot_total, kills, day_key, created_at) VALUES ($1, $2, $3, $4, $5, $6, $7, $8)',
+            [attackerCommanderId, ctx.coord, ctx.base.sector_id, !!attackerWins, total, kills, npcBerlinDayKey(now), now]);
+        await client.query('COMMIT');
+    } catch (e) {
+        try { await client.query('ROLLBACK'); } catch (e2) { /* ignorieren */ }
+        throw e;
+    } finally {
+        client.release();
+    }
+}
+
+// ---- Oeffentliche Profile ----
+function npcStageInfo(clanRow, now) {
+    const stageIdx = npcStageIndex(clanRow.founded_at, now);
+    const elapsed = (now.getTime() - new Date(clanRow.founded_at).getTime()) / 86400000;
+    const next = stageIdx + 1 < NPC_STAGES.length ? NPC_STAGES[stageIdx + 1] : null;
+    const cur = NPC_STAGES[stageIdx];
+    return {
+        stage: stageIdx, stageName: cur.name, stageCount: NPC_STAGES.length,
+        daysToNext: next ? Math.max(0, Math.ceil((next.days - elapsed) * 10) / 10) : -1,
+        progress: next ? Math.max(0, Math.min(1, (elapsed - cur.days) / (next.days - cur.days))) : 1,
+        elapsedDays: Math.floor(elapsed)
+    };
+}
+
+function npcBaseView(base, clan, stageIdx, now, lootFactor) {
+    const st = npcBaseState(base, clan, stageIdx, now);
+    const f = lootFactor === undefined ? 1 : lootFactor;
+    return {
+        coord: base.coord, name: base.name, origin: base.origin, sector: base.sector_id,
+        ships: st.ships.slice(0, 4), power: st.power, danger: st.danger,
+        stock: st.stock, cap: st.cap,
+        lootable: st.stock.map((s, i) => (i >= 1 && i <= 3) ? Math.floor(s * LOOT_MAX_SHARE * f) : 0),
+        lootFactor: f, raids: base.raids, defeats: base.defeats
+    };
+}
+
+async function npcClanProfile(sector, now, viewerCommanderId) {
+    if (!galaxyOpenSectorList().some(x => x.id === sector)) return null;
+    if (!npcEnsuredSectors.has(sector)) await npcEnsureSector(sector, now);
+    const clanRow = await npcEnsureClanRow(sector, now);
+    const clan = npcClanDef(sector);
+    const info = npcStageInfo(clanRow, now);
+    const bases = (await pool.query('SELECT * FROM npc_bases WHERE sector_id = $1 ORDER BY origin, system_id, planet_number', [sector])).rows;
+    const views = [];
+    for (const b of bases) {
+        let f = 1;
+        if (viewerCommanderId) {
+            const n = (await pool.query(
+                `SELECT COUNT(*)::int AS n FROM npc_raids WHERE commander_id = $1 AND coord = $2 AND won = true AND created_at > $3::timestamptz - interval '24 hours'`,
+                [viewerCommanderId, b.coord, now])).rows[0].n;
+            f = NPC_RULES.lootFactors[Math.min(n, NPC_RULES.lootFactors.length - 1)];
+        }
+        views.push(npcBaseView(b, clan, info.stage, now, f));
+    }
+    const totalPower = views.reduce((a, v) => a + v.power, 0);
+    const maxPower = views.reduce((a, v) => Math.max(a, v.power), 0);
+    const raids = (await pool.query(
+        `SELECT COUNT(*)::int AS total, COUNT(*) FILTER (WHERE created_at > $2::timestamptz - interval '24 hours')::int AS day, COUNT(*) FILTER (WHERE won)::int AS won
+         FROM npc_raids WHERE sector_id = $1`, [sector, now])).rows[0];
+    const events = (await pool.query('SELECT kind, text, created_at FROM npc_events WHERE sector_id = $1 ORDER BY id DESC LIMIT 12', [sector])).rows;
+    const nextDanger = info.stage + 1 < NPC_STAGES.length ? npcDangerOf(npcPowerOf(npcShipsFor(clan, info.stage + 1, false))) : info.stage + 1;
+    return {
+        sector, ownerId: npcOwnerId(sector), id: clan.id, name: clan.name, motto: clan.motto, lore: clan.lore, color: clan.color,
+        counter: clan.counter, focus: clan.focus, strength: clan.strength,
+        stage: info.stage, stageName: info.stageName, stageCount: info.stageCount, daysToNext: info.daysToNext, progress: info.progress,
+        elapsedDays: info.elapsedDays, foundedAt: new Date(clanRow.founded_at).toISOString(),
+        danger: views.length > 0 ? npcDangerOf(maxPower) : 1, nextDanger: Math.max(1, Math.min(5, nextDanger)),
+        baseCount: views.filter(v => v.origin !== 'takeover').length, outposts: views.filter(v => v.origin === 'takeover').length,
+        totalPower, maxPower, takeoverStage: NPC_RULES.takeoverMinStage, takeovers: clanRow.takeovers,
+        raidsTotal: raids.total, raidsWon: raids.won, raids24h: raids.day,
+        stages: NPC_STAGES.map(s => ({ name: s.name, days: s.days })),
+        bases: views,
+        chronicle: events.map(e => ({ kind: e.kind, text: e.text, at: new Date(e.created_at).toISOString() }))
+    };
+}
+
+app.get('/npc/clans', async (req, res) => {
+    try {
+        const now = new Date();
+        const out = [];
+        for (const sec of galaxyOpenSectorList()) {
+            if (!npcEnsuredSectors.has(sec.id)) await npcEnsureSector(sec.id, now);
+            const cr = await npcEnsureClanRow(sec.id, now);
+            const clan = npcClanDef(sec.id);
+            const info = npcStageInfo(cr, now);
+            const bases = (await pool.query('SELECT * FROM npc_bases WHERE sector_id = $1', [sec.id])).rows;
+            let maxPower = 0;
+            for (const b of bases) maxPower = Math.max(maxPower, npcBaseState(b, clan, info.stage, now).power);
+            out.push({ sector: sec.id, ownerId: npcOwnerId(sec.id), name: clan.name, color: clan.color, stage: info.stage, stageName: info.stageName,
+                       stageCount: info.stageCount, bases: bases.length, danger: bases.length > 0 ? npcDangerOf(maxPower) : 1, maxPower });
+        }
+        res.json({ success: true, clans: out });
+    } catch (error) {
+        console.error('[Piraten] /npc/clans:', error.message);
+        res.status(500).json({ success: false, error: 'Abfrage fehlgeschlagen.' });
+    }
+});
+
+app.get('/npc/clan/:sector', async (req, res) => {
+    const sector = parseInt(req.params.sector, 10);
+    if (!Number.isInteger(sector) || sector < 1 || sector > 99999) return res.status(400).json({ success: false, error: 'Ungültiger Sektor.' });
+    try {
+        let viewer = 0;
+        try { const who = await marketIdentity(req); viewer = who ? who.commanderId : 0; } catch (e) { viewer = 0; }
+        const profile = await npcClanProfile(sector, new Date(), viewer);
+        if (!profile) return res.status(404).json({ success: false, error: 'In diesem Sektor gibt es keine Piraten.' });
+        res.json({ success: true, clan: profile });
+    } catch (error) {
+        console.error('[Piraten] /npc/clan:', error.message);
+        res.status(500).json({ success: false, error: 'Abfrage fehlgeschlagen.' });
+    }
+});
+
+app.get('/npc/base/:coord', async (req, res) => {
+    const coord = normalizeRegistryCoord(req.params.coord);
+    if (!coord) return res.status(400).json({ success: false, error: 'Ungültiges Koordinatenformat.' });
+    try {
+        const base = await npcLoadBase(coord);
+        if (!base) return res.status(404).json({ success: false, error: 'Hier steht kein Piratenstützpunkt.' });
+        const now = new Date();
+        const clanRow = await npcEnsureClanRow(base.sector_id, now);
+        const clan = npcClanDef(base.sector_id);
+        let f = 1;
+        try {
+            const who = await marketIdentity(req);
+            if (who) {
+                const n = (await pool.query(
+                    `SELECT COUNT(*)::int AS n FROM npc_raids WHERE commander_id = $1 AND coord = $2 AND won = true AND created_at > $3::timestamptz - interval '24 hours'`,
+                    [who.commanderId, coord, now])).rows[0].n;
+                f = NPC_RULES.lootFactors[Math.min(n, NPC_RULES.lootFactors.length - 1)];
+            }
+        } catch (e) { f = 1; }
+        res.json({ success: true, base: npcBaseView(base, clan, npcStageIndex(clanRow.founded_at, now), now, f), clanSector: base.sector_id, clanName: clan.name });
+    } catch (error) {
+        console.error('[Piraten] /npc/base:', error.message);
+        res.status(500).json({ success: false, error: 'Abfrage fehlgeschlagen.' });
+    }
+});
+
+// -------------------------------------------------------
+// ADMIN-Befehl "#npc" (Spieler-Info-Feld)
+// -------------------------------------------------------
+async function buildNpcAdminReport(rawQuery) {
+    const tokens = String(rawQuery || '').trim().split(/\s+/).slice(1);
+    const now = new Date();
+    const help = 'PIRATEN-Admin:\n  #npc                        alle Clans (Stufe, Stuetzpunkte, Kampfkraft, Uebernahmen)\n  #npc <Sektor>               Stuetzpunkte eines Clans\n' +
+        '  #npc stage <Sektor> <0-' + (NPC_STAGES.length - 1) + '>   Entwicklungsstufe setzen (Gruendungsdatum wird passend verschoben)\n  #npc heal                   Stuetzpunkt-Netz aller offenen Sektoren nachtragen\n' +
+        '  #npc reset <Koordinate>     Stuetzpunkt voll auffuellen (Flotte + halbes Lager)\n  #npc takeover <Sektor>      Uebernahme sofort erzwingen (Test)';
+    try {
+        if (tokens.length === 0) {
+            const clans = (await pool.query('SELECT * FROM npc_clans ORDER BY sector_id')).rows;
+            if (clans.length === 0) return 'Noch keine Clans angelegt. "#npc heal" legt sie an.\n\n' + help;
+            const lines = ['PIRATENCLANS (' + clans.length + ')'];
+            for (const cr of clans) {
+                const clan = npcClanDef(cr.sector_id);
+                const info = npcStageInfo(cr, now);
+                const bases = (await pool.query('SELECT * FROM npc_bases WHERE sector_id = $1', [cr.sector_id])).rows;
+                let power = 0;
+                for (const b of bases) power += npcBaseState(b, clan, info.stage, now).power;
+                lines.push(`  Sektor ${cr.sector_id}  ${clan.name}: Stufe ${info.stage} (${info.stageName}), Tag ${info.elapsedDays}, ${bases.length} Stuetzpunkte, Kampfkraft gesamt ${power}, Uebernahmen ${cr.takeovers}`);
+            }
+            return lines.join('\n') + '\n\n' + help;
+        }
+        const cmd = tokens[0].toLowerCase();
+        if (cmd === 'heal') {
+            npcEnsuredSectors.clear();
+            await npcEnsureAll();
+            return 'Stuetzpunkt-Netz nachgetragen fuer ' + npcEnsuredSectors.size + ' Sektoren.';
+        }
+        if (cmd === 'stage') {
+            const sector = parseInt(tokens[1], 10), stage = parseInt(tokens[2], 10);
+            if (!Number.isInteger(sector) || !Number.isInteger(stage) || stage < 0 || stage >= NPC_STAGES.length) return 'Verwendung: #npc stage <Sektor> <0-' + (NPC_STAGES.length - 1) + '>';
+            await npcEnsureClanRow(sector, now);
+            const founded = new Date(now.getTime() - (NPC_STAGES[stage].days * 86400000 + 60000));
+            await pool.query('UPDATE npc_clans SET founded_at = $2, stage_seen = $3 WHERE sector_id = $1', [sector, founded, stage]);
+            await npcLogEvent(sector, 'admin', `Entwicklungsstufe von Admin auf ${stage} (${NPC_STAGES[stage].name}) gesetzt.`);
+            return `Sektor ${sector} (${npcClanDef(sector).name}): Stufe ${stage} (${NPC_STAGES[stage].name}) gesetzt.`;
+        }
+        if (cmd === 'reset') {
+            const coord = normalizeRegistryCoord(tokens[1]);
+            if (!coord) return 'Verwendung: #npc reset <Koordinate>';
+            const r = await pool.query('UPDATE npc_bases SET last_fight = NULL, last_update = $2, stock = $3 WHERE coord = $1 RETURNING coord, sector_id, origin', [coord, now, '[0,0,0,0,0]']);
+            if (r.rows.length === 0) return 'Hier steht kein Piratenstuetzpunkt: ' + coord;
+            const clanRow = await npcEnsureClanRow(r.rows[0].sector_id, now);
+            const clan = npcClanDef(r.rows[0].sector_id);
+            const rates = npcRatesFor(clan, npcStageIndex(clanRow.founded_at, now), r.rows[0].origin === 'takeover');
+            await pool.query('UPDATE npc_bases SET stock = $2 WHERE coord = $1', [coord, JSON.stringify(rates.map(x => Math.floor(x * NPC_RULES.stockHours * 0.5)))]);
+            return `Stuetzpunkt ${coord} aufgefuellt.`;
+        }
+        if (cmd === 'takeover') {
+            const sector = parseInt(tokens[1], 10);
+            if (!Number.isInteger(sector)) return 'Verwendung: #npc takeover <Sektor>';
+            const cr = await npcEnsureClanRow(sector, now);
+            const taken = await npcTakeOne(npcClanDef(sector), cr, now, true);
+            return taken ? `${npcClanDef(sector).name} haben ${taken} uebernommen.` : 'Kein verlassener Planet in Sektor ' + sector + ' gefunden.';
+        }
+        const sector = parseInt(tokens[0], 10);
+        if (Number.isInteger(sector)) {
+            const profile = await npcClanProfile(sector, now, 0);
+            if (!profile) return 'Sektor ' + sector + ' ist nicht offen.';
+            const lines = [`${profile.name} (Sektor ${sector}): Stufe ${profile.stage}/${profile.stageCount - 1} ${profile.stageName}, Gefahr ${profile.danger}/5, Angriffe ${profile.raidsTotal} (${profile.raidsWon} gewonnen)`];
+            for (const b of profile.bases)
+                lines.push(`  ${b.coord}  ${b.name}${b.origin === 'takeover' ? ' [Uebernahme]' : ''}: Schiffe ${b.ships.join('/')}, Kampfkraft ${b.power}, Lager W${b.stock[1]} M${b.stock[2]} T${b.stock[3]}, Angriffe ${b.raids}`);
+            if (profile.chronicle.length > 0) lines.push('Chronik: ' + profile.chronicle.slice(0, 5).map(c => c.text).join(' | '));
+            return lines.join('\n');
+        }
+        return help;
+    } catch (e) {
+        console.error('[Piraten] Admin-Befehl:', e.message);
+        return 'Fehler: ' + e.message;
+    }
+}
+
+// Start: Stuetzpunkt-Netz aller offenen Sektoren anlegen (mit Verzoegerung, bis Datenbank + Galaxie-Struktur bereit sind)
+setTimeout(() => { npcEnsureAll().catch(e => console.error('[Piraten] Start:', e.message)); }, 20000);
+
+// #####################################################################
+// §37  TAEGLICHE AUFGABEN (Daily Quests) — NEU 21.10.2026
+//      Je Aufgabe (Katalog DAILY_CATALOG, erzeugt von Tools/Daily/sync_daily.js; Texte/Bilder liegen im Unity-Asset Assets/Quests/Daily/DailyNN.asset)
+//      prueft der SERVER Bedingung und Belohnung. Tageswechsel = Mitternacht deutscher Zeit. Abholen ist atomar (eine Zeile je Spieler/Tag/Aufgabe).
+//      Bedingungen: npc_raid_win = so viele Piraten-Angriffe heute GEWONNEN (npc_raids, nur Server-Daten).
+//      Routen: GET /daily?commanderId=, POST /daily/claim. Tabelle daily_quest_state (in DB_EXPORT_TABLES).
+// #####################################################################
+
+// DAILY-KATALOG-START (erzeugt von Tools/Daily/sync_daily.js aus daily_katalog.js - NICHT von Hand aendern)
+const DAILY_CATALOG = [
+    {"id":"Daily01","cond":{"kind":"npc_raid_win","target":1},"reward":{"random":1}},
+    {"id":"Daily02","cond":{"kind":"npc_kills","target":25},"reward":{"random":1}},
+    {"id":"Daily03","cond":{"kind":"npc_raid_win","target":3},"reward":{"random":1}}
+];
+// DAILY-KATALOG-ENDE
+
+async function dailyProgress(def, commanderId, dayKey) {
+    if (def.cond.kind === 'npc_raid_win') {
+        const r = await pool.query('SELECT COUNT(*)::int AS n FROM npc_raids WHERE commander_id = $1 AND day_key = $2 AND won = true', [commanderId, dayKey]);
+        return r.rows[0] ? r.rows[0].n : 0;
+    }
+    if (def.cond.kind === 'npc_kills') {
+        const r = await pool.query('SELECT COALESCE(SUM(kills), 0)::int AS n FROM npc_raids WHERE commander_id = $1 AND day_key = $2', [commanderId, dayKey]);
+        return r.rows[0] ? r.rows[0].n : 0;
+    }
+    return 0;
+}
+
+function dailySecondsToReset(now) {
+    const p = getBerlinParts(now);
+    const secOfDay = Number(p.hour) * 3600 + Number(p.minute) * 60 + Number(p.second);
+    return Math.max(1, 86400 - secOfDay);
+}
+
+app.get('/daily', async (req, res) => {
+    const commanderId = parseInt(req.query && req.query.commanderId, 10);
+    if (!commanderId) return res.status(400).json({ success: false, error: 'Ungültige Angaben.' });
+    const caller = await requireCaller(req, res, { commanderId });
+    if (!caller) return;
+    try {
+        const now = new Date();
+        const dayKey = npcBerlinDayKey(now);
+        const claimed = (await pool.query('SELECT quest_id FROM daily_quest_state WHERE commander_id = $1 AND day_key = $2', [caller.commanderId, dayKey])).rows.map(x => x.quest_id);
+        const quests = [];
+        for (const def of DAILY_CATALOG) {
+            const current = await dailyProgress(def, caller.commanderId, dayKey);
+            quests.push({ id: def.id, current: Math.min(current, def.cond.target), target: def.cond.target, claimed: claimed.includes(def.id),
+                          reward: def.reward.random ? `${def.reward.random}x zufällige Kleine Kiste` : '' });
+        }
+        const lock = await achvActiveLock(caller.commanderId);
+        res.json({ success: true, day: dayKey, resetInSeconds: dailySecondsToReset(now), locked: !!lock, quests });
+    } catch (error) {
+        console.error('[Daily] Abfrage:', error.message);
+        res.status(500).json({ success: false, error: 'Abfrage fehlgeschlagen.' });
+    }
+});
+
+app.post('/daily/claim', async (req, res) => {
+    const commanderId = parseInt(req.body && req.body.commanderId, 10);
+    const questId = String(req.body && req.body.questId || '').slice(0, 40);
+    if (!commanderId || !questId) return res.status(400).json({ success: false, error: 'Ungültige Angaben.' });
+    const caller = await requireCaller(req, res, { commanderId });
+    if (!caller) return;
+    const def = DAILY_CATALOG.find(x => x.id === questId);
+    if (!def) return res.status(404).json({ success: false, error: 'Diese Aufgabe gibt es nicht.' });
+    const cid = caller.commanderId;
+    try {
+        const lock = await achvActiveLock(cid);
+        if (lock) return res.status(423).json({ success: false, error: 'Belohnungen sind vorübergehend gesperrt.', lockedUntil: lock.until });
+        const now = new Date();
+        const dayKey = npcBerlinDayKey(now);
+        const current = await dailyProgress(def, cid, dayKey);
+        if (current < def.cond.target) return res.status(400).json({ success: false, error: 'Diese Aufgabe ist heute noch nicht erledigt.', current, target: def.cond.target });
+        const claim = await pool.query(
+            'INSERT INTO daily_quest_state (commander_id, day_key, quest_id) VALUES ($1, $2, $3) ON CONFLICT DO NOTHING RETURNING quest_id', [cid, dayKey, questId]);
+        if (claim.rows.length === 0) return res.status(409).json({ success: false, error: 'Diese Belohnung hast du heute schon abgeholt.' });
+        let granted;
+        try {
+            granted = await achvGrantReward(caller.playFabId, def.reward);
+        } catch (e) {
+            await pool.query('DELETE FROM daily_quest_state WHERE commander_id = $1 AND day_key = $2 AND quest_id = $3', [cid, dayKey, questId]);
+            console.error('[Daily] Belohnung Fehler:', e.message);
+            return res.status(500).json({ success: false, error: 'Belohnung konnte nicht gutgeschrieben werden. Bitte später erneut versuchen.' });
+        }
+        await pool.query('UPDATE daily_quest_state SET reward = $4 WHERE commander_id = $1 AND day_key = $2 AND quest_id = $3', [cid, dayKey, questId, JSON.stringify(granted)]);
+        await achvLog(cid, 'daily:' + questId, 'ABGEHOLT', { granted, day: dayKey });
+        res.json({ success: true, questId, granted, text: granted.map(g => `${g.qty}x ${g.label}`).join('\n') });
+    } catch (error) {
+        console.error('[Daily] Abholen Fehler:', error.message);
+        res.status(500).json({ success: false, error: 'Abholen gerade nicht möglich.' });
+    }
+});
 
 // #####################################################################
 // §21  SERVERSTART (app.listen)
