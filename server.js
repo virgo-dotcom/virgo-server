@@ -58,6 +58,7 @@
 //  §36  PIRATEN / EnemyNPC (npc_clans/_bases/_raids/_events, ein Clan je Sektor, GET /npc/..., NPC-Verteidiger in resolveCombat, Admin "#npc"); steht VOR §21
 //  §35  ALLIANZKASSE (alliance_treasury/_log, /alliance-treasury, Einzahlen + Handelssteuer, nichts entnehmbar, Admin "#kasse"); steht VOR §21
 //  §34  ERFOLGE serverseitig (achievement_state/_locks/_log, GET /achievements, POST /achievements/claim, Admin "#achv"); steht VOR §21
+//  §38  KAMPFPUNKTE (Allianz-Pool alliances.combat_points, combat_points_log; nur Mensch gegen Mensch; liegt im Kampfbereich vor recalcParticipantLosses/getBerlinParts)
 //  §33  STATIONIEREN + gemeinsames Verteidigen (stationed_fleets, /fleets/stationed, Kampf mit mehreren Teilnehmern); steht VOR §21
 //  §32  TERRAFORMING (Wartezeit, Abschluss, Abbruch durch Spieler/Angreifer, /planet/terraform-complete|abort); steht VOR §21
 //  §31  KOLONISATIONS-REGELN (Verwaltung/Habitat/Kosten, Pruefung in /planet/claim und beim Forschungs-Abschluss); steht VOR §21
@@ -1243,6 +1244,13 @@ async function initDatabase() {
             last_fight TIMESTAMPTZ NULL, raids INTEGER NOT NULL DEFAULT 0, defeats INTEGER NOT NULL DEFAULT 0);`);
         await pool.query(`ALTER TABLE npc_bases ADD COLUMN IF NOT EXISTS heat REAL NOT NULL DEFAULT 0;`);   // Alarmbereitschaft (22.10.2026): haeufig angegriffene Posten rüsten schneller nach
         await pool.query(`CREATE INDEX IF NOT EXISTS idx_npc_bases_sector ON npc_bases (sector_id);`);
+        // NEU 22.10.2026 (§38 Kampfpunkte): Pool je Allianz (kann ins Minus gehen) + Protokoll je Teilnehmer
+        await pool.query(`ALTER TABLE alliances ADD COLUMN IF NOT EXISTS combat_points INTEGER NOT NULL DEFAULT 0;`);
+        await pool.query(`CREATE TABLE IF NOT EXISTS combat_points_log (
+            id SERIAL PRIMARY KEY, report_id TEXT NOT NULL DEFAULT '', commander_id INTEGER NOT NULL, alliance_id INTEGER NULL,
+            pair_key TEXT NOT NULL DEFAULT '', points INTEGER NOT NULL, detail JSONB, created_at TIMESTAMPTZ NOT NULL DEFAULT now());`);
+        await pool.query(`CREATE INDEX IF NOT EXISTS idx_combat_points_log_commander ON combat_points_log (commander_id, id DESC);`);
+        await pool.query(`CREATE INDEX IF NOT EXISTS idx_combat_points_log_pair ON combat_points_log (pair_key, created_at);`);
         await pool.query(`CREATE TABLE IF NOT EXISTS npc_raids (
             id SERIAL PRIMARY KEY, commander_id INTEGER NOT NULL, coord TEXT NOT NULL, sector_id INTEGER NOT NULL, won BOOLEAN NOT NULL DEFAULT false,
             loot_total BIGINT NOT NULL DEFAULT 0, kills INTEGER NOT NULL DEFAULT 0, day_key TEXT NOT NULL DEFAULT '', created_at TIMESTAMPTZ NOT NULL DEFAULT now());`);
@@ -4416,7 +4424,7 @@ const DB_EXPORT_TABLES = ['alliances', 'alliance_ranks', 'alliance_members', 'al
     'support_messages', 'player_reports', 'shop_items', 'promo_codes', 'promo_redemptions', 'giftbox_claims', 'giftbox_golden_claims',
     'market_offers', 'transport_deliveries', 'planet_registry', 'combat_reports', 'attack_traces', 'processed_fleets',
     'galaxy_sectors', 'galaxy_config', 'galaxy_texts', 'stationed_fleets', 'achievement_state', 'achievement_locks', 'achievement_log', 'alliance_treasury', 'alliance_treasury_log',
-    'npc_clans', 'npc_bases', 'npc_raids', 'npc_events', 'daily_quest_state'];
+    'npc_clans', 'npc_bases', 'npc_raids', 'npc_events', 'daily_quest_state', 'combat_points_log'];
 app.get('/admin/db-export', async (req, res) => {
     if (process.env.DB_EXPORT_ENABLED !== 'true') return res.status(404).json({ success: false, error: 'Nicht verfuegbar.' });
     if (!adminKeyOk(req.query.key)) return res.status(403).json({ success: false, error: 'Nicht autorisiert' });
@@ -5785,6 +5793,80 @@ function recalcParticipantLosses(participant, before10, beforeShips, after10, af
         : 0;
 }
 
+// #####################################################################
+// §38  KAMPFPUNKTE (Allianz-Pool) — NEU 22.10.2026
+//      Ersetzt die alte "Erfahrung" (die schrieb Credits gut). Nach jedem Kampf mit MENSCHEN auf beiden Seiten bekommt jeder menschliche
+//      Teilnehmer Punkte: Sieg +10 / Niederlage -5, je zerstoertes gegnerisches (menschliches) Kampfschiff +2, je verlorenes eigenes -1.
+//      Die Punkte gehen in den Pool der Allianz des Teilnehmers (alliances.combat_points, darf negativ werden); ohne Allianz werden sie
+//      nur protokolliert (combat_points_log). NPC-Schiffe (Piraten, verlassene Planeten) zaehlen NIE: reine PvE-Kaempfe geben keine Punkte,
+//      bei Kaempfen mit NPC + zwei Menschen (z.B. eigene Falle bei einem NPC) zaehlen nur die menschlichen Schiffe.
+//      Anti-Farm: Wiederholte Kaempfe DESSELBEN Paares binnen 24 h bringen weniger Pluspunkte (Faktoren unten); Minuspunkte bleiben voll.
+//      Zahlen nur hier (COMBAT_POINTS). Reine Rechnung: combatPointsCompute (testbar), Speichern: combatPointsApply.
+// #####################################################################
+const COMBAT_POINTS = { win: 10, loss: -5, kill: 2, lost: -1, repeatFactors: [1.0, 0.5, 0.25, 0.1], repeatWindowHours: 24 };
+
+function combatPointsIsHuman(id) { return Number(id) >= 1000000; }
+
+function combatPointsLostWarships(p) {
+    let n = 0;
+    for (let i = 0; i < 10; i++) n += Math.max(0, ((p.warshipsBefore || [])[i] || 0) - ((p.warshipsAfter || [])[i] || 0));
+    return n;
+}
+
+// Liefert null (kein Punkte-Kampf) oder { pairKey, entries: [{ commanderId, side, win, kills, lost, positive, negative }] } - OHNE Wiederholungs-Faktor
+function combatPointsCompute(report) {
+    const att = (report.attackers || []).filter(p => combatPointsIsHuman(p.commanderId));
+    const def = (report.defenders || []).filter(p => combatPointsIsHuman(p.commanderId));
+    if (att.length === 0 || def.length === 0) return null;
+    const lostAtt = att.reduce((a, p) => a + combatPointsLostWarships(p), 0);
+    const lostDef = def.reduce((a, p) => a + combatPointsLostWarships(p), 0);
+    const entries = [];
+    const addSide = (list, side, won, enemyLost) => {
+        const sizeSum = list.reduce((a, p) => a + Math.max(1, p.totalShipsBefore || 0), 0);
+        for (const p of list) {
+            const share = Math.max(1, p.totalShipsBefore || 0) / sizeSum;
+            const kills = Math.round(enemyLost * COMBAT_POINTS.kill * share);
+            const lost = combatPointsLostWarships(p);
+            const win = won ? COMBAT_POINTS.win : COMBAT_POINTS.loss;
+            entries.push({ commanderId: p.commanderId, side, win, kills, lost, positive: (win > 0 ? win : 0) + kills, negative: (win < 0 ? win : 0) + lost * COMBAT_POINTS.lost });
+        }
+    };
+    addSide(att, 'attacker', !!report.attackerWins, lostDef);
+    addSide(def, 'defender', !report.attackerWins, lostAtt);
+    const hostId = combatPointsIsHuman(report.planetOwnerId) ? report.planetOwnerId : def[0].commanderId;
+    const a = att[0].commanderId;
+    const pairKey = Math.min(a, hostId) + ':' + Math.max(a, hostId);
+    return { pairKey, entries };
+}
+
+async function combatPointsApply(report, now, log) {
+    try {
+        const calc = combatPointsCompute(report);
+        report.combatPointsApplies = !!calc;
+        report.combatPointsAttacker = 0; report.combatPointsDefender = 0;
+        if (!calc) return;
+        const since = new Date(now.getTime() - COMBAT_POINTS.repeatWindowHours * 3600000);
+        const prior = await pool.query('SELECT COUNT(DISTINCT report_id)::int AS n FROM combat_points_log WHERE pair_key = $1 AND created_at >= $2', [calc.pairKey, since]);
+        const n = (prior.rows[0] && prior.rows[0].n) || 0;
+        const factor = COMBAT_POINTS.repeatFactors[Math.min(n, COMBAT_POINTS.repeatFactors.length - 1)];
+        report.combatPointsFactor = factor;
+        for (const e of calc.entries) {
+            const points = Math.round(e.positive * factor) + e.negative;
+            e.points = points;
+            if (e.side === 'attacker' && report.combatPointsAttacker === 0) report.combatPointsAttacker = points;
+            if (e.side === 'defender' && e.commanderId === report.planetOwnerId) report.combatPointsDefender = points;
+            const allianceId = await getAllianceIdForCommander(e.commanderId);
+            await pool.query('INSERT INTO combat_points_log (report_id, commander_id, alliance_id, pair_key, points, detail, created_at) VALUES ($1, $2, $3, $4, $5, $6, $7)',
+                [report.reportId, e.commanderId, allianceId, calc.pairKey, points, JSON.stringify({ side: e.side, win: e.win, kills: e.kills, lost: e.lost, factor }), now]);
+            if (allianceId) await pool.query('UPDATE alliances SET combat_points = combat_points + $2 WHERE id = $1', [allianceId, points]);
+        }
+        if (log) log.push(`Kampfpunkte (${calc.pairKey}, Faktor ${factor}): ` + calc.entries.map(e => e.commanderId + ' ' + (e.points >= 0 ? '+' : '') + e.points).join(', '));
+    } catch (e) {
+        console.error('[Kampfpunkte] Fehler:', e.message);
+        if (log) log.push('Kampfpunkte Fehler: ' + e.message);
+    }
+}
+
 // WICHTIG: Der Render-Server läuft in UTC, nicht in deutscher Zeit.
 // date.getHours() etc. würden also die Serverzeit zeigen (im Sommer
 // 2 Stunden, im Winter 1 Stunde hinter der deutschen Zeit). Über
@@ -6270,36 +6352,9 @@ async function resolveCombat(attackerPlayFabId, attackerCommander, attackerFleet
     report.totalDefenderLosses = defenderParticipant.totalLosses;
     if (useV2 && stationed) stationedRecalc(report, stationed);
 
-    // PHASE 9: Erfahrung (Ress05)
-    const attackerExp = 10 + (attackerWins ? 10 : 0);
-    report.ress05Attacker = attackerExp;
-    if (defenderPlanet && !npcCtx) {
-        const defenderExp = 10 + (!attackerWins ? 10 : 0);
-        defenderPlanet.ressources[4] = (defenderPlanet.ressources[4] || 0) + defenderExp;
-        report.ress05Defender = defenderExp;
-    }
-
-    // Attacker-Erfahrung direkt auf dessen Heimatplanet gutschreiben
-    if (attackerCommander.colonies && attackerCommander.colonies.length > 0) {
-        const homeCoord = attackerCommander.colonies[0];
-        const homeKey = `planet_${homeCoord.replace(/:/g, '_')}`;
-        try {
-            const homeData = await playfabServer('/Server/GetUserData', { PlayFabId: attackerPlayFabId, Keys: [homeKey] });
-            if (homeData.Data?.[homeKey]) {
-                const homePlanet = JSON.parse(homeData.Data[homeKey].Value);
-                if (homePlanet.ressources && homePlanet.ressources.length > 4) {
-                    homePlanet.ressources[4] = (homePlanet.ressources[4] || 0) + attackerExp;
-                    await playfabServer('/Server/UpdateUserData', {
-                        PlayFabId: attackerPlayFabId,
-                        Data: { [homeKey]: JSON.stringify(homePlanet) },
-                        Permission: 'Private'
-                    });
-                }
-            }
-        } catch (e) {
-            log.push(`Erfahrung-Gutschrift Fehler: ${e.message}`);
-        }
-    }
+    // PHASE 9: Kampfpunkte (§38). Die frueheren "Erfahrung"-Credits (ress05Attacker/-Defender) gibt es nicht mehr.
+    report.ress05Attacker = 0;
+    report.ress05Defender = 0;
 
     // NEU 18.10.2026 (§32): Gewinnt der Angreifer gegen einen Planeten, der noch terraformt, ist das Terraforming vereitelt:
     // der Planet wird wieder frei, Ueberlebende und Rohstoffe fliegen zum naechsten Planeten des Verteidigers (gespeichert wird unten wie gewohnt).
@@ -6352,6 +6407,9 @@ async function resolveCombat(attackerPlayFabId, attackerCommander, attackerFleet
             }
         }
     }
+
+    // NEU 22.10.2026 (§38): Kampfpunkte (nur Mensch gegen Mensch) berechnen und den Allianz-Pools gutschreiben; Felder im Bericht setzen
+    await combatPointsApply(report, now, log);
 
     // Bericht dauerhaft in der Datenbank speichern (eigene Zeile,
     // unabhängig von Mails/PlayFab) + Angreifer-Mail
