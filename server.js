@@ -911,10 +911,11 @@ async function initDatabase() {
         // einen frueheren Standardpreis dieses Artikels haben - spaetere manuelle Aenderungen in der Datenbank bleiben erhalten.
         const shopPreviousSeedCosts = {
             // Flotten-Angebote: frueher pauschal 250 ICC, danach (gleicher Tag) die Paketpreise 14.569 / 31.339 / 24.209 / 6.469 / 26.479 / 10.819
-            fleet_warship01: [250, 14569], fleet_warship02: [250, 31339], fleet_warship03: [250, 24209], fleet_warship04: [250, 6469], fleet_ship01: [250, 26479], fleet_ship03: [250, 10819],
+            // 21.10.2026: Aufschlag 10 -> 0,1 (Preise ca. /100); als "frueher" gelten auch die Preise vom 04.10. (149/629/2.429/6.469/2.649/10.819) und die Zwischenstaende vom 21.10. (1.019/4.369/16.849/45.009)
+            fleet_warship01: [250, 14569, 149, 1019], fleet_warship02: [250, 31339, 629, 4369], fleet_warship03: [250, 24209, 2429, 16849], fleet_warship04: [250, 6469, 45009], fleet_ship01: [250, 26479, 2649], fleet_ship03: [250, 10819],
             item_ship05: [1000],
             crate_res_0: [200], crate_res_1: [134], crate_res_2: [100], crate_res_3: [134], crate_res_4: [400],
-            crate_warship_0: [15], crate_warship_1: [63], crate_warship_2: [242], crate_warship_3: [647], crate_ship_1: [265], crate_ship_3: [1082]
+            crate_warship_0: [15, 149, 1019], crate_warship_1: [63, 629, 4369], crate_warship_2: [242, 2429, 16849], crate_warship_3: [647, 6469, 45009], crate_ship_1: [265, 2649], crate_ship_3: [1082, 10819]
         };
         for (const row of defaultShopItems) {
             const previous = shopPreviousSeedCosts[row[0]];
@@ -8175,7 +8176,7 @@ const MARKET_RESOURCE_NAMES = ['Energie', 'Wasserstoff', 'Metalle', 'Werkzeuge',
 // Baukosten (Ress01-05) der handelbaren Schiffe - MUSS manuell synchron mit den Unity-Assets gehalten werden
 // (Assets/Ship Assets/*.asset, Stand 04.10.2026), wie BUILDING_ECONOMY. Daraus wird der Warenwert berechnet.
 const MARKET_SHIP_COSTS = {
-    warship: { 0: [1240, 1860, 2480, 1860, 60], 1: [5330, 8000, 10660, 8000, 245], 2: [20590, 30880, 41170, 30880, 940], 3: [55000, 82500, 110000, 82500, 2500] },
+    warship: { 0: [220, 330, 3080, 330, 25], 1: [990, 2480, 4620, 2480, 75], 2: [5390, 4620, 6160, 5780, 175], 3: [55000, 82500, 110000, 82500, 2500] },
     ship:    { 1: [500, 350, 15000, 7500, 1], 3: [15000, 30000, 17500, 12500, 1000] }   // 1 = Containerschiff, 3 = Kolonisationsschiff
 };
 const MARKET_SHIP_NAMES = {
@@ -8874,7 +8875,9 @@ const INVENTORY_ITEMS = (() => {
 //   3) x 10 Aufschlag: ICC ist Pay-to-Win UND Pay-to-Accelerate - die gesparte Bauzeit wird mitbezahlt
 //   4) wie im Einzelhandel auf eine 9 am Ende AUFgerundet (1.453 -> 1.459; 83 -> 89; 91 -> 99)
 // -------------------------------------------------------
-const SHOP_SHIP_ICC_MARKUP   = 10;
+// NEU 21.10.2026 (Nutzer, Balancing-Phase): "2 Nullen weg" - Aufschlag 10 -> 0,1 (also ICC = Bauwert / 12.000), damit ein Warship04 ~450 ICC kostet
+// (bei 100 ICC = 1 EUR ca. 4,50 EUR). Bis 21.10. war es x10 (Pay-to-Accelerate). Gilt fuer ALLE Schiffe im Shop (Flotten-Pakete und Schiffskisten).
+const SHOP_SHIP_ICC_MARKUP   = 0.1;
 const SHOP_ICC_VALUE_POINTS  = 1200;
 
 function shopRetailRoundUp9(value) {
