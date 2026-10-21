@@ -895,6 +895,11 @@ async function initDatabase() {
             ['crate_warship_1', 'Schiffskiste Raumjaeger',    'gegenstaende', shopShipIccPrice('warship', 1, 1), 'inventory', 0, 1],
             ['crate_warship_2', 'Schiffskiste Kosmosjaeger',  'gegenstaende', shopShipIccPrice('warship', 2, 1), 'inventory', 0, 1],
             ['crate_warship_3', 'Schiffskiste Sternkreuzer',  'gegenstaende', shopShipIccPrice('warship', 3, 1), 'inventory', 0, 1],
+            // NEU 21.10.2026 (Nutzer): SCHIFFSKISTEN-PAKETE = so viele Jaeger, wie in einen Warship04 passen (20 Slots): feste Preise, in etwa 8,2-8,5 EUR.
+            // item_id = <Inventar-Gegenstand>_x<Anzahl>; reward_amount = Kisten je Kauf (shopInventoryItemId liest den Gegenstand aus der Kennung).
+            ['crate_warship_2_x5',  '5x Schiffskiste Kosmosjaeger', 'gegenstaende', 829, 'inventory', 0, 5],     // 8,29 EUR
+            ['crate_warship_1_x10', '10x Schiffskiste Raumjaeger',  'gegenstaende', 839, 'inventory', 0, 10],    // 8,39 EUR
+            ['crate_warship_0_x20', '20x Schiffskiste Orbitaljaeger', 'gegenstaende', 849, 'inventory', 0, 20],  // 8,49 EUR
             ['crate_ship_1',    'Schiffskiste Containerschiff',  'gegenstaende', shopShipIccPrice('ship', 1, 1),    'inventory', 0, 1],
             ['crate_ship_3',    'Schiffskiste Kolonisationsschiff', 'gegenstaende', shopShipIccPrice('ship', 3, 1),   'inventory', 0, 1]
         ];
@@ -9006,11 +9011,17 @@ async function inventoryGrant(playFabId, itemId, quantity) {
 // PFLICHT (Identitaet nur aus dem Ticket, nicht aus dem Body). Reihenfolge: erst ICC abbuchen, dann Kisten gutschreiben; scheitert
 // das, wird das ICC zurueckgebucht (im Zweifel lieber kurz weniger ICC als Gratis-Kisten).
 // -------------------------------------------------------
+// Kisten-Pakete im Shop tragen eine Kennung wie "crate_warship_2_x5" (5 Kisten je Kauf): der Inventar-Gegenstand ist der Teil davor.
+function shopInventoryItemId(item) {
+    return String(item.item_id).replace(/_x\d+$/, '');
+}
+
 async function shopPurchaseInventoryItem(req, res, item, quantity) {
     const who = await marketIdentity(req);
     if (!who) return res.status(401).json({ success: false, error: 'Nicht angemeldet.' });
-    const def = INVENTORY_ITEMS[item.item_id];
-    if (!def || INVENTORY_ADMIN_ONLY_ITEMS.has(item.item_id))
+    const invId = shopInventoryItemId(item);
+    const def = INVENTORY_ITEMS[invId];
+    if (!def || INVENTORY_ADMIN_ONLY_ITEMS.has(invId))
         return res.status(404).json({ success: false, error: 'Dieser Artikel ist nicht verfügbar.' });
 
     const crates = item.reward_amount * quantity;
@@ -9026,14 +9037,14 @@ async function shopPurchaseInventoryItem(req, res, item, quantity) {
             return { status: 400, body: { success: false, error: 'Nicht genug ICC', iccBalance: commander.accountResources[4] } };
 
         const inv = await inventoryLoad(who.playFabId);
-        const have = Number(inv.items[item.item_id]) || 0;
+        const have = Number(inv.items[invId]) || 0;
         if (have + crates > INVENTORY_MAX_STACK)
             return { status: 400, body: { success: false, error: `Dein Inventar kann nicht so viele davon halten (höchstens ${INVENTORY_MAX_STACK}).` } };
 
         commander.accountResources[4] -= totalCost;
         await playfabServer('/Server/UpdateUserData', { PlayFabId: who.playFabId, Data: { commander_data: JSON.stringify(commander) }, Permission: 'Private' });
         try {
-            inv.items[item.item_id] = have + crates;
+            inv.items[invId] = have + crates;
             await inventorySave(who.playFabId, inv);
         } catch (grantError) {
             console.error('[Inventar] shop: Gutschrift der Kisten fehlgeschlagen, buche ICC zurueck:', grantError.message);
@@ -9047,7 +9058,7 @@ async function shopPurchaseInventoryItem(req, res, item, quantity) {
             throw grantError;
         }
         await iccTrustSet(who.playFabId, commander.accountResources[4]);
-        console.log(`[Inventar] Shop: Commander ${who.commanderId} kauft ${crates}x ${item.item_id} fuer ${totalCost} ICC`);
+        console.log(`[Inventar] Shop: Commander ${who.commanderId} kauft ${crates}x ${invId} fuer ${totalCost} ICC`);
         return { status: 200, body: { success: true, newIccBalance: commander.accountResources[4], crates } };
     });
     return res.status(outcome.status).json(outcome.body);
