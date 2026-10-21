@@ -6084,7 +6084,7 @@ async function resolveCombat(attackerPlayFabId, attackerCommander, attackerFleet
             let attSpec = { warships: attackerFleet.warships, ships: attackerShipsBefore, research: v2ResearchOf(attackerCommander), retreatLossPercent: attackerFleet.retreatLossPercent };
             if (stationed && stationed.foreign.length > 0) {
                 phaseA = runCombatV2({ attacker: attSpec, defender: { parts: stationed.foreign.map(stationedPartSpec) }, seed: v2Seed });
-                attSpec = Object.assign({}, attSpec, { warships: phaseA.attacker.warships, ships: phaseA.attacker.ships });
+                attSpec = Object.assign({}, attSpec, { warships: phaseA.attacker.warships, ships: phaseA.attacker.ships, hpCarry: phaseA.attackerHp });   // NEU 21.10.2026: Schaden aus Phase 1 bleibt
                 skipPhaseB = phaseA.outcome !== 'win';
             }
             if (!skipPhaseB) {
@@ -7343,7 +7343,17 @@ function v2BuildSide(spec, isAttacker, mix, tag) {
         groups.push({ id: 'Ship0' + i + tag, kind: 'civil', idx: i, carrier: false, active: false, n0: n, w: [0, 0, 0], s: [0, 0, 0], hp0: COMBAT_V2.civilHp, list: [] });
     }
     if (totalShips > COMBAT_V2.maxShipsPerSide) throw new Error('Kampf v2: zu viele Schiffe (' + totalShips + ')');
-    for (const g of groups) for (let j = 0; j < g.n0; j++) g.list.push({ hp: g.hp0 });
+    // NEU 21.10.2026 (Nutzer: "Schiffe nehmen den Schaden aus der ersten Schlacht mit"): spec.hpCarry = Restlebenspunkte je Schiff aus einem
+    // frueheren Gefecht (z. B. Phase 1 gegen fremde stationierte Flotten), Schluessel 'w<idx>' / 'c<idx>'. Passt die Anzahl nicht, gilt voller Schutz.
+    const carry = spec.hpCarry || null;
+    for (const g of groups) {
+        const saved = carry ? carry[(g.kind === 'war' ? 'w' : 'c') + g.idx] : null;
+        if (Array.isArray(saved) && saved.length === g.n0) {
+            for (const hp of saved) g.list.push({ hp: Math.max(0.0001, Math.min(Number(hp) || g.hp0, g.hp0)) });
+        } else {
+            for (let j = 0; j < g.n0; j++) g.list.push({ hp: g.hp0 });
+        }
+    }
     return { groups, warHp0, civilActive: false };
 }
 
@@ -7638,6 +7648,11 @@ function runCombatV2(input) {
         rounds: roundLog.length,
         roundLog,
         startState,
+        attackerHp: (() => {      // Restlebenspunkte je Ueberlebendem (fuer ein Folgegefecht, siehe hpCarry)
+            const out = {};
+            for (const g of att.groups) out[(g.kind === 'war' ? 'w' : 'c') + g.idx] = g.list.map(s => Math.round(s.hp * 1000) / 1000);
+            return out;
+        })(),
         attacker: survivors(attSpec, att),
         defender: defenderParts ? { warships: defenderParts[0].warships, ships: defenderParts[0].ships } : survivors(defSpec, def),
         defenderParts,
@@ -8180,7 +8195,8 @@ const MARKET_SHIP_COSTS = {
     ship:    { 1: [500, 350, 15000, 7500, 1], 3: [15000, 30000, 17500, 12500, 1000] }   // 1 = Containerschiff, 3 = Kolonisationsschiff
 };
 const MARKET_SHIP_NAMES = {
-    warship: { 0: 'Orbitaljäger', 1: 'Raumjäger', 2: 'Kosmosjäger', 3: 'Sternkreuzer' },
+    // NEU 21.10.2026: volle Namen wie in den Schiffs-Assets (Name + Baureihe), damit Mails/Berichte ueberall dasselbe zeigen wie das Spiel (Regel: ingame immer derselbe Name)
+    warship: { 0: 'Orbitaljäger „Wespe“', 1: 'Raumjäger „Sturm-Falke“', 2: 'Kosmosjäger „Drachenbiss“', 3: 'Sternkreuzer „Eisenbär“' },
     ship:    { 1: 'Containerschiff', 3: 'Kolonisationsschiff' }
 };
 
