@@ -880,7 +880,7 @@ async function initDatabase() {
             ['fleet_warship04', '1x Sternkreuzer',    'flotten',    shopShipIccPrice('warship', 3, 1),    'warship',  3, 1],
             ['fleet_ship01',    '1x Containerschiff',    'flotten',    shopShipIccPrice('ship', 1, 1),       'ship',     1, 1],
             ['fleet_ship03',    '1x Kolonisationsschiff','flotten',    shopShipIccPrice('ship', 3, 1),       'ship',     3, 1],
-            ['item_ship05',     '1x Kernbombe',          'gegenstaende', 100000, 'ship', 5, 1],   // Nutzer-Vorgabe 04.10.2026: 100.000 ICC (vorher 1.000)
+            // Kernbombe: seit 22.10.2026 NICHT mehr kaeuflich (Nutzer: nur den Testern zeigen, "derzeit nicht verfuegbar", ohne Preis) - der Client zeigt einen Platzhalter
             // NEU (04.10.2026): KISTEN fuer das Inventar (§28). reward_kind 'inventory': item_id = Inventar-Gegenstand, reward_amount =
             // Anzahl Kisten je Kauf; sie landen im Inventar des Kaeufers (nicht auf einem Planeten). "Kleine Kiste" (erste Serie, Nutzer-Vorgabe):
             // Inhalt = Ressourcenpaket des Shops (Energie 5.000, Wasserstoff 7.500, Metalle 10.000, Werkzeuge 7.500, Credits 2.500) fuer
@@ -913,6 +913,8 @@ async function initDatabase() {
         }
         // 22.10.2026: das Kosmosjaeger-Paket hat jetzt 6 statt 5 Kisten (neue Kennung ..._x6) - das alte Angebot (_x5) wird abgeschaltet (Kaufhistorie bleibt)
         await pool.query("UPDATE shop_items SET active = false WHERE item_id = 'crate_warship_2_x5'");
+        // 22.10.2026: Kernbombe nur noch als Platzhalter ohne Preis (Client); das alte Shop-Angebot (100.000 ICC) wird abgeschaltet
+        await pool.query("UPDATE shop_items SET active = false WHERE item_id = 'item_ship05'");
 
         // NEU (04.10.2026): Preise der Flotten-Pakete und Kisten (siehe Seeds oben). Bestehende Zeilen werden NUR aktualisiert, wenn sie noch
         // einen frueheren Standardpreis dieses Artikels haben - spaetere manuelle Aenderungen in der Datenbank bleiben erhalten.
