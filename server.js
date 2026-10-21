@@ -5035,9 +5035,9 @@ app.get('/serverTick', serverTickHandler);
 // =========================================================
 const BUILDING_ECONOMY = {
     0: { // Kommandozentrale — feste Grundproduktion, wächst NICHT mit Stufe.
-         // baseStorageCapacity treibt hier die Ress05-Kapazität an (kein
-         // eigenes Gebäude für Ress05).
-        productionEarly: [[10], [20], [50], [25], [1]],
+         // NEU 21.10.2026: Tagessatz = Inhalt der Kleinen Kisten (5.000/7.500/10.000/7.500/2.500), Quelle Tools/Wirtschaft/sync_wirtschaft.js.
+         // Die Lagerkapazitaet kommt jetzt aus econStorageCaps (3 Tagesertraege); baseStorageCapacity wird nur noch von getStorageCapacity (ALT) gelesen.
+        productionEarly: [[0.2893519], [0.4340278], [0.5787037], [0.4340278], [0.1446759]],
         scalesWithLevel: false,
         tierGrowthFactors: [],
         tierStepCounts: [],
@@ -5442,6 +5442,72 @@ function getCapacityMultiplier(level) {
     }
     return mult;
 }
+// =====================================================================
+// NEU 21.10.2026 (Nutzer-Vorgaben): WIRTSCHAFTS-REGELN
+//   1) Kommandozentrale: feste Tagesproduktion je Ressource = Inhalt der Kleinen Kisten, egal welche Stufe (BUILDING_ECONOMY[0]).
+//   2) Lager (je Ressource) = 3 Tagesertraege des Planeten (HQ + Farm-Gebaeude, ohne Forschung) - die Produktion stoppt, sobald der Bestand
+//      die Kapazitaet erreicht; Beute/Handel/Shop duerfen weiter drueber hinaus (wie bisher). UNTERGRENZE: das Lager fasst immer mindestens
+//      den teuersten ANSTEHENDEN Ausbau (naechste Stufe aller Gebaeude auf diesem Planeten) - sonst waere z. B. die Werft nie bezahlbar.
+//      Solange die Gebaeude-Baukosten mehr als 3 Tagesertraege kosten, greift diese Untergrenze (siehe Vault "Wirtschaft - Lager und Ertrag").
+//   3) Rohstoff-Forschung (+1 %/Stufe) wirkt auf den GESAMTEN Ertrag der Ressource (HQ-Grundertrag + Farm), nicht auf Credits.
+//   Katalog (Baukosten, HQ-Tagessatz) erzeugt Tools/Wirtschaft/sync_wirtschaft.js.
+// =====================================================================
+// WIRTSCHAFT-KATALOG-START (erzeugt von Tools/Wirtschaft/sync_wirtschaft.js - NICHT von Hand aendern)
+const ECON_HQ_DAILY = [5000,7500,10000,7500,2500];      // Kommandozentrale: feste Tagesproduktion Ress01-05 (= Kleine Kisten)
+const ECON_STORAGE_DAYS = 3;                         // Lager = so viele Tagesertraege
+const ECON_MAX_BUILDING_LEVEL = 18;
+const ECON_BUILDING_COSTS = {   // Baukosten je Gebaeude-Index, Zeile = Zielstufe 1..18, Spalte = Ress01-05
+    0: [[25,50,200,100,1],[25,50,200,100,1],[50,100,400,200,2],[100,200,800,400,4],[300,600,2400,1200,12],[600,1200,4800,2400,24],[1200,2400,9600,4800,48],[2400,4800,19200,9600,96],[4800,9600,38400,19200,192],[24000,48000,192000,96000,960],[48000,96000,384000,192000,1920],[96000,192000,768000,384000,3840],[192000,384000,1536000,768000,7680],[384000,768000,3072000,1536000,15360],[3072000,6144000,24576000,12288000,122880],[6144000,12288000,49152000,24576000,245760],[12288000,24576000,98304000,49152000,491520],[24576000,49152000,196608000,98304000,983040]],
+    1: [[0,25,200,150,1],[0,50,400,300,2],[0,100,800,600,4],[0,300,2400,1800,12],[0,600,4800,3600,24],[0,1200,9600,7200,48],[0,2400,19200,14400,96],[0,4800,38400,28800,192],[0,24000,192000,144000,960],[0,48000,384000,288000,1920],[0,96000,768000,576000,3840],[0,192000,1536000,1152000,7680],[0,384000,3072000,2304000,15360],[0,3072000,24576000,18432000,122880],[0,6144000,49152000,36864000,245760],[0,12288000,98304000,73728000,491520],[0,24576000,196608000,147456000,983040],[0,49152000,393216000,294912000,1966080]],
+    2: [[50,0,175,50,1],[100,0,350,100,2],[200,0,700,200,4],[600,0,2100,600,12],[1200,0,4200,1200,24],[2400,0,8400,2400,48],[4800,0,16800,4800,96],[9600,0,33600,9600,192],[48000,0,168000,48000,960],[96000,0,336000,96000,1920],[192000,0,672000,192000,3840],[384000,0,1344000,384000,7680],[768000,0,2688000,768000,15360],[6144000,0,21504000,6144000,122880],[12288000,0,43008000,12288000,245760],[24576000,0,86016000,24576000,491520],[49152000,0,172032000,49152000,983040],[98304000,0,344064000,98304000,1966080]],
+    3: [[125,50,250,125,2],[250,100,500,250,4],[500,200,1000,500,8],[1500,600,3000,1500,24],[3000,1200,6000,3000,48],[6000,2400,12000,6000,96],[12000,4800,24000,12000,192],[24000,9600,48000,24000,384],[120000,48000,240000,120000,1920],[240000,96000,480000,240000,3840],[480000,192000,960000,480000,7680],[960000,384000,1920000,960000,15360],[1920000,768000,3840000,1920000,30720],[15360000,6144000,30720000,15360000,245760],[30720000,12288000,61440000,30720000,491520],[61440000,24576000,122880000,61440000,983040],[122880000,49152000,245760000,122880000,1966080],[245760000,98304000,491520000,245760000,3932160]],
+    4: [[150,75,250,250,2],[300,150,500,500,4],[600,300,1000,1000,8],[1800,900,3000,3000,24],[3600,1800,6000,6000,48],[7200,3600,12000,12000,96],[14400,7200,24000,24000,192],[28800,14400,48000,48000,384],[144000,72000,240000,240000,1920],[288000,144000,480000,480000,3840],[576000,288000,960000,960000,7680],[1152000,576000,1920000,1920000,15360],[2304000,1152000,3840000,3840000,30720],[18432000,9216000,30720000,30720000,245760],[36864000,18432000,61440000,61440000,491520],[73728000,36864000,122880000,122880000,983040],[147456000,73728000,245760000,245760000,1966080],[294912000,147456000,491520000,491520000,3932160]],
+    5: [[2500,2500,5000,4000,240],[5000,5000,10000,8000,480],[10000,10000,20000,16000,960],[30000,30000,60000,48000,2880],[60000,60000,120000,96000,5760],[120000,120000,240000,192000,11520],[240000,240000,480000,384000,23040],[480000,480000,960000,768000,46080],[2400000,2400000,4800000,3840000,230400],[4800000,4800000,9600000,7680000,460800],[9600000,9600000,19200000,15360000,921600],[19200000,19200000,38400000,30720000,1843200],[38400000,38400000,76800000,61440000,3686400],[307200000,307200000,614400000,491520000,29491200],[614400000,614400000,1228800000,983040000,58982400],[1228800000,1228800000,2457600000,1966080000,117964800],[2457600000,2457600000,4915200000,3932160000,235929600],[4915200000,4915200000,9830400000,7864320000,471859200]],
+    6: [[25,50,200,100,1],[25,50,200,100,1],[50,100,400,200,2],[100,200,800,400,4],[300,600,2400,1200,12],[600,1200,4800,2400,24],[1200,2400,9600,4800,48],[2400,4800,19200,9600,96],[4800,9600,38400,19200,192],[24000,48000,192000,96000,960],[48000,96000,384000,192000,1920],[96000,192000,768000,384000,3840],[192000,384000,1536000,768000,7680],[384000,768000,3072000,1536000,15360],[3072000,6144000,24576000,12288000,122880],[6144000,12288000,49152000,24576000,245760],[12288000,24576000,98304000,49152000,491520],[24576000,49152000,196608000,98304000,983040]],
+    10: [[9999,9999,9999,9999,9999],[9999,9999,9999,9999,9999],[19998,19998,19998,19998,19998],[39996,39996,39996,39996,39996],[119988,119988,119988,119988,119988],[239976,239976,239976,239976,239976],[479952,479952,479952,479952,479952],[959904,959904,959904,959904,959904],[1919808,1919808,1919808,1919808,1919808],[9599040,9599040,9599040,9599040,9599040],[19198080,19198080,19198080,19198080,19198080],[38396160,38396160,38396160,38396160,38396160],[76792320,76792320,76792320,76792320,76792320],[153584640,153584640,153584640,153584640,153584640],[1228677120,1228677120,1228677120,1228677120,1228677120],[2457354240,2457354240,2457354240,2457354240,2457354240],[4914708480,4914708480,4914708480,4914708480,4914708480],[9829416960,9829416960,9829416960,9829416960,9829416960]],
+    11: [[9999,9999,9999,9999,9999],[9999,9999,9999,9999,9999],[19998,19998,19998,19998,19998],[39996,39996,39996,39996,39996],[119988,119988,119988,119988,119988],[239976,239976,239976,239976,239976],[479952,479952,479952,479952,479952],[959904,959904,959904,959904,959904],[1919808,1919808,1919808,1919808,1919808],[9599040,9599040,9599040,9599040,9599040],[19198080,19198080,19198080,19198080,19198080],[38396160,38396160,38396160,38396160,38396160],[76792320,76792320,76792320,76792320,76792320],[153584640,153584640,153584640,153584640,153584640],[1228677120,1228677120,1228677120,1228677120,1228677120],[2457354240,2457354240,2457354240,2457354240,2457354240],[4914708480,4914708480,4914708480,4914708480,4914708480],[9829416960,9829416960,9829416960,9829416960,9829416960]]
+};
+// WIRTSCHAFT-KATALOG-ENDE
+
+function econPlanetDailyYield(planet, r) {
+    const b = planet.buildings || [];
+    let daily = (b[0] || 0) > 0 ? ECON_HQ_DAILY[r] : 0;
+    if (r < 4) {
+        const lvl = b[r + 1] || 0;
+        if (lvl > 0) daily += getProductionPerTick(r + 1, lvl)[r] * 17280;
+    }
+    return Math.round(daily);
+}
+
+// Lagerkapazitaet je Ressource (Ress01-05) fuer einen Planeten
+function econStorageCaps(planet) {
+    const b = (planet && planet.buildings) || [];
+    const caps = [0, 0, 0, 0, 0];
+    for (let r = 0; r < 5; r++) {
+        let cap = Math.round(econPlanetDailyYield(planet || {}, r) * ECON_STORAGE_DAYS);
+        for (const key of Object.keys(ECON_BUILDING_COSTS)) {
+            const next = (b[Number(key)] || 0) + 1;
+            if (next > ECON_MAX_BUILDING_LEVEL) continue;
+            const row = ECON_BUILDING_COSTS[key][next - 1];
+            if (row && row[r] > cap) cap = row[r];
+        }
+        caps[r] = cap;
+    }
+    return caps;
+}
+
+// Forschungsstufe fuer eine Ressource (0-3 = Ress01-04); Credits (4) haben keine
+function getResearchLevelForResource(r, commander) {
+    if (!commander) return 0;
+    switch (r) {
+        case 0: return commander.ress01 || 0;
+        case 1: return commander.ress02 || 0;
+        case 2: return commander.ress03 || 0;
+        case 3: return commander.ress04 || 0;
+        default: return 0;
+    }
+}
+
 // NEU (01.10.2026, Fund "Metall-Vorrat pendelt zwischen 192.000 und 195.561"):
 // Unity (BuildingDefinition.storageSafetyMargin, seit 02.09.2026) multipliziert
 // die Lagerkapazität zusaetzlich mit 1.5, damit sie an den Sprungstufen
@@ -5488,12 +5554,7 @@ function produceResources(planet, elapsedSeconds, commander) {
     if (!planet.ressources) planet.ressources = [0, 0, 0, 0, 0];
     if (!planet.buildings) return planet;
 
-    const caps = [0, 0, 0, 0, 0];
-    for (let r = 1; r <= 4; r++) {
-        const level = planet.buildings[r] || 0;
-        caps[r - 1] = getStorageCapacity(r, level);
-    }
-    caps[4] = getStorageCapacity(0, planet.buildings[0] || 0);
+    const caps = econStorageCaps(planet);     // NEU 21.10.2026: 3 Tagesertraege (mind. der teuerste anstehende Ausbau)
 
     for (let i = 0; i < planet.buildings.length; i++) {
         const level = planet.buildings[i];
@@ -5501,13 +5562,11 @@ function produceResources(planet, elapsedSeconds, commander) {
 
         const perTick = getProductionPerTick(i, level);
 
-        // Rohstoff-Forschung: +1% Ertrag pro Stufe, NUR für Ress01-04-
-        // Gebäude (Building-Index 1-4)
-        const researchLevel = getResearchLevelForBuildingIndex(i, commander);
-        const bonusMultiplier = researchLevel > 0 ? 1 + researchLevel * 0.01 : 1;
-
         for (let r = 0; r < 5; r++) {
             if (perTick[r] === 0) continue;
+            // Rohstoff-Forschung: +1 % Ertrag je Stufe auf den GESAMTEN Ertrag der Ressource Ress01-04 (HQ-Grundertrag + Farm), nicht auf Credits
+            const researchLevel = getResearchLevelForResource(r, commander);
+            const bonusMultiplier = researchLevel > 0 ? 1 + researchLevel * 0.01 : 1;
             // NEU (04.10.2026, Spielerhandel): Das Lager begrenzt nur die PRODUKTION. Liegt der Bestand schon ueber
             // der Kapazitaet (Handel, Shop, Beute), bleibt er erhalten - es wird nur nichts dazuproduziert.
             // (Gleiche Regel im Client: PlanetProductionManager.ResourceLoop.)
@@ -8116,7 +8175,7 @@ const MARKET_RESOURCE_NAMES = ['Energie', 'Wasserstoff', 'Metalle', 'Werkzeuge',
 // Baukosten (Ress01-05) der handelbaren Schiffe - MUSS manuell synchron mit den Unity-Assets gehalten werden
 // (Assets/Ship Assets/*.asset, Stand 04.10.2026), wie BUILDING_ECONOMY. Daraus wird der Warenwert berechnet.
 const MARKET_SHIP_COSTS = {
-    warship: { 0: [50, 50, 1050, 150, 10], 1: [250, 250, 4000, 1000, 25], 2: [1500, 750, 10000, 7500, 50], 3: [2500, 1200, 31000, 20000, 100] },
+    warship: { 0: [1240, 1860, 2480, 1860, 60], 1: [5330, 8000, 10660, 8000, 245], 2: [20590, 30880, 41170, 30880, 940], 3: [55000, 82500, 110000, 82500, 2500] },
     ship:    { 1: [500, 350, 15000, 7500, 1], 3: [15000, 30000, 17500, 12500, 1000] }   // 1 = Containerschiff, 3 = Kolonisationsschiff
 };
 const MARKET_SHIP_NAMES = {
