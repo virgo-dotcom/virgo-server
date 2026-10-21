@@ -1241,6 +1241,7 @@ async function initDatabase() {
             origin TEXT NOT NULL DEFAULT 'slot', name TEXT NOT NULL DEFAULT '', founded_at TIMESTAMPTZ NOT NULL DEFAULT now(),
             ships JSONB NOT NULL DEFAULT '[]', stock JSONB NOT NULL DEFAULT '[0,0,0,0,0]', last_update TIMESTAMPTZ NOT NULL DEFAULT now(),
             last_fight TIMESTAMPTZ NULL, raids INTEGER NOT NULL DEFAULT 0, defeats INTEGER NOT NULL DEFAULT 0);`);
+        await pool.query(`ALTER TABLE npc_bases ADD COLUMN IF NOT EXISTS heat REAL NOT NULL DEFAULT 0;`);   // Alarmbereitschaft (22.10.2026): haeufig angegriffene Posten rüsten schneller nach
         await pool.query(`CREATE INDEX IF NOT EXISTS idx_npc_bases_sector ON npc_bases (sector_id);`);
         await pool.query(`CREATE TABLE IF NOT EXISTS npc_raids (
             id SERIAL PRIMARY KEY, commander_id INTEGER NOT NULL, coord TEXT NOT NULL, sector_id INTEGER NOT NULL, won BOOLEAN NOT NULL DEFAULT false,
@@ -10978,7 +10979,7 @@ const NPC_CLANS = [
     {"sector":6,"id":"Clan06","name":"Leerenschwarm","motto":"Wir sind viele.","lore":"Niemand weiß, woher sie kommen. Sie fliegen in riesigen Schwärmen kleiner Schiffe und überrennen jeden, der nicht genug Feuerkraft mitbringt.","color":"9B6BD6","strength":1.75,"mix":[2,0.8,0.6,0.6],"focus":"weapon","counter":"Flächenwaffen und Trägerverbände: gegen Schwärme zählt die Zahl der Treffer."}
 ];
 const NPC_SHIP_POWER = [10,30,70,1000];
-const NPC_RULES = {"dangerSteps":[100,300,1000,4000],"stockHours":24,"regenMinutes":60,"baseSpacingMin":2,"baseSpacingMax":3,"basePlanetMax":3,"lootFactors":[1,0.5,0.25,0.1],"takeoverMinStage":7,"takeoverAbandonedHours":48,"takeoverPerDay":1,"takeoverMax":8,"outpostShare":0.5};
+const NPC_RULES = {"dangerSteps":[100,300,1000,4000],"stockHours":24,"regenMinutes":60,"heatPerRaid":1,"heatHalfLifeDays":3,"heatRegenFactor":0.15,"regenMinutesMin":20,"baseSpacingMin":2,"baseSpacingMax":3,"basePlanetMax":3,"lootFactors":[1,0.5,0.25,0.1],"takeoverMinStage":7,"takeoverAbandonedHours":48,"takeoverPerDay":1,"takeoverMax":8,"outpostShare":0.5};
 // PIRATEN-KATALOG-ENDE
 
 const NPC_OWNER_BASE = 910000;
@@ -11046,6 +11047,19 @@ function npcDangerOf(power) {
     return d;
 }
 
+// Alarmbereitschaft: "heat" wird beim Angriff gespeichert (alte Hitze abgeklungen + 1) und gilt fuer die anschliessende Auffuellzeit.
+function npcRegenMinutes(heat) {
+    const h = Math.max(0, Number(heat) || 0);
+    return Math.max(NPC_RULES.regenMinutesMin || 1, NPC_RULES.regenMinutes / (1 + (NPC_RULES.heatRegenFactor || 0) * h));
+}
+// Hitze zum Zeitpunkt now: halbiert sich alle heatHalfLifeDays Tage seit dem letzten Angriff
+function npcHeatNow(base, now) {
+    const h = Math.max(0, Number(base && base.heat) || 0);
+    if (!h || !base.last_fight) return h;
+    const days = Math.max(0, (now.getTime() - new Date(base.last_fight).getTime()) / 86400000);
+    return h * Math.pow(0.5, days / Math.max(0.01, NPC_RULES.heatHalfLifeDays || 3));
+}
+
 // Aktueller Zustand eines Stuetzpunkts (rein rechnerisch, ohne Datenbank)
 function npcBaseState(base, clan, stageIdx, now) {
     const outpost = base.origin === 'takeover';
@@ -11055,7 +11069,7 @@ function npcBaseState(base, clan, stageIdx, now) {
     if (!base.last_fight) {
         for (let i = 0; i < 4; i++) ships[i] = target[i];
     } else {
-        const regenMs = Math.max(1, NPC_RULES.regenMinutes * 60000);
+        const regenMs = Math.max(1, npcRegenMinutes(base.heat) * 60000);
         const f = Math.min(1, Math.max(0, (now.getTime() - new Date(base.last_fight).getTime()) / regenMs));
         for (let i = 0; i < 4; i++) {
             const have = Math.min(Number(stored[i]) || 0, target[i]);
@@ -11276,9 +11290,10 @@ async function npcFinalizeCombat(ctx, afterWarships, looted, attackerWins, attac
             const ships = new Array(10).fill(0), stock = [0, 0, 0, 0, 0];
             for (let i = 0; i < 10; i++) ships[i] = Math.max(0, st.ships[i] - Math.max(0, (ctx.before[i] || 0) - (afterWarships[i] || 0)));
             for (let i = 0; i < 5; i++) stock[i] = Math.max(0, st.stock[i] - (looted[i] || 0));
+            const heat = npcHeatNow(cur, now) + (NPC_RULES.heatPerRaid || 1);
             await client.query(
-                `UPDATE npc_bases SET ships = $2, stock = $3, last_update = $4, last_fight = $4, raids = raids + 1, defeats = defeats + $5 WHERE coord = $1`,
-                [ctx.coord, JSON.stringify(ships), JSON.stringify(stock), now, attackerWins ? 1 : 0]);
+                `UPDATE npc_bases SET ships = $2, stock = $3, last_update = $4, last_fight = $4, raids = raids + 1, defeats = defeats + $5, heat = $6 WHERE coord = $1`,
+                [ctx.coord, JSON.stringify(ships), JSON.stringify(stock), now, attackerWins ? 1 : 0, heat]);
         }
         const total = looted.reduce((a, b) => a + (b || 0), 0);
         let kills = 0;
