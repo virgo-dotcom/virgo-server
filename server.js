@@ -1235,7 +1235,7 @@ async function initDatabase() {
         await pool.query(`CREATE INDEX IF NOT EXISTS idx_treasury_log_commander ON alliance_treasury_log (commander_id);`);
         // NEU 21.10.2026 (§36 Piraten, §37 Daily): Clans (einer je Sektor), Stuetzpunkte, Angriffs-Protokoll, Chronik, taegliche Aufgaben
         await pool.query(`CREATE TABLE IF NOT EXISTS npc_clans (
-            sector_id INTEGER PRIMARY KEY, founded_at TIMESTAMPTZ NOT NULL DEFAULT now(), stage_seen INTEGER NOT NULL DEFAULT 0,
+            sector_id INTEGER PRIMARY KEY, founded_at TIMESTAMPTZ NOT NULL DEFAULT now(), stage_seen INTEGER NOT NULL DEFAULT 0, strength INTEGER NOT NULL DEFAULT 0,
             takeovers INTEGER NOT NULL DEFAULT 0, last_takeover_at TIMESTAMPTZ NULL);`);
         await pool.query(`CREATE TABLE IF NOT EXISTS npc_bases (
             coord TEXT PRIMARY KEY, sector_id INTEGER NOT NULL, system_id INTEGER NOT NULL, planet_number INTEGER NOT NULL,
@@ -1243,6 +1243,7 @@ async function initDatabase() {
             ships JSONB NOT NULL DEFAULT '[]', stock JSONB NOT NULL DEFAULT '[0,0,0,0,0]', last_update TIMESTAMPTZ NOT NULL DEFAULT now(),
             last_fight TIMESTAMPTZ NULL, raids INTEGER NOT NULL DEFAULT 0, defeats INTEGER NOT NULL DEFAULT 0);`);
         await pool.query(`ALTER TABLE npc_bases ADD COLUMN IF NOT EXISTS heat REAL NOT NULL DEFAULT 0;`);   // Alarmbereitschaft (22.10.2026): haeufig angegriffene Posten rüsten schneller nach
+        await pool.query(`ALTER TABLE npc_clans ADD COLUMN IF NOT EXISTS strength INTEGER NOT NULL DEFAULT 0;`);   // 22.10.2026: Spielerstaerke im Sektor (Stufe haengt daran, nicht am Alter)
         await pool.query(`CREATE INDEX IF NOT EXISTS idx_npc_bases_sector ON npc_bases (sector_id);`);
         // NEU 22.10.2026 (§38 Kampfpunkte): Pool je Allianz (kann ins Minus gehen) + Protokoll je Teilnehmer
         await pool.query(`ALTER TABLE alliances ADD COLUMN IF NOT EXISTS combat_points INTEGER NOT NULL DEFAULT 0;`);
@@ -5065,7 +5066,7 @@ const BUILDING_ECONOMY = {
         baseStorageCapacity: 1000   // NEU 05.10.2026 (vorher 10): Lager fuer Credits (Ress05), wie bei den Ressourcen-Gebaeuden; muss zu Building00.asset passen
     },
     1: { // Ress01-Gebäude (Energie)
-        productionEarly: [[0.0458592, 0.0726819, 0.115193, 0.182569, 0.289352, 0.458592, 0.726819, 1.15193, 1.82569, 2.89352, 4.58592, 7.26819, 11.5193, 18.2569, 28.9352, 45.8592, 72.6819, 115.193, 182.569, 289.352], [], [], [], []],
+        productionEarly: [[0.0458592, 0.0726819, 0.115193, 0.182569, 0.289352, 0.458592, 0.726819, 1.15193, 1.82569, 2.89352, 3.90625, 5.27344, 7.11914, 9.61084, 12.9746, 17.5158, 23.6463, 31.9225, 43.0953, 58.1787], [], [], [], []],
         scalesWithLevel: true,
         tierGrowthFactors: [1.535, 1.62, 1.7],
         tierStepCounts: [4, 4, 7],
@@ -5073,7 +5074,7 @@ const BUILDING_ECONOMY = {
     },
     2: { // Ress02-Gebäude (Wasserstoff) — Produktionswerte noch offen,
          // hier vorerst leer bis sie feststehen (siehe Chat-Verlauf)
-        productionEarly: [[], [0.0687888, 0.109023, 0.17279, 0.273853, 0.434028, 0.687888, 1.09023, 1.7279, 2.73853, 4.34028, 6.87888, 10.9023, 17.279, 27.3853, 43.4028, 68.7888, 109.023, 172.79, 273.853, 434.028], [], [], []],
+        productionEarly: [[], [0.0687888, 0.109023, 0.17279, 0.273853, 0.434028, 0.687888, 1.09023, 1.7279, 2.73853, 4.34028, 5.85938, 7.91016, 10.6787, 14.4163, 19.462, 26.2736, 35.4694, 47.8837, 64.643, 87.268], [], [], []],
         scalesWithLevel: true,
         tierGrowthFactors: [1.535, 1.62, 1.7],
         tierStepCounts: [4, 4, 7],
@@ -5084,7 +5085,7 @@ const BUILDING_ECONOMY = {
          // sonst deckelt der Server die Ressource bei jedem Tick auf 0
          // (siehe Bug-Fund im Chat: fehlender Eintrag hier hat Ress03/04
          // bei jedem Server-Tick auf 0 zurückgesetzt)
-        productionEarly: [[], [], [0.0917184, 0.145364, 0.230386, 0.365137, 0.578704, 0.917184, 1.45364, 2.30386, 3.65137, 5.78704, 9.17184, 14.5364, 23.0386, 36.5137, 57.8704, 91.7184, 145.364, 230.386, 365.137, 578.704], [], []],
+        productionEarly: [[], [], [0.0917184, 0.145364, 0.230386, 0.365137, 0.578704, 0.917184, 1.45364, 2.30386, 3.65137, 5.78704, 7.8125, 10.5469, 14.2383, 19.2217, 25.9493, 35.0315, 47.2925, 63.8449, 86.1907, 116.357], [], []],
         scalesWithLevel: true,
         tierGrowthFactors: [1.535, 1.62, 1.7],
         tierStepCounts: [4, 4, 7],
@@ -5092,7 +5093,7 @@ const BUILDING_ECONOMY = {
     },
     4: { // Ress04-Gebäude (Werkzeuge) — Produktionswerte noch offen,
          // gleicher Kapazitäts-Fix wie bei Ress03
-        productionEarly: [[], [], [], [0.0687888, 0.109023, 0.17279, 0.273853, 0.434028, 0.687888, 1.09023, 1.7279, 2.73853, 4.34028, 6.87888, 10.9023, 17.279, 27.3853, 43.4028, 68.7888, 109.023, 172.79, 273.853, 434.028], []],
+        productionEarly: [[], [], [], [0.0687888, 0.109023, 0.17279, 0.273853, 0.434028, 0.687888, 1.09023, 1.7279, 2.73853, 4.34028, 5.85938, 7.91016, 10.6787, 14.4163, 19.462, 26.2736, 35.4694, 47.8837, 64.643, 87.268], []],
         scalesWithLevel: true,
         tierGrowthFactors: [1.535, 1.62, 1.7],
         tierStepCounts: [4, 4, 7],
@@ -5479,15 +5480,15 @@ const ECON_STORAGE_DAYS = 3;                         // Lager = so viele Tageser
 const ECON_SHIP_BUILD_MINUTES = {"warship":{"0":300,"1":360,"2":420,"3":1800},"ship":{"1":120,"3":0.25}};   // Bauzeit je Schiff in Minuten (Basis aus den Schiffs-Assets, ohne Werft-Bonus) - Grundlage des ICC-Zeitaufschlags
 const ECON_MAX_BUILDING_LEVEL = 18;
 const ECON_BUILDING_COSTS = {   // Baukosten je Gebaeude-Index, Zeile = Zielstufe 1..18, Spalte = Ress01-05
-    0: [[25,50,200,100,1],[25,50,200,100,1],[50,100,400,200,2],[100,200,800,400,4],[300,600,2400,1200,12],[600,1200,4800,2400,24],[1200,2400,9600,4800,48],[2400,4800,19200,9600,96],[4800,9600,38400,19200,192],[24000,48000,192000,96000,960],[48000,96000,384000,192000,1920],[96000,192000,768000,384000,3840],[192000,384000,1536000,768000,7680],[384000,768000,3072000,1536000,15360],[3072000,6144000,24576000,12288000,122880],[6144000,12288000,49152000,24576000,245760],[12288000,24576000,98304000,49152000,491520],[24576000,49152000,196608000,98304000,983040]],
-    1: [[0,25,200,150,1],[0,50,400,300,2],[0,100,800,600,4],[0,300,2400,1800,12],[0,600,4800,3600,24],[0,1200,9600,7200,48],[0,2400,19200,14400,96],[0,4800,38400,28800,192],[0,24000,192000,144000,960],[0,48000,384000,288000,1920],[0,96000,768000,576000,3840],[0,192000,1536000,1152000,7680],[0,384000,3072000,2304000,15360],[0,3072000,24576000,18432000,122880],[0,6144000,49152000,36864000,245760],[0,12288000,98304000,73728000,491520],[0,24576000,196608000,147456000,983040],[0,49152000,393216000,294912000,1966080]],
-    2: [[50,0,175,50,1],[100,0,350,100,2],[200,0,700,200,4],[600,0,2100,600,12],[1200,0,4200,1200,24],[2400,0,8400,2400,48],[4800,0,16800,4800,96],[9600,0,33600,9600,192],[48000,0,168000,48000,960],[96000,0,336000,96000,1920],[192000,0,672000,192000,3840],[384000,0,1344000,384000,7680],[768000,0,2688000,768000,15360],[6144000,0,21504000,6144000,122880],[12288000,0,43008000,12288000,245760],[24576000,0,86016000,24576000,491520],[49152000,0,172032000,49152000,983040],[98304000,0,344064000,98304000,1966080]],
-    3: [[125,50,250,125,2],[250,100,500,250,4],[500,200,1000,500,8],[1500,600,3000,1500,24],[3000,1200,6000,3000,48],[6000,2400,12000,6000,96],[12000,4800,24000,12000,192],[24000,9600,48000,24000,384],[120000,48000,240000,120000,1920],[240000,96000,480000,240000,3840],[480000,192000,960000,480000,7680],[960000,384000,1920000,960000,15360],[1920000,768000,3840000,1920000,30720],[15360000,6144000,30720000,15360000,245760],[30720000,12288000,61440000,30720000,491520],[61440000,24576000,122880000,61440000,983040],[122880000,49152000,245760000,122880000,1966080],[245760000,98304000,491520000,245760000,3932160]],
-    4: [[150,75,250,250,2],[300,150,500,500,4],[600,300,1000,1000,8],[1800,900,3000,3000,24],[3600,1800,6000,6000,48],[7200,3600,12000,12000,96],[14400,7200,24000,24000,192],[28800,14400,48000,48000,384],[144000,72000,240000,240000,1920],[288000,144000,480000,480000,3840],[576000,288000,960000,960000,7680],[1152000,576000,1920000,1920000,15360],[2304000,1152000,3840000,3840000,30720],[18432000,9216000,30720000,30720000,245760],[36864000,18432000,61440000,61440000,491520],[73728000,36864000,122880000,122880000,983040],[147456000,73728000,245760000,245760000,1966080],[294912000,147456000,491520000,491520000,3932160]],
-    5: [[2500,2500,5000,4000,240],[5000,5000,10000,8000,480],[10000,10000,20000,16000,960],[30000,30000,60000,48000,2880],[60000,60000,120000,96000,5760],[120000,120000,240000,192000,11520],[240000,240000,480000,384000,23040],[480000,480000,960000,768000,46080],[2400000,2400000,4800000,3840000,230400],[4800000,4800000,9600000,7680000,460800],[9600000,9600000,19200000,15360000,921600],[19200000,19200000,38400000,30720000,1843200],[38400000,38400000,76800000,61440000,3686400],[307200000,307200000,614400000,491520000,29491200],[614400000,614400000,1228800000,983040000,58982400],[1228800000,1228800000,2457600000,1966080000,117964800],[2457600000,2457600000,4915200000,3932160000,235929600],[4915200000,4915200000,9830400000,7864320000,471859200]],
-    6: [[25,50,200,100,1],[25,50,200,100,1],[50,100,400,200,2],[100,200,800,400,4],[300,600,2400,1200,12],[600,1200,4800,2400,24],[1200,2400,9600,4800,48],[2400,4800,19200,9600,96],[4800,9600,38400,19200,192],[24000,48000,192000,96000,960],[48000,96000,384000,192000,1920],[96000,192000,768000,384000,3840],[192000,384000,1536000,768000,7680],[384000,768000,3072000,1536000,15360],[3072000,6144000,24576000,12288000,122880],[6144000,12288000,49152000,24576000,245760],[12288000,24576000,98304000,49152000,491520],[24576000,49152000,196608000,98304000,983040]],
-    10: [[9999,9999,9999,9999,9999],[9999,9999,9999,9999,9999],[19998,19998,19998,19998,19998],[39996,39996,39996,39996,39996],[119988,119988,119988,119988,119988],[239976,239976,239976,239976,239976],[479952,479952,479952,479952,479952],[959904,959904,959904,959904,959904],[1919808,1919808,1919808,1919808,1919808],[9599040,9599040,9599040,9599040,9599040],[19198080,19198080,19198080,19198080,19198080],[38396160,38396160,38396160,38396160,38396160],[76792320,76792320,76792320,76792320,76792320],[153584640,153584640,153584640,153584640,153584640],[1228677120,1228677120,1228677120,1228677120,1228677120],[2457354240,2457354240,2457354240,2457354240,2457354240],[4914708480,4914708480,4914708480,4914708480,4914708480],[9829416960,9829416960,9829416960,9829416960,9829416960]],
-    11: [[9999,9999,9999,9999,9999],[9999,9999,9999,9999,9999],[19998,19998,19998,19998,19998],[39996,39996,39996,39996,39996],[119988,119988,119988,119988,119988],[239976,239976,239976,239976,239976],[479952,479952,479952,479952,479952],[959904,959904,959904,959904,959904],[1919808,1919808,1919808,1919808,1919808],[9599040,9599040,9599040,9599040,9599040],[19198080,19198080,19198080,19198080,19198080],[38396160,38396160,38396160,38396160,38396160],[76792320,76792320,76792320,76792320,76792320],[153584640,153584640,153584640,153584640,153584640],[1228677120,1228677120,1228677120,1228677120,1228677120],[2457354240,2457354240,2457354240,2457354240,2457354240],[4914708480,4914708480,4914708480,4914708480,4914708480],[9829416960,9829416960,9829416960,9829416960,9829416960]]
+    0: [[25,50,200,100,1],[25,50,200,100,1],[50,100,400,200,2],[100,200,800,400,4],[300,600,2400,1200,12],[600,1200,4800,2400,24],[1200,2400,9600,4800,48],[2400,4800,19200,9600,96],[4800,9600,38400,19200,192],[24000,48000,192000,96000,960],[48000,96000,384000,192000,1920],[96000,192000,768000,384000,3840],[192000,384000,1536000,768000,7680],[384000,768000,3072000,1536000,15360],[3072000,6144000,24576000,12288000,122880],[3532800,7065600,28262400,14131200,141312],[4062720,8125440,32501760,16250880,162509],[4672128,9344256,37377024,18688512,186885]],
+    1: [[0,25,200,150,1],[0,50,400,300,2],[0,100,800,600,4],[0,300,2400,1800,12],[0,600,4800,3600,24],[0,1200,9600,7200,48],[0,2400,19200,14400,96],[0,4800,38400,28800,192],[0,24000,192000,144000,960],[0,48000,384000,288000,1920],[0,96000,768000,576000,3840],[0,192000,1536000,1152000,7680],[0,384000,3072000,2304000,15360],[0,3072000,24576000,18432000,122880],[0,6144000,49152000,36864000,245760],[0,7065600,56524800,42393600,282624],[0,8125440,65003520,48752640,325018],[0,9344256,74754048,56065536,373770]],
+    2: [[50,0,175,50,1],[100,0,350,100,2],[200,0,700,200,4],[600,0,2100,600,12],[1200,0,4200,1200,24],[2400,0,8400,2400,48],[4800,0,16800,4800,96],[9600,0,33600,9600,192],[48000,0,168000,48000,960],[96000,0,336000,96000,1920],[192000,0,672000,192000,3840],[384000,0,1344000,384000,7680],[768000,0,2688000,768000,15360],[6144000,0,21504000,6144000,122880],[12288000,0,43008000,12288000,245760],[14131200,0,49459200,14131200,282624],[16250880,0,56878080,16250880,325018],[18688512,0,65409792,18688512,373770]],
+    3: [[125,50,250,125,2],[250,100,500,250,4],[500,200,1000,500,8],[1500,600,3000,1500,24],[3000,1200,6000,3000,48],[6000,2400,12000,6000,96],[12000,4800,24000,12000,192],[24000,9600,48000,24000,384],[120000,48000,240000,120000,1920],[240000,96000,480000,240000,3840],[480000,192000,960000,480000,7680],[960000,384000,1920000,960000,15360],[1920000,768000,3840000,1920000,30720],[15360000,6144000,30720000,15360000,245760],[30720000,12288000,61440000,30720000,491520],[35328000,14131200,70656000,35328000,565248],[40627200,16250880,81254400,40627200,650035],[46721280,18688512,93442560,46721280,747540]],
+    4: [[150,75,250,250,2],[300,150,500,500,4],[600,300,1000,1000,8],[1800,900,3000,3000,24],[3600,1800,6000,6000,48],[7200,3600,12000,12000,96],[14400,7200,24000,24000,192],[28800,14400,48000,48000,384],[144000,72000,240000,240000,1920],[288000,144000,480000,480000,3840],[576000,288000,960000,960000,7680],[1152000,576000,1920000,1920000,15360],[2304000,1152000,3840000,3840000,30720],[18432000,9216000,30720000,30720000,245760],[36864000,18432000,61440000,61440000,491520],[42393600,21196800,70656000,70656000,565248],[48752640,24376320,81254400,81254400,650035],[56065536,28032768,93442560,93442560,747540]],
+    5: [[2500,2500,5000,4000,240],[5000,5000,10000,8000,480],[10000,10000,20000,16000,960],[30000,30000,60000,48000,2880],[60000,60000,120000,96000,5760],[120000,120000,240000,192000,11520],[240000,240000,480000,384000,23040],[480000,480000,960000,768000,46080],[2400000,2400000,4800000,3840000,230400],[4800000,4800000,9600000,7680000,460800],[9600000,9600000,19200000,15360000,921600],[19200000,19200000,38400000,30720000,1843200],[38400000,38400000,76800000,61440000,3686400],[307200000,307200000,614400000,491520000,29491200],[614400000,614400000,1228800000,983040000,58982400],[706560000,706560000,1413120000,1130496000,67829760],[812544000,812544000,1625088000,1300070400,78004224],[934425600,934425600,1868851200,1495080960,89704858]],
+    6: [[25,50,200,100,1],[25,50,200,100,1],[50,100,400,200,2],[100,200,800,400,4],[300,600,2400,1200,12],[600,1200,4800,2400,24],[1200,2400,9600,4800,48],[2400,4800,19200,9600,96],[4800,9600,38400,19200,192],[24000,48000,192000,96000,960],[48000,96000,384000,192000,1920],[96000,192000,768000,384000,3840],[192000,384000,1536000,768000,7680],[384000,768000,3072000,1536000,15360],[3072000,6144000,24576000,12288000,122880],[3532800,7065600,28262400,14131200,141312],[4062720,8125440,32501760,16250880,162509],[4672128,9344256,37377024,18688512,186885]],
+    10: [[9999,9999,9999,9999,9999],[9999,9999,9999,9999,9999],[19998,19998,19998,19998,19998],[39996,39996,39996,39996,39996],[119988,119988,119988,119988,119988],[239976,239976,239976,239976,239976],[479952,479952,479952,479952,479952],[959904,959904,959904,959904,959904],[1919808,1919808,1919808,1919808,1919808],[9599040,9599040,9599040,9599040,9599040],[19198080,19198080,19198080,19198080,19198080],[38396160,38396160,38396160,38396160,38396160],[76792320,76792320,76792320,76792320,76792320],[153584640,153584640,153584640,153584640,153584640],[1228677120,1228677120,1228677120,1228677120,1228677120],[1412978688,1412978688,1412978688,1412978688,1412978688],[1624925491,1624925491,1624925491,1624925491,1624925491],[1868664315,1868664315,1868664315,1868664315,1868664315]],
+    11: [[9999,9999,9999,9999,9999],[9999,9999,9999,9999,9999],[19998,19998,19998,19998,19998],[39996,39996,39996,39996,39996],[119988,119988,119988,119988,119988],[239976,239976,239976,239976,239976],[479952,479952,479952,479952,479952],[959904,959904,959904,959904,959904],[1919808,1919808,1919808,1919808,1919808],[9599040,9599040,9599040,9599040,9599040],[19198080,19198080,19198080,19198080,19198080],[38396160,38396160,38396160,38396160,38396160],[76792320,76792320,76792320,76792320,76792320],[153584640,153584640,153584640,153584640,153584640],[1228677120,1228677120,1228677120,1228677120,1228677120],[1412978688,1412978688,1412978688,1412978688,1412978688],[1624925491,1624925491,1624925491,1624925491,1624925491],[1868664315,1868664315,1868664315,1868664315,1868664315]]
 };
 // WIRTSCHAFT-KATALOG-ENDE
 
@@ -11052,14 +11053,14 @@ async function buildTreasuryAdminReport(rawQuery) {
 
 // PIRATEN-KATALOG-START (erzeugt von Tools/Piraten/sync_piraten.js aus piraten_katalog.js - NICHT von Hand aendern)
 const NPC_STAGES = [
-    {"name":"Schlupfwinkel","days":0,"ships":[4,0,0,0],"research":0,"metal":30},
-    {"name":"Lager","days":2,"ships":[8,2,0,0],"research":0,"metal":45},
-    {"name":"Stützpunkt","days":5,"ships":[14,5,0,0],"research":2,"metal":60},
-    {"name":"Bastion","days":10,"ships":[24,10,2,0],"research":4,"metal":90},
-    {"name":"Festung","days":18,"ships":[40,18,6,0],"research":6,"metal":140},
-    {"name":"Zitadelle","days":30,"ships":[60,30,12,1],"research":8,"metal":210},
-    {"name":"Hochburg","days":50,"ships":[90,45,20,3],"research":11,"metal":320},
-    {"name":"Machtzentrum","days":80,"ships":[130,70,32,6],"research":14,"metal":480}
+    {"name":"Schlupfwinkel","points":0,"ships":[4,0,0,0],"research":0,"metal":30},
+    {"name":"Lager","points":3000,"ships":[8,2,0,0],"research":0,"metal":45},
+    {"name":"Stützpunkt","points":6000,"ships":[14,5,0,0],"research":2,"metal":60},
+    {"name":"Bastion","points":12000,"ships":[24,10,2,0],"research":4,"metal":90},
+    {"name":"Festung","points":25000,"ships":[40,18,6,0],"research":6,"metal":140},
+    {"name":"Zitadelle","points":50000,"ships":[60,30,12,1],"research":8,"metal":210},
+    {"name":"Hochburg","points":100000,"ships":[90,45,20,3],"research":11,"metal":320},
+    {"name":"Machtzentrum","points":200000,"ships":[130,70,32,6],"research":14,"metal":480}
 ];
 const NPC_CLANS = [
     {"sector":1,"id":"Clan01","name":"Rostklauen","motto":"Was rostet, das hält.","lore":"Schrottsammler und Wracktaucher aus den alten Frachterrouten. Sie flicken zusammen, was andere zurückgelassen haben, und fliegen Rudel kleiner, zäher Schiffe. Die ältesten Stützpunkte der Galaxie gehören ihnen.","color":"C8742E","strength":1,"mix":[1.5,1,0.5,0.5],"focus":"shield","counter":"Viele schwere Treffer: wenige, dicke Schiffe schlagen ihre Masse."},
@@ -11070,7 +11071,7 @@ const NPC_CLANS = [
     {"sector":6,"id":"Clan06","name":"Leerenschwarm","motto":"Wir sind viele.","lore":"Niemand weiß, woher sie kommen. Sie fliegen in riesigen Schwärmen kleiner Schiffe und überrennen jeden, der nicht genug Feuerkraft mitbringt.","color":"9B6BD6","strength":1.75,"mix":[2,0.8,0.6,0.6],"focus":"weapon","counter":"Flächenwaffen und Trägerverbände: gegen Schwärme zählt die Zahl der Treffer."}
 ];
 const NPC_SHIP_POWER = [10,30,70,1000];
-const NPC_RULES = {"dangerSteps":[100,300,1000,4000],"stockHours":24,"regenMinutes":60,"heatPerRaid":1,"heatHalfLifeDays":3,"heatRegenFactor":0.15,"regenMinutesMin":20,"baseSpacingMin":2,"baseSpacingMax":3,"basePlanetMax":3,"lootFactors":[1,0.5,0.25,0.1],"takeoverMinStage":7,"takeoverAbandonedHours":48,"takeoverPerDay":1,"takeoverMax":8,"outpostShare":0.5};
+const NPC_RULES = {"dangerSteps":[100,300,1000,4000],"stockHours":24,"regenMinutes":60,"heatPerRaid":1,"heatHalfLifeDays":3,"heatRegenFactor":0.15,"regenMinutesMin":20,"baseSpacingMin":2,"baseSpacingMax":3,"basePlanetMax":3,"lootFactors":[1,0.5,0.25,0.1],"strengthTopN":5,"takeoverMax":8,"outpostShare":0.5};
 // PIRATEN-KATALOG-ENDE
 
 const NPC_OWNER_BASE = 910000;
@@ -11087,11 +11088,26 @@ function npcClanDef(sector) {
         counter: 'Eine gemischte Flotte ist die sicherste Wahl.' };
 }
 
-function npcStageIndex(foundedAt, now) {
-    const days = (now.getTime() - new Date(foundedAt).getTime()) / 86400000;
+// Stufe eines Clans = gespeicherter Merker (stage_seen); er wird in npcTick aus der Spielerstaerke des Sektors hochgesetzt und sinkt nie
+function npcClanStage(clanRow) {
+    const s = Number(clanRow && clanRow.stage_seen) || 0;
+    return Math.max(0, Math.min(NPC_STAGES.length - 1, s));
+}
+
+// Stufe, die zu einer Spielerstaerke (Durchschnitt der Highscore-Punkte der staerksten Spieler im Sektor) passt
+function npcStageForStrength(points) {
     let idx = 0;
-    for (let i = 0; i < NPC_STAGES.length; i++) if (days >= NPC_STAGES[i].days) idx = i;
+    for (let i = 0; i < NPC_STAGES.length; i++) if (points >= NPC_STAGES[i].points) idx = i;
     return idx;
+}
+
+// Spielerstaerke eines Sektors: Durchschnitt der Highscore-Punkte der staerksten N Spieler, die dort einen Planeten haben (0, wenn niemand)
+async function npcSectorStrength(sector) {
+    const r = await pool.query(
+        `SELECT MAX(h.total_points)::int AS points FROM planet_registry r JOIN commander_highscore h ON h.commander_id = r.owner_commander_id
+         WHERE r.galaxy_id = 1 AND r.sector_id = $1 AND r.kind = 'player' GROUP BY r.owner_commander_id`, [sector]);
+    const pts = r.rows.map(x => Number(x.points) || 0).sort((a, b) => b - a).slice(0, Math.max(1, NPC_RULES.strengthTopN || 5));
+    return pts.length > 0 ? Math.round(pts.reduce((a, b) => a + b, 0) / pts.length) : 0;
 }
 
 // Schiffe eines Stuetzpunkts bei dieser Stufe (Warship01-04). Aussenposten (Uebernahmen) haben nur einen Teil.
@@ -11220,7 +11236,7 @@ async function npcPlaceBase(clan, clanRow, sector, system, planet, name, origin,
         const cur = await pool.query('SELECT owner_commander_id FROM planet_registry WHERE coord = $1', [coord]);
         if (!cur.rows[0] || cur.rows[0].owner_commander_id !== ownerId) return false;   // gehoert schon jemand anderem
     }
-    const stageIdx = npcStageIndex(clanRow.founded_at, now);
+    const stageIdx = npcClanStage(clanRow);
     const outpost = origin === 'takeover';
     const rates = npcRatesFor(clan, stageIdx, outpost);
     const startStock = rates.map(r => Math.floor(r * NPC_RULES.stockHours * 0.5));
@@ -11268,13 +11284,12 @@ async function npcEnsureAll(log) {
 }
 
 // ---- Stufen-Wechsel melden + Uebernahmen verlassener Planeten (laeuft im Server-Tick) ----
-async function npcTakeOne(clan, clanRow, now, force) {
+async function npcTakeOne(clan, clanRow, now) {
     const sector = clanRow.sector_id;
-    const hours = force ? 0 : NPC_RULES.takeoverAbandonedHours;
     const cand = await pool.query(
         `SELECT coord, system_id, planet_number FROM planet_registry
-         WHERE galaxy_id = 1 AND sector_id = $1 AND kind = 'abandoned' AND updated_at < $2::timestamptz - make_interval(hours => $3)
-         ORDER BY updated_at ASC LIMIT 1`, [sector, now, hours]);
+         WHERE galaxy_id = 1 AND sector_id = $1 AND kind = 'abandoned'
+         ORDER BY updated_at ASC LIMIT 1`, [sector]);
     const row = cand.rows[0];
     if (!row) return null;
     const count = (await pool.query("SELECT COUNT(*)::int AS n FROM npc_bases WHERE sector_id = $1 AND origin = 'takeover'", [sector])).rows[0].n;
@@ -11283,7 +11298,7 @@ async function npcTakeOne(clan, clanRow, now, force) {
         `UPDATE planet_registry SET owner_commander_id = $2, kind = $3, owner_name = $4, planet_name = $5, updated_at = now()
          WHERE coord = $1 AND kind = 'abandoned' RETURNING coord`, [row.coord, npcOwnerId(sector), NPC_REGISTRY_KIND, clan.name, name]);
     if (upd.rows.length === 0) return null;
-    const stageIdx = npcStageIndex(clanRow.founded_at, now);
+    const stageIdx = npcClanStage(clanRow);
     const rates = npcRatesFor(clan, stageIdx, true);
     await pool.query(
         `INSERT INTO npc_bases (coord, sector_id, system_id, planet_number, origin, name, founded_at, ships, stock, last_update)
@@ -11303,20 +11318,26 @@ async function npcTick(log) {
     for (const cr of clans) {
         if (!galaxyOpenSectorList().some(x => x.id === cr.sector_id)) continue;
         const clan = npcClanDef(cr.sector_id);
-        const stageIdx = npcStageIndex(cr.founded_at, now);
-        if (stageIdx > cr.stage_seen) {
-            const upd = await pool.query('UPDATE npc_clans SET stage_seen = $2 WHERE sector_id = $1 AND stage_seen < $2 RETURNING sector_id', [cr.sector_id, stageIdx]);
-            if (upd.rows.length > 0)
-                await npcLogEvent(cr.sector_id, 'stage', `${clan.name} erreichen Stufe ${stageIdx}: ${NPC_STAGES[stageIdx].name}.`);
-        }
-        if (stageIdx >= NPC_RULES.takeoverMinStage && cr.takeovers < NPC_RULES.takeoverMax) {
-            const waitMs = 86400000 / Math.max(1, NPC_RULES.takeoverPerDay);
-            if (!cr.last_takeover_at || now.getTime() - new Date(cr.last_takeover_at).getTime() >= waitMs) {
-                try {
-                    const taken = await npcTakeOne(clan, cr, now, false);
-                    if (taken && log) log.push(`Piraten: ${clan.name} uebernehmen ${taken}`);
-                } catch (e) { console.error('[Piraten] Uebernahme:', e.message); }
+        // Stufe folgt der Spielerstaerke im Sektor (nicht der Zeit) und geht nie zurueck
+        let strength = cr.strength || 0;
+        try { strength = await npcSectorStrength(cr.sector_id); } catch (e) { console.error('[Piraten] Spielerstaerke:', e.message); }
+        const wanted = npcStageForStrength(strength);
+        if (strength !== cr.strength) await pool.query('UPDATE npc_clans SET strength = $2 WHERE sector_id = $1', [cr.sector_id, strength]);
+        cr.strength = strength;
+        if (wanted > cr.stage_seen) {
+            const upd = await pool.query('UPDATE npc_clans SET stage_seen = $2 WHERE sector_id = $1 AND stage_seen < $2 RETURNING sector_id', [cr.sector_id, wanted]);
+            if (upd.rows.length > 0) {
+                cr.stage_seen = wanted;
+                await npcLogEvent(cr.sector_id, 'stage', `${clan.name} erreichen Stufe ${wanted}: ${NPC_STAGES[wanted].name}.`);
             }
+        }
+        // Verlassene Planeten des Sektors gehen sofort an den Clan (nur die Obergrenze an Aussenposten bleibt)
+        for (let n = cr.takeovers || 0; n < NPC_RULES.takeoverMax; n++) {
+            let taken = null;
+            try { taken = await npcTakeOne(clan, cr, now); } catch (e) { console.error('[Piraten] Uebernahme:', e.message); }
+            if (!taken) break;
+            cr.takeovers = (cr.takeovers || 0) + 1;
+            if (log) log.push(`Piraten: ${clan.name} uebernehmen ${taken}`);
         }
     }
 }
@@ -11347,7 +11368,7 @@ async function npcPrepareDefense(coord, attackerCommanderId, now) {
     }
     const clanRow = await npcEnsureClanRow(base.sector_id, now);
     const clan = npcClanDef(base.sector_id);
-    const stageIdx = npcStageIndex(clanRow.founded_at, now);
+    const stageIdx = npcClanStage(clanRow);
     const st = npcBaseState(base, clan, stageIdx, now);
 
     const done = await pool.query(
@@ -11375,8 +11396,8 @@ async function npcFinalizeCombat(ctx, afterWarships, looted, attackerWins, attac
         await client.query('BEGIN');
         const cur = (await client.query('SELECT * FROM npc_bases WHERE coord = $1 FOR UPDATE', [ctx.coord])).rows[0];
         if (cur) {
-            const clanRow = (await client.query('SELECT founded_at FROM npc_clans WHERE sector_id = $1', [cur.sector_id])).rows[0];
-            const stageIdx = npcStageIndex(clanRow ? clanRow.founded_at : cur.founded_at, now);
+            const clanRow = (await client.query('SELECT stage_seen FROM npc_clans WHERE sector_id = $1', [cur.sector_id])).rows[0];
+            const stageIdx = npcClanStage(clanRow);
             const st = npcBaseState(cur, ctx.clan, stageIdx, now);
             const ships = new Array(10).fill(0), stock = [0, 0, 0, 0, 0];
             for (let i = 0; i < 10; i++) ships[i] = Math.max(0, st.ships[i] - Math.max(0, (ctx.before[i] || 0) - (afterWarships[i] || 0)));
@@ -11403,14 +11424,16 @@ async function npcFinalizeCombat(ctx, afterWarships, looted, attackerWins, attac
 
 // ---- Oeffentliche Profile ----
 function npcStageInfo(clanRow, now) {
-    const stageIdx = npcStageIndex(clanRow.founded_at, now);
+    const stageIdx = npcClanStage(clanRow);
     const elapsed = (now.getTime() - new Date(clanRow.founded_at).getTime()) / 86400000;
     const next = stageIdx + 1 < NPC_STAGES.length ? NPC_STAGES[stageIdx + 1] : null;
     const cur = NPC_STAGES[stageIdx];
+    const strength = Number(clanRow.strength) || 0;
     return {
         stage: stageIdx, stageName: cur.name, stageCount: NPC_STAGES.length,
-        daysToNext: next ? Math.max(0, Math.ceil((next.days - elapsed) * 10) / 10) : -1,
-        progress: next ? Math.max(0, Math.min(1, (elapsed - cur.days) / (next.days - cur.days))) : 1,
+        daysToNext: -1,                                                   // Zeit spielt keine Rolle mehr (alter Client-Wert, bleibt aus Kompatibilitaet)
+        strength, nextAt: next ? next.points : -1,
+        progress: next ? Math.max(0, Math.min(1, (strength - cur.points) / Math.max(1, next.points - cur.points))) : 1,
         elapsedDays: Math.floor(elapsed)
     };
 }
@@ -11456,12 +11479,13 @@ async function npcClanProfile(sector, now, viewerCommanderId) {
         sector, ownerId: npcOwnerId(sector), id: clan.id, name: clan.name, motto: clan.motto, lore: clan.lore, color: clan.color,
         counter: clan.counter, focus: clan.focus, strength: clan.strength,
         stage: info.stage, stageName: info.stageName, stageCount: info.stageCount, daysToNext: info.daysToNext, progress: info.progress,
+        playerStrength: info.strength, nextAtStrength: info.nextAt,
         elapsedDays: info.elapsedDays, foundedAt: new Date(clanRow.founded_at).toISOString(),
         danger: views.length > 0 ? npcDangerOf(maxPower) : 1, nextDanger: Math.max(1, Math.min(5, nextDanger)),
         baseCount: views.filter(v => v.origin !== 'takeover').length, outposts: views.filter(v => v.origin === 'takeover').length,
-        totalPower, maxPower, takeoverStage: NPC_RULES.takeoverMinStage, takeovers: clanRow.takeovers,
+        totalPower, maxPower, takeovers: clanRow.takeovers,
         raidsTotal: raids.total, raidsWon: raids.won, raids24h: raids.day,
-        stages: NPC_STAGES.map(s => ({ name: s.name, days: s.days })),
+        stages: NPC_STAGES.map(s => ({ name: s.name, days: 0, points: s.points })),
         bases: views,
         chronicle: events.map(e => ({ kind: e.kind, text: e.text, at: new Date(e.created_at).toISOString() }))
     };
@@ -11523,7 +11547,7 @@ app.get('/npc/base/:coord', async (req, res) => {
                 f = NPC_RULES.lootFactors[Math.min(n, NPC_RULES.lootFactors.length - 1)];
             }
         } catch (e) { f = 1; }
-        res.json({ success: true, base: npcBaseView(base, clan, npcStageIndex(clanRow.founded_at, now), now, f), clanSector: base.sector_id, clanName: clan.name });
+        res.json({ success: true, base: npcBaseView(base, clan, npcClanStage(clanRow), now, f), clanSector: base.sector_id, clanName: clan.name });
     } catch (error) {
         console.error('[Piraten] /npc/base:', error.message);
         res.status(500).json({ success: false, error: 'Abfrage fehlgeschlagen.' });
@@ -11564,8 +11588,7 @@ async function buildNpcAdminReport(rawQuery) {
             const sector = parseInt(tokens[1], 10), stage = parseInt(tokens[2], 10);
             if (!Number.isInteger(sector) || !Number.isInteger(stage) || stage < 0 || stage >= NPC_STAGES.length) return 'Verwendung: #npc stage <Sektor> <0-' + (NPC_STAGES.length - 1) + '>';
             await npcEnsureClanRow(sector, now);
-            const founded = new Date(now.getTime() - (NPC_STAGES[stage].days * 86400000 + 60000));
-            await pool.query('UPDATE npc_clans SET founded_at = $2, stage_seen = $3 WHERE sector_id = $1', [sector, founded, stage]);
+            await pool.query('UPDATE npc_clans SET stage_seen = $2, strength = $3 WHERE sector_id = $1', [sector, stage, NPC_STAGES[stage].points]);
             await npcLogEvent(sector, 'admin', `Entwicklungsstufe von Admin auf ${stage} (${NPC_STAGES[stage].name}) gesetzt.`);
             return `Sektor ${sector} (${npcClanDef(sector).name}): Stufe ${stage} (${NPC_STAGES[stage].name}) gesetzt.`;
         }
@@ -11576,7 +11599,7 @@ async function buildNpcAdminReport(rawQuery) {
             if (r.rows.length === 0) return 'Hier steht kein Piratenstuetzpunkt: ' + coord;
             const clanRow = await npcEnsureClanRow(r.rows[0].sector_id, now);
             const clan = npcClanDef(r.rows[0].sector_id);
-            const rates = npcRatesFor(clan, npcStageIndex(clanRow.founded_at, now), r.rows[0].origin === 'takeover');
+            const rates = npcRatesFor(clan, npcClanStage(clanRow), r.rows[0].origin === 'takeover');
             await pool.query('UPDATE npc_bases SET stock = $2 WHERE coord = $1', [coord, JSON.stringify(rates.map(x => Math.floor(x * NPC_RULES.stockHours * 0.5)))]);
             return `Stuetzpunkt ${coord} aufgefuellt.`;
         }
@@ -11584,7 +11607,7 @@ async function buildNpcAdminReport(rawQuery) {
             const sector = parseInt(tokens[1], 10);
             if (!Number.isInteger(sector)) return 'Verwendung: #npc takeover <Sektor>';
             const cr = await npcEnsureClanRow(sector, now);
-            const taken = await npcTakeOne(npcClanDef(sector), cr, now, true);
+            const taken = await npcTakeOne(npcClanDef(sector), cr, now);
             return taken ? `${npcClanDef(sector).name} haben ${taken} uebernommen.` : 'Kein verlassener Planet in Sektor ' + sector + ' gefunden.';
         }
         const sector = parseInt(tokens[0], 10);
