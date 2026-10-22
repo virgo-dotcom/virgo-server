@@ -870,7 +870,7 @@ async function initDatabase() {
             ['ress01', '7.500 Wasserstoff',   'ressourcen', shopResourceIccPrice(1, 7500),  'resource', 1, 7500],
             ['ress02', '10.000 Metalle',      'ressourcen', shopResourceIccPrice(2, 10000), 'resource', 2, 10000],
             ['ress03', '7.500 Werkzeuge',     'ressourcen', shopResourceIccPrice(3, 7500),  'resource', 3, 7500],
-            ['ress04', '2.500 Credits',       'ressourcen', shopResourceIccPrice(4, 2500),  'resource', 4, 2500],
+            ['ress04', '2.500 ICC',           'ressourcen', shopResourceIccPrice(4, 2500),  'resource', 4, 2500],
             // Schiffe (Kampfschiffe UND zivile Schiffe) gibt es im Shop immer als EINZELPREIS fuer 1 Stueck (Nutzer-Vorgabe 04.10.2026; mehr
             // Stueck ueber das Mengenfeld im Shop). ICC-Wert = Baukosten (Summe Ress x Wertgewicht) / 1.200 Wertpunkte je ICC x 10 (Aufschlag:
             // der Spieler spart sich Bauzeit, ICC ist Pay-to-Accelerate), dann wie im Einzelhandel auf eine 9 am Ende aufgerundet
@@ -891,7 +891,7 @@ async function initDatabase() {
             ['crate_res_1',     'Kleine Kiste: Wasserstoff (7.500)',   'gegenstaende', shopResourceIccPrice(1, 7500),  'inventory', 0, 1],
             ['crate_res_2',     'Kleine Kiste: Metalle (10.000)',      'gegenstaende', shopResourceIccPrice(2, 10000), 'inventory', 0, 1],
             ['crate_res_3',     'Kleine Kiste: Werkzeuge (7.500)',     'gegenstaende', shopResourceIccPrice(3, 7500),  'inventory', 0, 1],
-            ['crate_res_4',     'Kleine Kiste: Credits (2.500)',       'gegenstaende', shopResourceIccPrice(4, 2500),  'inventory', 0, 1],
+            ['crate_res_4',     'Kleine Kiste: ICC (2.500)',           'gegenstaende', shopResourceIccPrice(4, 2500),  'inventory', 0, 1],
             // 22.10.2026 (Nutzer): die Einzelkisten der kleinen Jaeger (Orbitaljaeger/Raumjaeger/Kosmosjaeger) gibt es im Shop NICHT mehr - Kriegsschiffe
             // kosten damit mindestens so viel wie ein Sternkreuzer (819) bzw. ein Jaeger-Paket (829-849). Die alten Angebote werden unten abgeschaltet.
             ['crate_warship_3', 'Schiffskiste Sternkreuzer',  'gegenstaende', shopShipIccPrice('warship', 3, 1), 'inventory', 0, 1],
@@ -950,7 +950,7 @@ async function initDatabase() {
         // eine Menge waehlen). display_name ist reine Server-Doku (der Client baut den Namen aus ResourceNames.cs).
         // Idempotent und nur fuer Zeilen, die noch den alten Standardwert 100000 haben - spaetere manuelle
         // Aenderungen an Menge/Preis in der Datenbank werden NICHT ueberschrieben.
-        const shopResourceNames = [['ress00', 'Energie'], ['ress01', 'Wasserstoff'], ['ress02', 'Metalle'], ['ress03', 'Werkzeuge'], ['ress04', 'Credits']];
+        const shopResourceNames = [['ress00', 'Energie'], ['ress01', 'Wasserstoff'], ['ress02', 'Metalle'], ['ress03', 'Werkzeuge'], ['ress04', 'ICC']];
         // Namens-Korrektur (04.10.2026, zweite Umstellung: Index 3 = Werkzeuge, Index 4 = Credits) - nur reine Server-Doku.
         await pool.query(`UPDATE shop_items SET display_name = '10.000 Werkzeuge' WHERE item_id = 'ress03' AND display_name = '10.000 Gold'`);
         await pool.query(`UPDATE shop_items SET display_name = '10.000 Credits' WHERE item_id = 'ress04' AND display_name = '10.000 Werkzeug'`);
@@ -966,13 +966,18 @@ async function initDatabase() {
         // Ressourcen bekommen fuer dieselben 100 ICC gleich viel WERT (Gewichte aus §27: Metalle 12, Wasserstoff/Werkzeuge 16, Energie 24,
         // Credits 48): 7.500 Wasserstoff / 7.500 Werkzeuge / 5.000 Energie / 2.500 Credits. Idempotent und nur fuer Zeilen, die noch den
         // Standard 10.000 haben - spaetere manuelle Aenderungen in der Datenbank werden NICHT ueberschrieben.
-        for (const [itemId, amount, resName] of [['ress00', 5000, 'Energie'], ['ress01', 7500, 'Wasserstoff'], ['ress03', 7500, 'Werkzeuge'], ['ress04', 2500, 'Credits']]) {
+        for (const [itemId, amount, resName] of [['ress00', 5000, 'Energie'], ['ress01', 7500, 'Wasserstoff'], ['ress03', 7500, 'Werkzeuge'], ['ress04', 2500, 'ICC']]) {
             await pool.query(
                 `UPDATE shop_items SET reward_amount = $2, display_name = $3
                  WHERE item_id = $1 AND reward_kind = 'resource' AND reward_amount = 10000`,
                 [itemId, amount, `${amount.toLocaleString('de-DE')} ${resName}`]
             );
         }
+
+        // 22.10.2026 (Nutzer): Umbenennung der Waehrungen - Ress05 heisst jetzt ICC (Interstellar Credit Currency, vorher "Credits"), die Premium-Waehrung
+        // (Ress10, im Code weiter "icc") heisst jetzt VC (Virgo Coins). display_name ist nur Server-Doku; hier werden die alten Namen nachgezogen.
+        await pool.query(`UPDATE shop_items SET display_name = '2.500 ICC' WHERE item_id = 'ress04' AND display_name LIKE '%Credits%'`);
+        await pool.query(`UPDATE shop_items SET display_name = 'Kleine Kiste: ICC (2.500)' WHERE item_id = 'crate_res_4' AND display_name LIKE '%Credits%'`);
 
         // -------------------------------------------------------
         // NEU (17.09.): ICC-Geschenkkiste. Einzige bisherige ICC-Quelle
@@ -4055,7 +4060,7 @@ app.post('/shop/purchase', async (req, res) => {
 
         if (commander.accountResources[4] < totalCost)
             return res.status(400).json({
-                success: false, error: 'Nicht genug ICC', iccBalance: commander.accountResources[4]
+                success: false, error: 'Nicht genug VC', iccBalance: commander.accountResources[4]
             });
 
         if (item.reward_kind === 'resource') {
@@ -8343,7 +8348,7 @@ const MARKET_SETTLE_DELAY_SECONDS = 15;
 // 1.000 Metalle (12 000) = 750 Wasserstoff (16) = 750 Werkzeuge (16) = 500 Energie (24) = 250 Credits (48).
 // Reihenfolge der Wertigkeit laut Nutzer: Credits > Energie > Wasserstoff/Werkzeuge > Metalle.
 const MARKET_VALUE_WEIGHT = [24, 16, 12, 16, 48];
-const MARKET_RESOURCE_NAMES = ['Energie', 'Wasserstoff', 'Metalle', 'Werkzeuge', 'Credits']; // wie ResourceNames.cs im Client
+const MARKET_RESOURCE_NAMES = ['Energie', 'Wasserstoff', 'Metalle', 'Werkzeuge', 'ICC']; // wie ResourceNames.cs im Client
 
 // Baukosten (Ress01-05) der handelbaren Schiffe - MUSS manuell synchron mit den Unity-Assets gehalten werden
 // (Assets/Ship Assets/*.asset, Stand 04.10.2026), wie BUILDING_ECONOMY. Daraus wird der Warenwert berechnet.
@@ -8706,7 +8711,7 @@ app.post('/market/create', async (req, res) => {
 
     if (!coord) return marketFail(res, 400, 'Ungültige Kolonie.');
     if (!marketItemValid(kind, index)) return marketFail(res, 400, 'Diese Ware kann nicht gehandelt werden.');
-    if (!(priceResource >= 0 && priceResource <= 4)) return marketFail(res, 400, 'Als Gegenleistung sind nur Energie, Wasserstoff, Metalle, Werkzeuge und Credits erlaubt.');
+    if (!(priceResource >= 0 && priceResource <= 4)) return marketFail(res, 400, 'Als Gegenleistung sind nur Energie, Wasserstoff, Metalle, Werkzeuge und ICC erlaubt.');
     if (kind === 'resource' && priceResource === index)
         return marketFail(res, 400, `${marketItemName('resource', index)} kann nicht gegen ${marketItemName('resource', index)} getauscht werden.`);
     const def = MARKET_KINDS[kind];
@@ -9029,7 +9034,7 @@ const INVENTORY_MAX_USE_QUANTITY = 999;       // so viele Kisten auf einmal oeff
 // Einheiten je Rohstoffkiste, Index = Ress-Index. MUSS zu CrateItems.CrateAmount (Client, CrateItems.cs) passen - ein Test vergleicht beide.
 const INVENTORY_CRATE_AMOUNTS    = [5000, 7500, 10000, 7500, 2500, 10000, 10000, 10000, 10000, 10000];
 // Namen wie in ResourceNames.cs (Client) - nur fuer Admin-Texte; der Client baut die Anzeigenamen selbst.
-const INVENTORY_RESOURCE_NAMES = ['Energie', 'Wasserstoff', 'Metalle', 'Werkzeuge', 'Credits', 'Antimaterie', 'Kristalle', 'Chips', 'Daten', 'ICC'];
+const INVENTORY_RESOURCE_NAMES = ['Energie', 'Wasserstoff', 'Metalle', 'Werkzeuge', 'ICC', 'Antimaterie', 'Kristalle', 'Chips', 'Daten', 'VC'];   // 22.10.2026: Index 4 = ICC (Handelswaehrung), Index 9 = VC (Premium)
 const INVENTORY_ADMIN_ONLY_ITEMS = new Set(['crate_res_9']); // ICC-Kiste: Premium-Waehrung, nie per "all"/Shop/Quest
 
 const INVENTORY_ITEMS = (() => {
@@ -9183,7 +9188,7 @@ async function shopPurchaseInventoryItem(req, res, item, quantity) {
         while (commander.accountResources.length < 5) commander.accountResources.push(0);
         await iccGuard(who.playFabId, commander); // ICC-Waechter (§28): unerklaerte ICC-Erhoehung verwerfen
         if (commander.accountResources[4] < totalCost)
-            return { status: 400, body: { success: false, error: 'Nicht genug ICC', iccBalance: commander.accountResources[4] } };
+            return { status: 400, body: { success: false, error: 'Nicht genug VC', iccBalance: commander.accountResources[4] } };
 
         const inv = await inventoryLoad(who.playFabId);
         const have = Number(inv.items[invId]) || 0;
@@ -9350,7 +9355,7 @@ async function buildInventoryAdminReport(rawQuery) {
         'INVENTAR-Admin:\n' +
         '  #inv <Commander-ID>                          Inventar anzeigen\n' +
         '  #inv give <Commander-ID> <itemId> [Anzahl]   Gegenstaende vergeben (Standard 1)\n' +
-        '  #inv give <Commander-ID> all [Anzahl]        je Anzahl von JEDER Kiste (ohne ICC-Kiste)\n' +
+        '  #inv give <Commander-ID> all [Anzahl]        je Anzahl von JEDER Kiste (ohne VC-Kiste)\n' +
         '(statt der Commander-ID geht auch die PlayFab-ID)\n\nGegenstaende:\n' + itemList();
     if (tokens.length === 0 || /^(help|hilfe|\?)$/i.test(tokens[0])) return help;
 
@@ -10104,7 +10109,7 @@ app.post('/planet/terraform-abort', async (req, res) => {
 // #####################################################################
 
 const STATIONED_MAX_PER_PLANET = 10;
-const STATIONED_RESOURCE_NAMES = ['Energie', 'Wasserstoff', 'Metalle', 'Werkzeuge', 'Credits'];
+const STATIONED_RESOURCE_NAMES = ['Energie', 'Wasserstoff', 'Metalle', 'Werkzeuge', 'ICC'];
 
 async function stationedLookupCommander(commanderId) {
     const r = await pool.query('SELECT playfab_id, commander_name FROM commander_highscore WHERE commander_id = $1', [commanderId]);
@@ -11073,7 +11078,7 @@ app.post('/alliance-treasury/deposit', async (req, res) => {
     const index  = marketStrictInt(req.body && req.body.resourceIndex);
     const amount = marketStrictInt(req.body && req.body.amount);
     if (!coord) return marketFail(res, 400, 'Bitte einen Planeten wählen.');
-    if (!(index >= 0 && index <= 4)) return marketFail(res, 400, 'In die Kasse können Energie, Wasserstoff, Metalle, Werkzeuge und Credits eingezahlt werden.');
+    if (!(index >= 0 && index <= 4)) return marketFail(res, 400, 'In die Kasse können Energie, Wasserstoff, Metalle, Werkzeuge und ICC eingezahlt werden.');
     if (!(amount >= TREASURY_MIN_DEPOSIT[index] && amount <= TREASURY_MAX_DEPOSIT))
         return marketFail(res, 400, `Menge: mindestens ${marketNum(TREASURY_MIN_DEPOSIT[index])} ${MARKET_RESOURCE_NAMES[index]}.`);
 
