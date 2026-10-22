@@ -1301,6 +1301,10 @@ async function initDatabase() {
         // durch is_founder_rank ohnehin immer alle Rechte, das ist nur fuer Konsistenz in der DB).
         await pool.query(`ALTER TABLE alliance_ranks ADD COLUMN IF NOT EXISTS can_send_broadcast_mail BOOLEAN NOT NULL DEFAULT false;`);
         await pool.query(`UPDATE alliance_ranks SET can_send_broadcast_mail = true WHERE is_founder_rank = true AND can_send_broadcast_mail = false;`);
+        // NEU 22.10.2026 (Nutzer): Rang-Recht "Kassen-Entscheidungen" - wer ueber Ausgaben der Allianzkasse (spaeter: Forschungen/Megastrukturen) entscheidet.
+        // STANDARD: nur der Gruender (Gruender-Rang = true, alle anderen false); er kann das Recht im Rang-Editor weiteren Raengen geben.
+        await pool.query(`ALTER TABLE alliance_ranks ADD COLUMN IF NOT EXISTS can_manage_treasury BOOLEAN NOT NULL DEFAULT false;`);
+        await pool.query(`UPDATE alliance_ranks SET can_manage_treasury = true WHERE is_founder_rank = true AND can_manage_treasury = false;`);
         // Spam-Schutz (Fairplay-Regel): Zeitstempel des letzten Rundmail-Versands pro Allianz,
         // siehe BROADCAST_MAIL_COOLDOWN_MINUTES weiter unten.
         await pool.query(`ALTER TABLE alliances ADD COLUMN IF NOT EXISTS last_broadcast_mail_at TIMESTAMPTZ;`);
@@ -2022,7 +2026,7 @@ app.get('/alliances/:id/members', async (req, res) => {
             `SELECT m.*,
                     r.name AS rank_name, r.rank_order, r.is_founder_rank, r.is_default_rank,
                     r.can_manage_applications, r.can_manage_relationships, r.can_edit_alliance_info,
-                    r.can_kick_members, r.can_promote_members, r.can_send_broadcast_mail,
+                    r.can_kick_members, r.can_promote_members, r.can_send_broadcast_mail, r.can_manage_treasury,
                     COALESCE(h.total_points, 0) AS total_points,
                     h.updated_at AS last_active_at
              FROM alliance_members m
@@ -2496,7 +2500,7 @@ app.post('/alliances/:id/ranks', async (req, res) => {
     const id = parseInt(req.params.id, 10);
     const { requesterCommanderId, name, rankOrder,
         canManageApplications, canManageRelationships, canEditAllianceInfo, canKickMembers, canPromoteMembers, showInProfile,
-        canSendBroadcastMail } = req.body;
+        canSendBroadcastMail, canManageTreasury } = req.body;
     if (!id || !requesterCommanderId || !name)
         return res.status(400).json({ success: false, error: 'Fehlende Parameter' });
 
@@ -2512,12 +2516,12 @@ app.post('/alliances/:id/ranks', async (req, res) => {
             `INSERT INTO alliance_ranks
                 (alliance_id, name, rank_order, is_founder_rank, is_default_rank,
                  can_manage_applications, can_manage_relationships, can_edit_alliance_info, can_kick_members, can_promote_members, show_in_profile,
-                 can_send_broadcast_mail)
-             VALUES ($1, $2, $3, false, false, $4, $5, $6, $7, $8, $9, $10)
+                 can_send_broadcast_mail, can_manage_treasury)
+             VALUES ($1, $2, $3, false, false, $4, $5, $6, $7, $8, $9, $10, $11)
              RETURNING *`,
             [id, trimmedName, rankOrder || 50,
              !!canManageApplications, !!canManageRelationships, !!canEditAllianceInfo, !!canKickMembers, !!canPromoteMembers, !!showInProfile,
-             !!canSendBroadcastMail]
+             !!canSendBroadcastMail, !!canManageTreasury]
         );
         res.json({ success: true, rank: result.rows[0] });
     } catch (error) {
@@ -2567,6 +2571,7 @@ app.put('/alliances/:id/ranks/:rankId', async (req, res) => {
         if (canPromoteMembers      !== undefined) { updates.push(`can_promote_members = $${idx++}`);      values.push(!!canPromoteMembers); }
         if (showInProfile          !== undefined) { updates.push(`show_in_profile = $${idx++}`);          values.push(!!showInProfile); } // NEU 26.09.2026
         if (canSendBroadcastMail   !== undefined) { updates.push(`can_send_broadcast_mail = $${idx++}`);   values.push(!!canSendBroadcastMail); } // NEU 28.09.2026
+        if (canManageTreasury      !== undefined) { updates.push(`can_manage_treasury = $${idx++}`);        values.push(!!canManageTreasury); }      // NEU 22.10.2026
 
         if (isDefaultRank === true) {
             // Nur EIN Standard-Rang pro Allianz möglich — alten zuerst
@@ -3414,7 +3419,8 @@ const ALLIANCE_PERMISSION_COLUMNS = [
     'can_edit_alliance_info',
     'can_kick_members',
     'can_promote_members',
-    'can_send_broadcast_mail' // NEU 28.09.2026
+    'can_send_broadcast_mail', // NEU 28.09.2026
+    'can_manage_treasury'      // NEU 22.10.2026: Entscheidungen ueber die Allianzkasse
 ];
 
 // Generische Rechte-Prüfung — EINE Stelle für alle künftigen
@@ -3472,7 +3478,7 @@ async function getMemberRankInfo(commanderId, allianceId) {
 async function createDefaultAllianceRanks(allianceId) {
     const defaultRanks = [
         { name: 'Gründer', rank_order: 0, is_founder_rank: true, is_default_rank: false,
-          can_manage_applications: true, can_manage_relationships: true, can_edit_alliance_info: true, can_kick_members: true, can_promote_members: true, can_send_broadcast_mail: true },
+          can_manage_applications: true, can_manage_relationships: true, can_edit_alliance_info: true, can_kick_members: true, can_promote_members: true, can_send_broadcast_mail: true, can_manage_treasury: true },
         { name: 'Kriegsminister', rank_order: 10, is_founder_rank: false, is_default_rank: false,
           can_manage_applications: false, can_manage_relationships: true, can_edit_alliance_info: false, can_kick_members: false, can_promote_members: false, can_send_broadcast_mail: false },
         { name: 'Außenminister', rank_order: 10, is_founder_rank: false, is_default_rank: false,
@@ -3491,12 +3497,12 @@ async function createDefaultAllianceRanks(allianceId) {
             `INSERT INTO alliance_ranks
                 (alliance_id, name, rank_order, is_founder_rank, is_default_rank,
                  can_manage_applications, can_manage_relationships, can_edit_alliance_info, can_kick_members, can_promote_members, show_in_profile,
-                 can_send_broadcast_mail)
-             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12)
+                 can_send_broadcast_mail, can_manage_treasury)
+             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13)
              RETURNING id, name`,
             [allianceId, rank.name, rank.rank_order, rank.is_founder_rank, rank.is_default_rank,
              rank.can_manage_applications, rank.can_manage_relationships, rank.can_edit_alliance_info, rank.can_kick_members, rank.can_promote_members,
-             showInProfile, rank.can_send_broadcast_mail]
+             showInProfile, rank.can_send_broadcast_mail, !!rank.can_manage_treasury]
         );
         rankIds[rank.name] = result.rows[0].id;
     }
@@ -6370,6 +6376,30 @@ async function resolveCombat(attackerPlayFabId, attackerCommander, attackerFleet
                 report.recycling[i] = perRess;
             }
         }
+    }
+
+    // NEU 22.10.2026 (Nutzer): Vertreiben - Truemmer entstehen NUR durch zerstoerte Schiffe (eigene Verluste + vernichtete Gaeste, vor Reparatur)
+    // und landen auf dem eigenen Planeten. Es wird nur das Rohstoff-Feld des Planeten angefasst.
+    if (expelMode) {
+        try {
+            const expelBonus = RECYCLING_BASE + ((attackerCommander.recycling || 0) * 0.01);
+            let expelRecycled = 0;
+            for (let i = 0; i < 10; i++) {
+                const lost = Math.max(0, (attackerFleet.warships[i] || 0) - attackerAfterWarships[i]) + (useV2 && stationed ? stationedLostWarships(stationed, i) : 0);
+                if (lost > 0) expelRecycled += Math.floor(lost * (SHIP_BUILD_COST[i] || 1000) * expelBonus);
+            }
+            if (expelRecycled > 0) {
+                const planetKey = `planet_${destCoord.replace(/:/g, '_')}`;
+                const pd = await playfabServer('/Server/GetUserData', { PlayFabId: attackerPlayFabId, Keys: [planetKey] });
+                if (pd.Data && pd.Data[planetKey]) {
+                    const own = JSON.parse(pd.Data[planetKey].Value);
+                    const perRess = Math.floor(expelRecycled / 4);
+                    own.ressources = own.ressources || [0, 0, 0, 0, 0];
+                    for (let i = 0; i < 4; i++) { own.ressources[i] = (own.ressources[i] || 0) + perRess; report.recycling[i] = perRess; }
+                    await playfabServer('/Server/UpdateUserData', { PlayFabId: attackerPlayFabId, Data: { [planetKey]: JSON.stringify(own) }, Permission: 'Private' });
+                }
+            }
+        } catch (e) { log.push(`Truemmer beim Vertreiben Fehler: ${e.message}`); }
     }
 
     // PHASE 8: Reparatur
@@ -10245,6 +10275,55 @@ app.post('/fleets/stationed/recall', async (req, res) => {
     }
 });
 
+// ---- Zurueckrufen einer Flotte unterwegs (NEU 22.10.2026, Fairplay: der SERVER prueft und rechnet die Rueckflugzeit) ----
+// Regeln (Nutzer): Zurueckrufen beendet den Auftrag; die Flotte fliegt genau so lange heim, wie sie schon unterwegs war. Nach der Ankunft am Ziel
+// (z.B. Angriff) ist es nicht mehr moeglich. Gerechnet wird mit der SERVER-Uhr. Rueckgabe: { home } (neue Rueckflug-Flotte) oder { error }.
+function fleetRecallBuild(commander, fleet, now) {
+    if (!fleet) return { status: 404, error: 'Diese Flotte gibt es nicht (mehr).' };                                  // LOCALIZE
+    if (fleet.isReturnFlight || fleet.mission === 10 || fleet.mission === 'Return') return { status: 409, error: 'Die Flotte ist schon auf dem Rückflug.' };   // LOCALIZE
+    const arrival = new Date(fleet.arrivalUtc), departure = new Date(fleet.departureUtc);
+    if (fleet.hasArrived || isNaN(arrival.getTime()) || isNaN(departure.getTime()) || arrival.getTime() <= now.getTime())
+        return { status: 409, error: 'Die Flotte ist schon angekommen - zurückrufen geht nicht mehr.' };            // LOCALIZE
+    const total = Math.max(1, (arrival.getTime() - departure.getTime()) / 1000);
+    const elapsed = Math.min(total, Math.max(1, (now.getTime() - departure.getTime()) / 1000));
+    if (typeof commander.nextFleetCounter !== 'number') commander.nextFleetCounter = 1;
+    const home = {
+        fleetId: `${fleet.fleetId}-C${commander.nextFleetCounter++}`,
+        commanderId: fleet.commanderId, commanderName: fleet.commanderName,
+        originCoord: fleet.destinationCoord, destinationCoord: fleet.originCoord,
+        departureUtc: now.toISOString(), arrivalUtc: new Date(now.getTime() + elapsed * 1000).toISOString(),
+        mission: 10, warships: (fleet.warships || new Array(10).fill(0)).slice(), ships: (fleet.ships || new Array(6).fill(0)).slice(),
+        ressources: (fleet.ressources || [0, 0, 0, 0, 0]).slice(),
+        isReturnFlight: true, hasArrived: false, engineLevel: fleet.engineLevel || 1, fuelFactor: fleet.fuelFactor || 1
+    };
+    return { home };
+}
+
+app.post('/fleets/recall', async (req, res) => {
+    const commanderId = parseInt(req.body && req.body.commanderId, 10);
+    const fleetId = String(req.body && req.body.fleetId || '').slice(0, 80);
+    if (!commanderId || !fleetId) return res.status(400).json({ success: false, error: 'Ungültige Angaben.' });
+    const caller = await requireCaller(req, res, { commanderId });
+    if (!caller) return;
+    try {
+        const commander = await stationedLoadCommanderData(caller.playFabId);
+        if (!commander) return res.status(500).json({ success: false, error: 'Deine Daten sind nicht lesbar.' });
+        const fleet = (commander.activeFleets || []).find(f => f && f.fleetId === fleetId && f.commanderId === commander.commanderId);
+        const now = new Date();
+        const r = fleetRecallBuild(commander, fleet, now);
+        if (r.error) return res.status(r.status).json({ success: false, error: r.error });
+        // Race-Guard: wird die Flotte gerade vom Tick/Client verarbeitet, gewinnt der andere (Zeile bleibt 5 Minuten gesperrt)
+        const claimed = await claimFleetForProcessing(fleetId);
+        if (!claimed) return res.status(409).json({ success: false, error: 'Die Flotte wird gerade verarbeitet.' });         // LOCALIZE
+        commander.activeFleets = commander.activeFleets.filter(f => !(f && f.fleetId === fleetId)).concat([r.home]);
+        await stationedSaveCommanderData(caller.playFabId, commander);
+        res.json({ success: true, oldFleetId: fleetId, fleet: r.home });
+    } catch (error) {
+        console.error('[Flotte] recall Fehler:', error.message);
+        res.status(500).json({ success: false, error: 'Zurückrufen gerade nicht möglich.' });
+    }
+});
+
 app.post('/fleets/stationed/expel', async (req, res) => {
     const commanderId = parseInt(req.body && req.body.commanderId, 10);
     const fleetId = String(req.body && req.body.fleetId || '').slice(0, 80);
@@ -10851,8 +10930,14 @@ async function treasuryCredit(allianceId, resourceIndex, amount, kind, commander
     return balance;
 }
 
+// Wer ueber Ausgaben der Kasse entscheiden darf (Nutzer 22.10.2026): STANDARD nur der Gruender; er kann das Rang-Recht can_manage_treasury weiteren
+// Raengen geben (Rang-Editor "Entscheidet ueber die Allianzkasse"). JEDER kuenftige Aufrufer von treasurySpend() muss das vorher pruefen.
+async function treasuryMayDecide(commanderId, allianceId) {
+    return await allianceHasPermission(commanderId, allianceId, 'can_manage_treasury');
+}
+
 // Fuer SPAETERE Allianz-Projekte (Forschung, Megastrukturen): zieht Kosten (Array von 5 Mengen) atomar ab, nur wenn alles da ist.
-// Wird NUR vom Server aufgerufen (kein Endpunkt!). Rueckgabe { ok, balances }.
+// Wird NUR vom Server aufgerufen (kein Endpunkt!). Rueckgabe { ok, balances }. Entscheidungsrecht: siehe treasuryMayDecide().
 async function treasurySpend(allianceId, costs, reason, commanderId, commanderName) {
     const c = [0, 1, 2, 3, 4].map(i => Math.max(0, Math.floor(Number(costs && costs[i]) || 0)));
     if (c.every(x => x === 0)) return { ok: false, balances: await treasuryBalances(allianceId) };
