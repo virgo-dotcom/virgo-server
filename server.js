@@ -892,9 +892,8 @@ async function initDatabase() {
             ['crate_res_2',     'Kleine Kiste: Metalle (10.000)',      'gegenstaende', shopResourceIccPrice(2, 10000), 'inventory', 0, 1],
             ['crate_res_3',     'Kleine Kiste: Werkzeuge (7.500)',     'gegenstaende', shopResourceIccPrice(3, 7500),  'inventory', 0, 1],
             ['crate_res_4',     'Kleine Kiste: Credits (2.500)',       'gegenstaende', shopResourceIccPrice(4, 2500),  'inventory', 0, 1],
-            ['crate_warship_0', 'Schiffskiste Orbitaljaeger', 'gegenstaende', shopShipIccPrice('warship', 0, 1), 'inventory', 0, 1],
-            ['crate_warship_1', 'Schiffskiste Raumjaeger',    'gegenstaende', shopShipIccPrice('warship', 1, 1), 'inventory', 0, 1],
-            ['crate_warship_2', 'Schiffskiste Kosmosjaeger',  'gegenstaende', shopShipIccPrice('warship', 2, 1), 'inventory', 0, 1],
+            // 22.10.2026 (Nutzer): die Einzelkisten der kleinen Jaeger (Orbitaljaeger/Raumjaeger/Kosmosjaeger) gibt es im Shop NICHT mehr - Kriegsschiffe
+            // kosten damit mindestens so viel wie ein Sternkreuzer (819) bzw. ein Jaeger-Paket (829-849). Die alten Angebote werden unten abgeschaltet.
             ['crate_warship_3', 'Schiffskiste Sternkreuzer',  'gegenstaende', shopShipIccPrice('warship', 3, 1), 'inventory', 0, 1],
             // NEU 21.10.2026 (Nutzer): SCHIFFSKISTEN-PAKETE = so viele Jaeger, wie in einen Warship04 passen (20 Slots): feste Preise, in etwa 8,2-8,5 EUR.
             // item_id = <Inventar-Gegenstand>_x<Anzahl>; reward_amount = Kisten je Kauf (shopInventoryItemId liest den Gegenstand aus der Kennung).
@@ -916,6 +915,8 @@ async function initDatabase() {
         await pool.query("UPDATE shop_items SET active = false WHERE item_id = 'crate_warship_2_x5'");
         // 22.10.2026: Kernbombe nur noch als Platzhalter ohne Preis (Client); das alte Shop-Angebot (100.000 ICC) wird abgeschaltet
         await pool.query("UPDATE shop_items SET active = false WHERE item_id = 'item_ship05'");
+        // 22.10.2026: Einzelkisten der kleinen Jaeger aus dem Shop (Kisten im Inventar der Spieler bleiben oeffenbar)
+        await pool.query("UPDATE shop_items SET active = false WHERE item_id IN ('crate_warship_0', 'crate_warship_1', 'crate_warship_2')");
 
         // NEU (04.10.2026): Preise der Flotten-Pakete und Kisten (siehe Seeds oben). Bestehende Zeilen werden NUR aktualisiert, wenn sie noch
         // einen frueheren Standardpreis dieses Artikels haben - spaetere manuelle Aenderungen in der Datenbank bleiben erhalten.
