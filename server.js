@@ -5836,8 +5836,8 @@ function combatPointsCompute(report) {
     };
     addSide(att, 'attacker', !!report.attackerWins, lostDef);
     addSide(def, 'defender', !report.attackerWins, lostAtt);
-    const hostId = combatPointsIsHuman(report.planetOwnerId) ? report.planetOwnerId : def[0].commanderId;
     const a = att[0].commanderId;
+    const hostId = (combatPointsIsHuman(report.planetOwnerId) && report.planetOwnerId !== a) ? report.planetOwnerId : def[0].commanderId;   // Vertreiben: Besitzer = Angreifer, Gegenueber = erster Gast
     const pairKey = Math.min(a, hostId) + ':' + Math.max(a, hostId);
     return { pairKey, entries };
 }
@@ -5847,6 +5847,7 @@ async function combatPointsApply(report, now, log) {
         const calc = combatPointsCompute(report);
         report.combatPointsApplies = !!calc;
         report.combatPointsAttacker = 0; report.combatPointsDefender = 0;
+        let defenderShown = false;
         if (!calc) return;
         const since = new Date(now.getTime() - COMBAT_POINTS.repeatWindowHours * 3600000);
         const prior = await pool.query('SELECT COUNT(DISTINCT report_id)::int AS n FROM combat_points_log WHERE pair_key = $1 AND created_at >= $2', [calc.pairKey, since]);
@@ -5857,7 +5858,7 @@ async function combatPointsApply(report, now, log) {
             const points = Math.round(e.positive * factor) + e.negative;
             e.points = points;
             if (e.side === 'attacker' && report.combatPointsAttacker === 0) report.combatPointsAttacker = points;
-            if (e.side === 'defender' && e.commanderId === report.planetOwnerId) report.combatPointsDefender = points;
+            if (e.side === 'defender' && !defenderShown && (e.commanderId === report.planetOwnerId || report.expulsion)) { report.combatPointsDefender = points; defenderShown = true; }
             const allianceId = await getAllianceIdForCommander(e.commanderId);
             await pool.query('INSERT INTO combat_points_log (report_id, commander_id, alliance_id, pair_key, points, detail, created_at) VALUES ($1, $2, $3, $4, $5, $6, $7)',
                 [report.reportId, e.commanderId, allianceId, calc.pairKey, points, JSON.stringify({ side: e.side, win: e.win, kills: e.kills, lost: e.lost, factor }), now]);
@@ -5996,12 +5997,28 @@ async function resolveCombat(attackerPlayFabId, attackerCommander, attackerFleet
     // eigentliche Ursache für "Verteidiger: 0 Schiffe" bei allen PvP-Kämpfen.
     const isRealPlayerDefender = !!(ownerInfo && ownerInfo.pfid && ownerInfo.ownerCommanderId >= 1000000);
 
+    // NEU 22.10.2026 (Nutzer): Ein Angriff auf die EIGENE Koordinate vertreibt fremde (nicht befreundete) stationierte Flotten. Es kaempft nur die
+    // angreifende Flotte gegen diese Gaeste (Phase 1 des normalen Kampfes); der Planet selbst, seine Rohstoffe und Verbuendete bleiben unberuehrt,
+    // es gibt keine Beute. Ohne fremde Gaeste kehrt die Flotte einfach heim.
+    const expelMode = !!(ownerInfo && ownerInfo.ownerCommanderId === attackerCommander.commanderId);
+    let expelStationed = null;
+    if (expelMode) {
+        try { expelStationed = getCombatEngineMode() === 'v2' ? await stationedPrepareCombat(destCoord, attackerCommander.commanderId) : null; }
+        catch (e) { expelStationed = null; log.push(`Stationierte Flotten nicht lesbar: ${e.message}`); }
+        if (!expelStationed || expelStationed.foreign.length === 0) {
+            await upsertAttackTrace(attackerFleet.fleetId, { combat_processed_at: new Date(), combat_success: false });
+            await sendMail(attackerCommander, 'Nichts zu vertreiben', `Auf ${destCoord} steht keine fremde Flotte, die du vertreiben könntest. Deine Flotte kehrt zurück.`, 1);   // LOCALIZE
+            return buildReturnFleet(attackerFleet, now, [...attackerFleet.warships], attackerFleet.ressources || [0,0,0,0,0]);
+        }
+        expelStationed.allied = [];      // Verbuendete Gaeste kaempfen hier nicht mit und stehen nicht im Bericht
+    }
+
     let defenderPfid = null;
     let defenderCommander = null;
     let defenderPlanet = null;
     let defenderPlanetKey = null;
 
-    if (isRealPlayerDefender) {
+    if (isRealPlayerDefender && !expelMode) {
         defenderPfid = ownerInfo.pfid;
         defenderPlanetKey = `planet_${destCoord.replace(/:/g, '_')}`;
         try {
@@ -6018,7 +6035,7 @@ async function resolveCombat(attackerPlayFabId, attackerCommander, attackerFleet
 
     // NEU 18.10.2026 (§33): Der Verteidiger wird notfalls ueber das Register + Highscore gefunden (die oeffentlichen Systemdaten haben nicht immer 'pfid';
     // das betraf z.B. frisch besiedelte/terraformende Planeten). Ohne das haette der Angreifer ins Leere geschossen.
-    if (!defenderPfid) {
+    if (!defenderPfid && !expelMode) {
         try {
             const reg = await pool.query('SELECT owner_commander_id, kind, owner_name, planet_name FROM planet_registry WHERE coord = $1', [destCoord]);
             const row = reg.rows[0];
@@ -6044,7 +6061,7 @@ async function resolveCombat(attackerPlayFabId, attackerCommander, attackerFleet
     // NEU 21.10.2026 (§36): steht auf dem Ziel ein Piratenstuetzpunkt, verteidigt er mit Schiffen + Forschung seines Clans.
     // Scheitert die Datenbank dabei, wird NICHT gegen "nichts" gekaempft (wuerde einen Gratis-Sieg bedeuten): die Flotte fliegt unveraendert heim.
     let npcCtx = null;
-    if (!defenderPfid) {
+    if (!defenderPfid && !expelMode) {
         try {
             npcCtx = await npcPrepareDefense(destCoord, attackerCommander.commanderId, now);
         } catch (e) {
@@ -6206,7 +6223,8 @@ async function resolveCombat(attackerPlayFabId, attackerCommander, attackerFleet
         try {
             const v2Seed = Math.floor(Math.random() * 2147483646) + 1;
             // §33: stationierte Flotten nur mit der v2-Engine (im Schattenmodus bleibt alles beim Alten)
-            if (combatEngine === 'v2' && defenderCommander && ownerInfo && ownerInfo.ownerCommanderId >= 1000000) {
+            if (expelMode) stationed = expelStationed;
+            else if (combatEngine === 'v2' && defenderCommander && ownerInfo && ownerInfo.ownerCommanderId >= 1000000) {
                 try { stationed = await stationedPrepareCombat(destCoord, ownerInfo.ownerCommanderId); }
                 catch (e) { stationed = null; log.push(`Stationierte Flotten nicht lesbar: ${e.message}`); }
             }
@@ -6214,7 +6232,7 @@ async function resolveCombat(attackerPlayFabId, attackerCommander, attackerFleet
             if (stationed && stationed.foreign.length > 0) {
                 phaseA = runCombatV2({ attacker: attSpec, defender: { parts: stationed.foreign.map(stationedPartSpec) }, seed: v2Seed });
                 attSpec = Object.assign({}, attSpec, { warships: phaseA.attacker.warships, ships: phaseA.attacker.ships, hpCarry: phaseA.attackerHp });   // NEU 21.10.2026: Schaden aus Phase 1 bleibt
-                skipPhaseB = phaseA.outcome !== 'win';
+                skipPhaseB = expelMode || phaseA.outcome !== 'win';     // Vertreiben: nie gegen den eigenen Planeten
             }
             if (!skipPhaseB) {
                 const hostSpec = { warships: defWarships, ships: defShips, research: v2ResearchOf(defenderCommander), tag: '' };
@@ -6225,7 +6243,7 @@ async function resolveCombat(attackerPlayFabId, attackerCommander, attackerFleet
                 });
             } else {
                 // Der Planet wurde nicht erreicht: Ergebnis = Ausgang von Phase A, der Planetenbesitzer bleibt unberuehrt
-                v2Result = { outcome: phaseA.outcome === 'win' ? 'lose' : phaseA.outcome, rounds: phaseA.rounds, roundLog: [], startState: phaseA.startState,
+                v2Result = { outcome: expelMode ? phaseA.outcome : (phaseA.outcome === 'win' ? 'lose' : phaseA.outcome), rounds: phaseA.rounds, roundLog: [], startState: phaseA.startState,
                     attacker: phaseA.attacker, defender: { warships: defWarships.slice(0, 10), ships: defShips.slice(0, 6) }, defenderParts: null,
                     attackerBonusPercent: phaseA.attackerBonusPercent, defenderBonusPercent: v2Round1(v2MixBonus(defWarships) * 100), retreated: phaseA.retreated, seed: phaseA.seed };
             }
@@ -6295,8 +6313,11 @@ async function resolveCombat(attackerPlayFabId, attackerCommander, attackerFleet
         defenderFleetBonus, 'HP');
     defenderParticipant.commanderId   = report.planetOwnerId;
     defenderParticipant.commanderName = report.planetOwnerName;
-    report.defenders.push(defenderParticipant);
-    report.totalDefenderShips += defenderParticipant.totalShipsBefore;
+    if (expelMode) report.expulsion = true;       // Bericht "Flotten vertrieben": nur die fremden Gaeste sind Gegner
+    else {
+        report.defenders.push(defenderParticipant);
+        report.totalDefenderShips += defenderParticipant.totalShipsBefore;
+    }
     if (useV2 && stationed) stationedAddParticipants(report, stationed);   // NEU 18.10.2026 (§33): stationierte Teilnehmer
 
     // PHASE 6: Beute (nur bei Angreifer-Sieg, nur wenn Verteidiger-Planet bekannt)
@@ -6449,7 +6470,7 @@ async function resolveCombat(attackerPlayFabId, attackerCommander, attackerFleet
     // unabhängig von Mails/PlayFab) + Angreifer-Mail
     await saveReportToDatabase(report);
     await sendCombatMail(attackerCommander, report, true);
-    if (useV2 && stationed) await stationedFinalize(stationed, report, now, log);   // NEU 18.10.2026 (§33): Gaeste speichern + Bericht an alle Beteiligten
+    if (useV2 && stationed) await stationedFinalize(stationed, report, now, log, expelMode && attackerWins);   // NEU 18.10.2026 (§33): Gaeste speichern + Bericht an alle Beteiligten
 
     log.push(`Kampf: ${attackerFleet.fleetId} | ${attackerWins ? 'Angreifer siegt' : 'Verteidiger siegt'} | Verluste ${report.totalAttackerLosses}/${report.totalDefenderLosses}`);
 
@@ -10148,6 +10169,17 @@ async function processStationingArrival(playFabId, commander, fleet, now) {
 
 // ---- Abziehen (Besitzer) und Ausweisen (Gastgeber) ----
 async function stationedEnd(fleetId, byOwnerId, byHostId, now) {
+    // NEU 22.10.2026 (Nutzer): Ausweisen geht NUR bei Freunden und Verbuendeten (im Einvernehmen). Neutrale und feindliche Gaeste stehen aus
+    // taktischen/diplomatischen Gruenden da; wer sie loswerden will, greift den EIGENEN Planeten an (resolveCombat, "Vertreiben").
+    if (byHostId && !byOwnerId) {
+        const pre = await pool.query('SELECT owner_commander_id, host_commander_id FROM stationed_fleets WHERE fleet_id = $1', [fleetId]);
+        const p = pre.rows[0];
+        if (p && p.host_commander_id === byHostId) {
+            let friendly = false;
+            try { friendly = await isAuthorizedToViewCommanderData(byHostId, p.owner_commander_id); } catch (e) { friendly = false; }
+            if (!friendly) return { status: 403, body: { success: false, error: 'Nur Freunde und Verbündete kannst du ausweisen. Neutrale und feindliche Flotten vertreibst du mit einem Angriff auf deinen eigenen Planeten.' } };   // LOCALIZE
+        }
+    }
     const del = await pool.query(
         `DELETE FROM stationed_fleets WHERE fleet_id = $1 AND (owner_commander_id = $2 OR host_commander_id = $3) RETURNING *`,
         [fleetId, byOwnerId || 0, byHostId || 0]);
@@ -10307,18 +10339,24 @@ function stationedRecalc(report, ctx) {
 }
 
 // Ergebnisse speichern: Flotten aktualisieren/loeschen, Mail mit dem EINEN Kampfbericht an jeden Gast-Besitzer
-async function stationedFinalize(ctx, report, now, log) {
+async function stationedFinalize(ctx, report, now, log, expelHome) {
     for (const p of stationedAllParts(ctx)) {
         try {
             const left = sumArray(p.after.w) + sumArray(p.after.s);
+            let home = null;
             if (left <= 0) await pool.query('DELETE FROM stationed_fleets WHERE fleet_id = $1', [p.row.fleet_id]);
-            else {
+            else if (expelHome && p.ownerCommander) {
+                // Vertreiben (Angriff auf den eigenen Planeten) gewonnen: auch die Ueberlebenden (z.B. durch Reparatur) fliegen heim
+                await pool.query('DELETE FROM stationed_fleets WHERE fleet_id = $1', [p.row.fleet_id]);
+                home = stationedBuildHomeFleet(p.ownerCommander, p.row.host_coord, p.row.origin_coord, p.fleet, p.after.w, p.after.s, p.fleet.ressources, now);
+            } else {
                 const updated = Object.assign({}, p.fleet, { warships: p.after.w, ships: p.after.s });
                 await pool.query('UPDATE stationed_fleets SET fleet = $2::jsonb WHERE fleet_id = $1', [p.row.fleet_id, JSON.stringify(updated)]);
             }
             const owner = p.ownerCommander;
             if (owner) {
                 await sendCombatMail(owner, report, false, p.participant, false);
+                if (home) await sendMail(owner, 'Flotte vertrieben', `Deine stationierte Flotte wurde von ${p.row.host_coord} vertrieben. Sie fliegt nach ${home.destinationCoord} (Ankunft ${formatTimestamp(new Date(home.arrivalUtc))}).`, 1);   // LOCALIZE
                 await stationedSaveCommanderData(p.ownerPfid, owner);
             }
             log.push(`Stationierte Flotte ${p.row.fleet_id}: ${sumArray(p.before.w) + sumArray(p.before.s)} -> ${left} Schiffe`);
