@@ -54,6 +54,7 @@
 //  §25  KAMPF V2 (Rundenkampf, Mischbonus, Zivile in letzter Reihe): steht VOR §21; aktiv nur bei COMBAT_ENGINE=shadow|v2
 //  §26  GALAXIE-REGISTER (planet_registry): serverautoritative Belegung, Schritt 1 (nur lesen/befuellen); steht VOR §21
 //  §28  INVENTAR (PlayFab Internal Data "inventory"): Kisten (Rohstoffe Ress01-10, Schiffe), Oeffnen, Admin-Vergabe "#inv"; steht VOR §21
+//  §39  ANGEMELDET BLEIBEN (remember_tokens, POST /auth/remember|remembered-login|forget|forget-all; Geraete-Kennung, nur Pruefsumme gespeichert); steht VOR §21
 //  §37  TAEGLICHE AUFGABEN (daily_quest_state, GET /daily, POST /daily/claim; Katalog von Tools/Daily/sync_daily.js); steht VOR §21
 //  §36  PIRATEN / EnemyNPC (npc_clans/_bases/_raids/_events, ein Clan je Sektor, GET /npc/..., NPC-Verteidiger in resolveCombat, Admin "#npc"); steht VOR §21
 //  §35  ALLIANZKASSE (alliance_treasury/_log, /alliance-treasury, Einzahlen + Handelssteuer, nichts entnehmbar, Admin "#kasse"); steht VOR §21
@@ -93,7 +94,7 @@ app.use((req, res, next) => (req.path === '/admin/db-import' ? importJsonParser(
 
 // -------------------------------------------------------
 // CORS — WICHTIG für WebGL-Builds!
-// Der WebGL-Build läuft im Browser (auf itch.io), Anfragen an
+// Der WebGL-Build läuft im Browser (auf GitHub Pages), Anfragen an
 // virgo-server.onrender.com sind also Cross-Origin-Requests. Ohne
 // diese Header blockiert der Browser den Request stillschweigend,
 // bevor er den Server überhaupt erreicht (im Unity-Editor tritt das
@@ -148,6 +149,7 @@ const AUTH_POLICY = [
     ['*',    /^\/$/,                           'public'],   // Startseite / Render-Healthcheck
     ['GET',  /^\/legal-texts$/,                'public'],   // AGB muessen VOR dem Login lesbar sein
     ['POST', /^\/supportMessage$/,             'public'],   // Support-Formular auch ohne Login
+    ['POST', /^\/auth\/(remembered-login|forget)$/, 'public'],  // NEU 23.10.2026 (§39): Anmeldung mit Geraete-Kennung, vor dem Login
     ['*',    /^\/serverTick$/,                 'internal'], // cron-job.org, kein Spieler-Ticket
     ['*',    /^\/devtodos(\/.*)?$/,            'keyed'],    // eigener ADMIN_KEY
     ['GET',  /^\/admin\/reports$/,             'keyed'],    // eigener ADMIN_KEY
@@ -1269,6 +1271,15 @@ async function initDatabase() {
         await pool.query(`CREATE TABLE IF NOT EXISTS daily_quest_state (
             commander_id INTEGER NOT NULL, day_key TEXT NOT NULL, quest_id TEXT NOT NULL, claimed_at TIMESTAMPTZ NOT NULL DEFAULT now(),
             reward JSONB NULL, PRIMARY KEY (commander_id, day_key, quest_id));`);
+        // NEU 23.10.2026 (§37 Wochenplan): gemeldete und geprueft Ereignisse je Spieler und Tag (Ausbau, Forschung, eigene Transporte, Freundschaftsanfragen)
+        await pool.query(`CREATE TABLE IF NOT EXISTS daily_events (
+            commander_id INTEGER NOT NULL, day_key TEXT NOT NULL, kind TEXT NOT NULL, ref TEXT NOT NULL, created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+            PRIMARY KEY (commander_id, day_key, kind, ref));`);
+        // NEU 23.10.2026 (§39 Angemeldet bleiben): nur Pruefsummen der Geraete-Kennungen (nicht in DB_EXPORT_TABLES)
+        await pool.query(`CREATE TABLE IF NOT EXISTS remember_tokens (
+            id SERIAL PRIMARY KEY, playfab_id TEXT NOT NULL, token_hash TEXT NOT NULL UNIQUE, created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+            last_used_at TIMESTAMPTZ NOT NULL DEFAULT now(), expires_at TIMESTAMPTZ NOT NULL);`);
+        await pool.query(`CREATE INDEX IF NOT EXISTS idx_remember_tokens_playfab ON remember_tokens (playfab_id);`);
         await pool.query(`CREATE TABLE IF NOT EXISTS planet_freed (id SERIAL PRIMARY KEY, coord TEXT NOT NULL, freed_at TIMESTAMPTZ NOT NULL DEFAULT now());`);
         await pool.query(`CREATE INDEX IF NOT EXISTS idx_planet_freed_time ON planet_freed (freed_at);`);
 
@@ -3159,6 +3170,7 @@ app.post('/relationships/friend-request', async (req, res) => {
         );
         if (result.rows.length === 0)
             return res.status(400).json({ success: false, error: 'Beziehung ist nicht neutral, Anfrage nicht möglich.' });
+        await dailyRecord(commanderId, 'friend_request', String(targetCommanderId), new Date());   // NEU 23.10.2026: Tagesaufgabe "Freundschaftsanfrage"
         res.json({ success: true, relationship: result.rows[0] });
     } catch (error) {
         console.error('[Server] friend-request Fehler:', error.message);
@@ -4437,7 +4449,7 @@ const DB_EXPORT_TABLES = ['alliances', 'alliance_ranks', 'alliance_members', 'al
     'support_messages', 'player_reports', 'shop_items', 'promo_codes', 'promo_redemptions', 'giftbox_claims', 'giftbox_golden_claims',
     'market_offers', 'transport_deliveries', 'planet_registry', 'combat_reports', 'attack_traces', 'processed_fleets',
     'galaxy_sectors', 'galaxy_config', 'galaxy_texts', 'stationed_fleets', 'achievement_state', 'achievement_locks', 'achievement_log', 'alliance_treasury', 'alliance_treasury_log',
-    'npc_clans', 'npc_bases', 'npc_raids', 'npc_events', 'daily_quest_state', 'combat_points_log'];
+    'npc_clans', 'npc_bases', 'npc_raids', 'npc_events', 'daily_quest_state', 'daily_events', 'combat_points_log'];
 app.get('/admin/db-export', async (req, res) => {
     if (process.env.DB_EXPORT_ENABLED !== 'true') return res.status(404).json({ success: false, error: 'Nicht verfuegbar.' });
     if (!adminKeyOk(req.query.key)) return res.status(403).json({ success: false, error: 'Nicht autorisiert' });
@@ -6865,6 +6877,7 @@ async function deleteAccountDataFor(playFabId, commanderId) {
     const summary = {};
     try {
         await client.query('BEGIN');
+        await client.query('DELETE FROM remember_tokens WHERE playfab_id = $1', [playFabId]);   // NEU 23.10.2026 (§39)
 
         if (commanderId !== null) {
             const memberResult = await client.query(
@@ -10507,6 +10520,19 @@ const ACHV_CATALOG = [
     {"id":"eco_sale_1","cat":"wirtschaft","cond":{"t":"count","s":"marketSales","n":1},"reward":{"random":1}},
     {"id":"eco_sale_10","cat":"wirtschaft","cond":{"t":"count","s":"marketSales","n":10},"reward":{"random":2}},
     {"id":"eco_buy_1","cat":"wirtschaft","cond":{"t":"count","s":"marketPurchases","n":1},"reward":{"random":1}},
+    {"id":"eco_buy_10","cat":"wirtschaft","cond":{"t":"count","s":"marketPurchases","n":10},"reward":{"random":2}},
+    {"id":"eco_sale_50","cat":"wirtschaft","cond":{"t":"count","s":"marketSales","n":50},"reward":{"random":3}},
+    {"id":"eco_sale_250","cat":"wirtschaft","cond":{"t":"count","s":"marketSales","n":250},"reward":{"items":[{"i":"crate_ship_1","q":2}]}},
+    {"id":"eco_cont_1","cat":"wirtschaft","cond":{"t":"ships","i":1,"n":1},"reward":{"random":1}},
+    {"id":"eco_cont_5","cat":"wirtschaft","cond":{"t":"ships","i":1,"n":5},"reward":{"random":2}},
+    {"id":"eco_cont_25","cat":"wirtschaft","cond":{"t":"ships","i":1,"n":25},"reward":{"items":[{"i":"crate_ship_1","q":1}]}},
+    {"id":"eco_cont_100","cat":"wirtschaft","cond":{"t":"ships","i":1,"n":100},"reward":{"items":[{"i":"crate_ship_1","q":3}]}},
+    {"id":"eco_trans_1","cat":"wirtschaft","cond":{"t":"count","s":"transportsSent","n":1},"reward":{"random":1}},
+    {"id":"eco_trans_10","cat":"wirtschaft","cond":{"t":"count","s":"transportsSent","n":10},"reward":{"random":2}},
+    {"id":"eco_trans_50","cat":"wirtschaft","cond":{"t":"count","s":"transportsSent","n":50},"reward":{"random":3}},
+    {"id":"eco_trans_250","cat":"wirtschaft","cond":{"t":"count","s":"transportsSent","n":250},"reward":{"items":[{"i":"crate_ship_1","q":2}]}},
+    {"id":"eco_guest_5","cat":"wirtschaft","cond":{"t":"count","s":"transportRecipients","n":5},"reward":{"random":2}},
+    {"id":"eco_guest_20","cat":"wirtschaft","cond":{"t":"count","s":"transportRecipients","n":20},"reward":{"random":4}},
     {"id":"first_warship","cat":"militaer","cond":{"t":"researchAll","r":[["weapon01",1],["shield01",1]]},"reward":{"random":1}},
     {"id":"mil_win_1","cat":"militaer","cond":{"t":"count","s":"combatWins","n":1},"reward":{"random":1}},
     {"id":"mil_win_10","cat":"militaer","cond":{"t":"count","s":"combatWins","n":10},"reward":{"random":2}},
@@ -10542,7 +10568,16 @@ const ACHV_CATALOG = [
     {"id":"exp_stationed","cat":"expansion","cond":{"t":"count","s":"stationed","n":1},"reward":{"random":1}},
     {"id":"exp_treasury_1","cat":"expansion","cond":{"t":"count","s":"treasuryDeposits","n":1},"reward":{"random":1}},
     {"id":"exp_treasury_10","cat":"expansion","cond":{"t":"count","s":"treasuryDeposits","n":10},"reward":{"random":2}},
-    {"id":"exp_treasury_value","cat":"expansion","cond":{"t":"count","s":"treasuryValue","n":100000},"reward":{"random":2}}
+    {"id":"exp_treasury_value","cat":"expansion","cond":{"t":"count","s":"treasuryValue","n":100000},"reward":{"random":2}},
+    {"id":"exp_colony_2","cat":"expansion","cond":{"t":"count","s":"colonies","n":2},"reward":{"random":1}},
+    {"id":"exp_colony_8","cat":"expansion","cond":{"t":"count","s":"colonies","n":8},"reward":{"items":[{"i":"crate_ship_3","q":1}]}},
+    {"id":"exp_colship_1","cat":"expansion","cond":{"t":"ships","i":3,"n":1},"reward":{"random":1}},
+    {"id":"exp_colship_5","cat":"expansion","cond":{"t":"ships","i":3,"n":5},"reward":{"random":3}},
+    {"id":"exp_nobel","cat":"expansion","cond":{"t":"all","parts":[{"t":"ships","i":1,"n":10},{"t":"research","f":"recycling","l":3},{"t":"count","s":"transportsSent","n":25},{"t":"count","s":"colonies","n":3}]},"reward":{"items":[{"i":"crate_ship_3","q":1},{"i":"crate_ship_1","q":3}]}},
+    {"id":"exp_daily_7","cat":"expansion","cond":{"t":"count","s":"dailyDays","n":7},"reward":{"random":2}},
+    {"id":"exp_daily_30","cat":"expansion","cond":{"t":"count","s":"dailyDays","n":30},"reward":{"random":4}},
+    {"id":"exp_daily_100","cat":"expansion","cond":{"t":"count","s":"dailyDays","n":100},"reward":{"items":[{"i":"crate_warship_0","q":3}]}},
+    {"id":"exp_daily_civ","cat":"expansion","cond":{"t":"count","s":"civDailies","n":20},"reward":{"random":3}}
 ];
 // ACHV-KATALOG-ENDE
 
@@ -10561,7 +10596,12 @@ const ACHV_COUNTERS = {
     alliance:        `SELECT COUNT(*)::int AS n FROM alliance_members WHERE commander_id = $1`,
     stationed:       `SELECT COUNT(*)::int AS n FROM stationed_fleets WHERE owner_commander_id = $1`,
     treasuryDeposits: `SELECT COUNT(*)::int AS n FROM alliance_treasury_log WHERE commander_id = $1 AND kind = 'deposit'`,
-    treasuryValue:   `SELECT COALESCE(SUM(value_points), 0)::bigint AS n FROM alliance_treasury_log WHERE commander_id = $1 AND kind IN ('deposit', 'tax')`
+    treasuryValue:   `SELECT COALESCE(SUM(value_points), 0)::bigint AS n FROM alliance_treasury_log WHERE commander_id = $1 AND kind IN ('deposit', 'tax')`,
+    // NEU 23.10.2026: friedliche Erfolge (Logistik, Tagesaufgaben)
+    transportsSent:       `SELECT COUNT(*)::int AS n FROM transport_deliveries WHERE sender_commander_id = $1 AND recipient_commander_id <> $1`,
+    transportRecipients:  `SELECT COUNT(DISTINCT recipient_commander_id)::int AS n FROM transport_deliveries WHERE sender_commander_id = $1 AND recipient_commander_id <> $1`,
+    dailyDays:            `SELECT COUNT(DISTINCT day_key)::int AS n FROM daily_quest_state WHERE commander_id = $1`,
+    civDailies:           `SELECT COUNT(*)::int AS n FROM daily_quest_state WHERE commander_id = $1 AND (quest_id ~ '_Civ[12]$' OR quest_id IN ('Daily_Alt_Markt', 'Daily_Alt_Kauf'))`
 };
 
 // Auswertungs-Kontext: laedt Spielerdaten erst, wenn eine Bedingung sie braucht (und nur einmal je Anfrage)
@@ -10611,6 +10651,8 @@ function achvTarget(cond) {
         case 'building': case 'research': case 'researchSum': return cond.l;
         case 'researchAll': return cond.r.length;
         case 'count': return cond.n;
+        case 'ships': return cond.n;
+        case 'all': return cond.parts.length;
         case 'tutorial': return 4;
         default: return 1;
     }
@@ -10627,6 +10669,17 @@ async function achvProgress(def, ctx) {
             return clamp(best, c.l);
         }
         case 'research': return clamp((await ctx.commander())[c.f], c.l);
+        case 'ships': {          // NEU 23.10.2026: so viele Schiffe dieser Art besitzen (alle Planeten + Flotten unterwegs)
+            let sum = 0;
+            for (const p of await ctx.planets()) sum += Math.max(0, Number(p.ships && p.ships[c.i]) || 0);
+            for (const fl of ((await ctx.commander()).activeFleets || [])) sum += Math.max(0, Number(fl && fl.ships && fl.ships[c.i]) || 0);
+            return clamp(sum, c.n);
+        }
+        case 'all': {            // NEU 23.10.2026: alle Teilbedingungen gleichzeitig; Fortschritt = Anzahl erfuellter Teile
+            let done = 0;
+            for (const part of c.parts) { const pr = await achvProgress({ cond: part }, ctx); if (pr.current >= pr.target) done++; }
+            return clamp(done, c.parts.length);
+        }
         case 'researchAll': {
             const cm = await ctx.commander();
             return clamp(c.r.filter(([f, l]) => (Number(cm[f]) || 0) >= l).length, c.r.length);
@@ -11200,7 +11253,7 @@ const NPC_CLANS = [
     {"sector":6,"id":"Clan06","name":"Leerenschwarm","motto":"Wir sind viele.","lore":"Niemand weiß, woher sie kommen. Sie fliegen in riesigen Schwärmen kleiner Schiffe und überrennen jeden, der nicht genug Feuerkraft mitbringt.","color":"9B6BD6","strength":1.75,"mix":[2,0.8,0.6,0.6],"focus":"weapon","counter":"Flächenwaffen und Trägerverbände: gegen Schwärme zählt die Zahl der Treffer."}
 ];
 const NPC_SHIP_POWER = [10,30,70,1000];
-const NPC_RULES = {"dangerSteps":[100,300,1000,4000],"stockHours":24,"regenMinutes":60,"heatPerRaid":1,"heatHalfLifeDays":3,"heatRegenFactor":0.15,"regenMinutesMin":20,"baseSpacingMin":2,"baseSpacingMax":3,"basePlanetMax":3,"lootFactors":[1,0.5,0.25,0.1],"strengthTopN":5,"takeoverMax":8,"outpostShare":0.5};
+const NPC_RULES = {"dangerSteps":[100,300,1000,4000],"stockHours":24,"regenMinutes":60,"heatPerRaid":1,"heatHalfLifeDays":3,"heatRegenFactor":0.15,"regenMinutesMin":20,"baseSpacingMin":2,"baseSpacingMax":3,"basePlanetMax":3,"lootFactors":[1,0.5,0.25,0.1],"strengthTopN":5,"takeoverMax":8,"outpostShare":0.5,"beginner":{"tierAPercent":30,"tierBPercent":25,"outpostMaxStage":3,"jitter":0.3}};
 // PIRATEN-KATALOG-ENDE
 
 const NPC_OWNER_BASE = 910000;
@@ -11245,7 +11298,39 @@ function npcStrengthAt(clan, stageIdx) {
     return 1 + (clan.strength - 1) * f;
 }
 
-function npcShipsFor(clan, stageIdx, outpost) {
+// EINSTEIGERPOSTEN (NEU 23.10.2026): Die Sektorstufe folgt den staerksten Spielern der Nachbarschaft. Damit Neulinge auch in einem Sektor
+// voller Veteranen Piraten finden, die sie schlagen koennen, bleibt ein fester Teil der Posten (je Koordinate, deterministisch) auf niedriger
+// Stufe: tierA = Stufe 0 (nur Jaeger), tierB = hoechstens Stufe 1. Aussenposten (uebernommene Planeten) wachsen hoechstens bis outpostMaxStage.
+// Einsteiger- und Aussenposten haben je Koordinate +-jitter Schiffe ("ein paar Jaeger, mal mehr, mal weniger"). Zahlen: Tools/Piraten/piraten_katalog.js.
+function npcCoordHash(coord, salt) {
+    const p = String(coord).split(':').map(x => parseInt(x, 10) || 0);
+    return galaxyHash(p[0] | 0, p[1] | 0, (((p[2] | 0) * 37) + (p[3] | 0)) | 0, salt | 0);
+}
+function npcBaseTier(base) {            // 'outpost' | 'a' | 'b' | 'normal'
+    const B = NPC_RULES.beginner;
+    if (!B || !base) return 'normal';
+    if (base.origin === 'takeover') return 'outpost';
+    const r = npcCoordHash(base.coord, 7101) % 100;
+    if (r < (B.tierAPercent || 0)) return 'a';
+    if (r < (B.tierAPercent || 0) + (B.tierBPercent || 0)) return 'b';
+    return 'normal';
+}
+function npcBaseStage(base, clanStage) {
+    const B = NPC_RULES.beginner;
+    const tier = npcBaseTier(base);
+    if (tier === 'a') return Math.min(clanStage, 0);
+    if (tier === 'b') return Math.min(clanStage, 1);
+    if (tier === 'outpost') return Math.min(clanStage, B && B.outpostMaxStage !== undefined ? B.outpostMaxStage : clanStage);
+    return clanStage;
+}
+function npcBaseJitter(base) {
+    const B = NPC_RULES.beginner;
+    if (!B || !B.jitter || npcBaseTier(base) === 'normal') return 1;
+    const u = (npcCoordHash(base.coord, 7102) % 2001) / 1000 - 1;      // -1 ... +1
+    return 1 + u * B.jitter;
+}
+
+function npcShipsFor(clan, stageIdx, outpost, jitter) {
     const st = NPC_STAGES[Math.max(0, Math.min(NPC_STAGES.length - 1, stageIdx))];
     const share = outpost ? NPC_RULES.outpostShare : 1;
     const strength = npcStrengthAt(clan, stageIdx);
@@ -11253,7 +11338,7 @@ function npcShipsFor(clan, stageIdx, outpost) {
     for (let i = 0; i < 4; i++) {
         const base = st.ships[i] || 0;
         if (base <= 0) continue;
-        out[i] = Math.max(1, Math.round(base * strength * (clan.mix[i] || 1) * share));
+        out[i] = Math.max(1, Math.round(base * strength * (clan.mix[i] || 1) * share * (jitter || 1)));
     }
     return out;
 }
@@ -11297,9 +11382,10 @@ function npcHeatNow(base, now) {
 }
 
 // Aktueller Zustand eines Stuetzpunkts (rein rechnerisch, ohne Datenbank)
-function npcBaseState(base, clan, stageIdx, now) {
+function npcBaseState(base, clan, clanStageIdx, now) {
     const outpost = base.origin === 'takeover';
-    const target = npcShipsFor(clan, stageIdx, outpost);
+    const stageIdx = npcBaseStage(base, clanStageIdx);                 // Einsteiger-/Aussenposten bleiben niedriger (NEU 23.10.2026)
+    const target = npcShipsFor(clan, stageIdx, outpost, npcBaseJitter(base));
     const stored = Array.isArray(base.ships) ? base.ships : [];
     const ships = new Array(10).fill(0);
     if (!base.last_fight) {
@@ -11321,7 +11407,7 @@ function npcBaseState(base, clan, stageIdx, now) {
         stock[i] = Math.min(cap[i], Math.floor((Number(storedStock[i]) || 0) + rates[i] * hours));
     }
     const power = npcPowerOf(ships);
-    return { ships, target, rates, stock, cap, power, danger: npcDangerOf(power), outpost, stageIdx };
+    return { ships, target, rates, stock, cap, power, danger: npcDangerOf(power), outpost, stageIdx, tier: npcBaseTier(base) };
 }
 
 function npcBerlinDayKey(now) {
@@ -11506,7 +11592,7 @@ async function npcPrepareDefense(coord, attackerCommanderId, now) {
     const n = done.rows[0] ? done.rows[0].n : 0;
     const lootFactor = NPC_RULES.lootFactors[Math.min(n, NPC_RULES.lootFactors.length - 1)];
 
-    const research = npcResearchFor(clan, stageIdx);
+    const research = npcResearchFor(clan, st.stageIdx);                 // Stufe des POSTENS (Einsteigerposten forschen weniger)
     const ownerId = npcOwnerId(base.sector_id);
     return {
         coord, clan, stageIdx, base, state: st, lootFactor, raidsToday: n,
@@ -11572,7 +11658,7 @@ function npcBaseView(base, clan, stageIdx, now, lootFactor) {
     const f = lootFactor === undefined ? 1 : lootFactor;
     return {
         coord: base.coord, name: base.name, origin: base.origin, sector: base.sector_id,
-        ships: st.ships.slice(0, 4), power: st.power, danger: st.danger,
+        ships: st.ships.slice(0, 4), power: st.power, danger: st.danger, starter: st.tier === 'a' || st.tier === 'b',
         stock: st.stock, cap: st.cap,
         lootable: st.stock.map((s, i) => (i >= 1 && i <= 3) ? Math.floor(s * LOOT_MAX_SHARE * f) : 0),
         lootFactor: f, raids: base.raids, defeats: base.defeats
@@ -11764,33 +11850,169 @@ setTimeout(() => { npcEnsureAll().catch(e => console.error('[Piraten] Start:', e
 //      Je Aufgabe (Katalog DAILY_CATALOG, erzeugt von Tools/Daily/sync_daily.js; Texte/Bilder liegen im Unity-Asset Assets/Quests/Daily/DailyNN.asset)
 //      prueft der SERVER Bedingung und Belohnung. Tageswechsel = Mitternacht deutscher Zeit. Abholen ist atomar (eine Zeile je Spieler/Tag/Aufgabe).
 //      Bedingungen: npc_raid_win = so viele Piraten-Angriffe heute GEWONNEN (npc_raids, nur Server-Daten).
-//      Routen: GET /daily?commanderId=, POST /daily/claim. Tabelle daily_quest_state (in DB_EXPORT_TABLES).
+//      NEU 23.10.2026: WOCHENPLAN - jeden Wochentag (deutsche Zeit) 7 Aufgaben: 2 Militaer (nur Piraten), 2 Zivil, 2 Bau/Forschung, 1 mit einem anderen Spieler
+//      (Katalog: Tools/Daily/daily_katalog.js). Fehlt eine Voraussetzung (Freund/Allianz/zweite Kolonie), gilt die Ersatzaufgabe. Zaehler stammen aus Server-Tabellen
+//      (npc_raids, market_offers, transport_deliveries, alliance_treasury_log, stationed_fleets) bzw. daily_events (Ausbau/Forschung/eigene Transporte: Client meldet,
+//      Server prueft gegen den Spielstand). Routen: GET /daily?commanderId=, POST /daily/claim, POST /daily/event. Tabellen daily_quest_state, daily_events (beide in DB_EXPORT_TABLES).
 // #####################################################################
 
 // DAILY-KATALOG-START (erzeugt von Tools/Daily/sync_daily.js aus daily_katalog.js - NICHT von Hand aendern)
+const DAILY_DAYS = [
+    {"name":"Montag","motto":"Blitzstart"},
+    {"name":"Dienstag","motto":"Handelstag"},
+    {"name":"Mittwoch","motto":"Forschertag"},
+    {"name":"Donnerstag","motto":"Grenzpatrouille"},
+    {"name":"Freitag","motto":"Großkampftag"},
+    {"name":"Samstag","motto":"Expeditionstag"},
+    {"name":"Sonntag","motto":"Gemeinschaftstag"}
+];
 const DAILY_CATALOG = [
-    {"id":"Daily01","cond":{"kind":"npc_raid_win","target":1},"reward":{"random":1}},
-    {"id":"Daily02","cond":{"kind":"npc_kills","target":25},"reward":{"random":1}},
-    {"id":"Daily03","cond":{"kind":"npc_raid_win","target":3},"reward":{"random":1}}
+    {"id":"Daily_Mo_Mil1","day":0,"cat":"mil","cond":{"kind":"npc_raid_win","target":1},"reward":{"items":[{"i":"crate_warship_0","q":1}]}},
+    {"id":"Daily_Mo_Mil2","day":0,"cat":"mil","cond":{"kind":"npc_kills","target":6},"reward":{"items":[{"i":"crate_warship_0","q":1}]}},
+    {"id":"Daily_Mo_Civ1","day":0,"cat":"civ","cond":{"kind":"own_transport","target":1},"reward":{"items":[{"i":"crate_ship_1","q":1}]},"needs":"colony","alt":"Daily_Alt_Markt"},
+    {"id":"Daily_Mo_Civ2","day":0,"cat":"civ","cond":{"kind":"market_offer","target":1},"reward":{"items":[{"i":"crate_ship_1","q":1}]}},
+    {"id":"Daily_Mo_Bau1","day":0,"cat":"bau","cond":{"kind":"build_start","target":1},"reward":{"random":1}},
+    {"id":"Daily_Mo_Bau2","day":0,"cat":"bau","cond":{"kind":"research_start","target":1},"reward":{"random":1}},
+    {"id":"Daily_Mo_Soz","day":0,"cat":"soz","cond":{"kind":"friend_request","target":1},"reward":{"random":2}},
+    {"id":"Daily_Di_Mil1","day":1,"cat":"mil","cond":{"kind":"npc_raid_win","target":2},"reward":{"items":[{"i":"crate_warship_0","q":1}]}},
+    {"id":"Daily_Di_Mil2","day":1,"cat":"mil","cond":{"kind":"npc_bases","target":2},"reward":{"items":[{"i":"crate_warship_0","q":1}]}},
+    {"id":"Daily_Di_Civ1","day":1,"cat":"civ","cond":{"kind":"market_buy","target":1},"reward":{"items":[{"i":"crate_ship_1","q":1}]}},
+    {"id":"Daily_Di_Civ2","day":1,"cat":"civ","cond":{"kind":"market_offer","target":2},"reward":{"items":[{"i":"crate_ship_1","q":1}]}},
+    {"id":"Daily_Di_Bau1","day":1,"cat":"bau","cond":{"kind":"build_start","target":1,"i":1},"reward":{"random":1}},
+    {"id":"Daily_Di_Bau2","day":1,"cat":"bau","cond":{"kind":"research_start","target":1},"reward":{"random":1}},
+    {"id":"Daily_Di_Soz","day":1,"cat":"soz","cond":{"kind":"transport_foreign","target":1},"reward":{"random":2}},
+    {"id":"Daily_Mi_Mil1","day":2,"cat":"mil","cond":{"kind":"npc_kills","target":12},"reward":{"items":[{"i":"crate_warship_0","q":1}]}},
+    {"id":"Daily_Mi_Mil2","day":2,"cat":"mil","cond":{"kind":"npc_raid_total","target":2},"reward":{"items":[{"i":"crate_warship_0","q":1}]}},
+    {"id":"Daily_Mi_Civ1","day":2,"cat":"civ","cond":{"kind":"own_transport","target":1},"reward":{"items":[{"i":"crate_ship_1","q":1}]},"needs":"colony","alt":"Daily_Alt_Markt"},
+    {"id":"Daily_Mi_Civ2","day":2,"cat":"civ","cond":{"kind":"own_transfer","target":1},"reward":{"items":[{"i":"crate_ship_1","q":1}]},"needs":"colony","alt":"Daily_Alt_Kauf"},
+    {"id":"Daily_Mi_Bau1","day":2,"cat":"bau","cond":{"kind":"research_start","target":1},"reward":{"random":1}},
+    {"id":"Daily_Mi_Bau2","day":2,"cat":"bau","cond":{"kind":"build_start","target":1,"i":2},"reward":{"random":1}},
+    {"id":"Daily_Mi_Soz","day":2,"cat":"soz","cond":{"kind":"treasury_deposit","target":1},"reward":{"random":2},"needs":"alliance","alt":"Daily_Alt_Freund"},
+    {"id":"Daily_Do_Mil1","day":3,"cat":"mil","cond":{"kind":"npc_raid_win","target":3},"reward":{"items":[{"i":"crate_warship_0","q":1}]}},
+    {"id":"Daily_Do_Mil2","day":3,"cat":"mil","cond":{"kind":"npc_kills","target":20},"reward":{"items":[{"i":"crate_warship_0","q":1}]}},
+    {"id":"Daily_Do_Civ1","day":3,"cat":"civ","cond":{"kind":"transport_friend","target":1},"reward":{"items":[{"i":"crate_ship_1","q":1}]},"needs":"friend","alt":"Daily_Alt_Transport"},
+    {"id":"Daily_Do_Civ2","day":3,"cat":"civ","cond":{"kind":"market_buy","target":1},"reward":{"items":[{"i":"crate_ship_1","q":1}]}},
+    {"id":"Daily_Do_Bau1","day":3,"cat":"bau","cond":{"kind":"build_start","target":1,"i":3},"reward":{"random":1}},
+    {"id":"Daily_Do_Bau2","day":3,"cat":"bau","cond":{"kind":"build_start","target":1,"i":4},"reward":{"random":1}},
+    {"id":"Daily_Do_Soz","day":3,"cat":"soz","cond":{"kind":"stationed_other","target":1},"reward":{"random":2},"needs":"friend","alt":"Daily_Alt_Freund"},
+    {"id":"Daily_Fr_Mil1","day":4,"cat":"mil","cond":{"kind":"npc_raid_win","target":5},"reward":{"items":[{"i":"crate_warship_0","q":1}]}},
+    {"id":"Daily_Fr_Mil2","day":4,"cat":"mil","cond":{"kind":"npc_kills","target":40},"reward":{"items":[{"i":"crate_warship_0","q":1}]}},
+    {"id":"Daily_Fr_Civ1","day":4,"cat":"civ","cond":{"kind":"own_transport","target":3},"reward":{"items":[{"i":"crate_ship_1","q":1}]},"needs":"colony","alt":"Daily_Alt_Markt"},
+    {"id":"Daily_Fr_Civ2","day":4,"cat":"civ","cond":{"kind":"market_offer","target":3},"reward":{"items":[{"i":"crate_ship_1","q":1}]}},
+    {"id":"Daily_Fr_Bau1","day":4,"cat":"bau","cond":{"kind":"build_start","target":2},"reward":{"random":1}},
+    {"id":"Daily_Fr_Bau2","day":4,"cat":"bau","cond":{"kind":"research_start","target":1},"reward":{"random":1}},
+    {"id":"Daily_Fr_Soz","day":4,"cat":"soz","cond":{"kind":"treasury_deposit","target":1},"reward":{"random":2},"needs":"alliance","alt":"Daily_Alt_Freund"},
+    {"id":"Daily_Sa_Mil1","day":5,"cat":"mil","cond":{"kind":"npc_raid_win","target":4},"reward":{"items":[{"i":"crate_warship_0","q":1}]}},
+    {"id":"Daily_Sa_Mil2","day":5,"cat":"mil","cond":{"kind":"npc_bases","target":3},"reward":{"items":[{"i":"crate_warship_0","q":1}]}},
+    {"id":"Daily_Sa_Civ1","day":5,"cat":"civ","cond":{"kind":"own_transport","target":2},"reward":{"items":[{"i":"crate_ship_1","q":1}]},"needs":"colony","alt":"Daily_Alt_Markt"},
+    {"id":"Daily_Sa_Civ2","day":5,"cat":"civ","cond":{"kind":"market_buy","target":2},"reward":{"items":[{"i":"crate_ship_1","q":1}]}},
+    {"id":"Daily_Sa_Bau1","day":5,"cat":"bau","cond":{"kind":"build_start","target":3},"reward":{"random":1}},
+    {"id":"Daily_Sa_Bau2","day":5,"cat":"bau","cond":{"kind":"research_start","target":1},"reward":{"random":1}},
+    {"id":"Daily_Sa_Soz","day":5,"cat":"soz","cond":{"kind":"transport_foreign","target":1},"reward":{"random":2}},
+    {"id":"Daily_So_Mil1","day":6,"cat":"mil","cond":{"kind":"npc_raid_total","target":1},"reward":{"items":[{"i":"crate_warship_0","q":1}]}},
+    {"id":"Daily_So_Mil2","day":6,"cat":"mil","cond":{"kind":"npc_kills","target":10},"reward":{"items":[{"i":"crate_warship_0","q":1}]}},
+    {"id":"Daily_So_Civ1","day":6,"cat":"civ","cond":{"kind":"own_transport","target":1},"reward":{"items":[{"i":"crate_ship_1","q":1}]},"needs":"colony","alt":"Daily_Alt_Markt"},
+    {"id":"Daily_So_Civ2","day":6,"cat":"civ","cond":{"kind":"market_offer","target":1},"reward":{"items":[{"i":"crate_ship_1","q":1}]}},
+    {"id":"Daily_So_Bau1","day":6,"cat":"bau","cond":{"kind":"build_start","target":1},"reward":{"random":1}},
+    {"id":"Daily_So_Bau2","day":6,"cat":"bau","cond":{"kind":"research_start","target":1},"reward":{"random":1}},
+    {"id":"Daily_So_Soz","day":6,"cat":"soz","cond":{"kind":"transport_friend","target":1},"reward":{"random":2},"needs":"friend","alt":"Daily_Alt_Transport"},
+    {"id":"Daily_Alt_Transport","day":-1,"cat":"soz","cond":{"kind":"transport_foreign","target":1},"reward":{"random":2}},
+    {"id":"Daily_Alt_Markt","day":-1,"cat":"civ","cond":{"kind":"market_offer","target":1},"reward":{"items":[{"i":"crate_ship_1","q":1}]}},
+    {"id":"Daily_Alt_Kauf","day":-1,"cat":"civ","cond":{"kind":"market_buy","target":1},"reward":{"items":[{"i":"crate_ship_1","q":1}]}},
+    {"id":"Daily_Alt_Freund","day":-1,"cat":"soz","cond":{"kind":"friend_request","target":1},"reward":{"random":2}}
 ];
 // DAILY-KATALOG-ENDE
 
+// Wochentag nach deutscher Zeit: 0 = Montag ... 6 = Sonntag
+function dailyWeekday(now) {
+    const p = getBerlinParts(now);
+    const d = new Date(Date.UTC(Number(p.year), Number(p.month) - 1, Number(p.day)));
+    return (d.getUTCDay() + 6) % 7;
+}
+
+// SQL-Baustein: Tag (deutsche Zeit) einer Zeitspalte als 'JJJJ-MM-TT' - dasselbe Format wie npcBerlinDayKey
+function dailyDaySql(col) { return `to_char(${col} AT TIME ZONE 'Europe/Berlin', 'YYYY-MM-DD')`; }
+
+// Freund/Allianzpartner: Freundschaft, ein weiteres Mitglied der eigenen Allianz oder Mitglied einer verbuendeten Allianz
+const DAILY_PARTNER_SQL = (me, other) => `(
+    EXISTS (SELECT 1 FROM player_relationships r WHERE r.status = 'friend'
+            AND ((r.commander_id_a = ${me} AND r.commander_id_b = ${other}) OR (r.commander_id_a = ${other} AND r.commander_id_b = ${me})))
+ OR EXISTS (SELECT 1 FROM alliance_members m1 JOIN alliance_members m2 ON m1.alliance_id = m2.alliance_id WHERE m1.commander_id = ${me} AND m2.commander_id = ${other})
+ OR EXISTS (SELECT 1 FROM alliance_members m1 JOIN alliance_members m2 ON m1.alliance_id <> m2.alliance_id
+            JOIN alliance_relationships ar ON ar.status = 'ally'
+                 AND ((ar.alliance_id_a = m1.alliance_id AND ar.alliance_id_b = m2.alliance_id) OR (ar.alliance_id_a = m2.alliance_id AND ar.alliance_id_b = m1.alliance_id))
+            WHERE m1.commander_id = ${me} AND m2.commander_id = ${other}))`;
+
+// Zaehler fuer EINEN Tag. Alles, was der Server selbst sieht (Kaempfe gegen Piraten, Handel, Transporte an andere, Kasse, Stationierung),
+// kommt direkt aus den Tabellen. Gebaeude/Forschung/eigene Transporte stehen in daily_events (vom Client gemeldet UND vom Server gegen den
+// Spielstand geprueft, siehe POST /daily/event). Spaeter gestartete Aufgaben zaehlen nie rueckwirkend ueber Mitternacht hinaus.
 async function dailyProgress(def, commanderId, dayKey) {
-    if (def.cond.kind === 'npc_raid_win') {
-        const r = await pool.query('SELECT COUNT(*)::int AS n FROM npc_raids WHERE commander_id = $1 AND day_key = $2 AND won = true', [commanderId, dayKey]);
-        return r.rows[0] ? r.rows[0].n : 0;
+    const one = async (sql, params) => { const r = await pool.query(sql, params); return r.rows[0] ? Number(r.rows[0].n) || 0 : 0; };
+    const c = def.cond, id = commanderId;
+    switch (c.kind) {
+        case 'npc_raid_win':   return one('SELECT COUNT(*)::int AS n FROM npc_raids WHERE commander_id = $1 AND day_key = $2 AND won = true', [id, dayKey]);
+        case 'npc_raid_total': return one('SELECT COUNT(*)::int AS n FROM npc_raids WHERE commander_id = $1 AND day_key = $2', [id, dayKey]);
+        case 'npc_kills':      return one('SELECT COALESCE(SUM(kills), 0)::int AS n FROM npc_raids WHERE commander_id = $1 AND day_key = $2', [id, dayKey]);
+        case 'npc_bases':      return one('SELECT COUNT(DISTINCT coord)::int AS n FROM npc_raids WHERE commander_id = $1 AND day_key = $2 AND won = true', [id, dayKey]);
+        case 'market_offer':   return one(`SELECT COUNT(*)::int AS n FROM market_offers WHERE seller_commander_id = $1 AND ${dailyDaySql('created_at')} = $2`, [id, dayKey]);
+        case 'market_buy':     return one(`SELECT COUNT(*)::int AS n FROM market_offers WHERE buyer_commander_id = $1 AND seller_commander_id <> $1 AND status = 'sold' AND ${dailyDaySql('sold_at')} = $2`, [id, dayKey]);
+        case 'market_sold':    return one(`SELECT COUNT(*)::int AS n FROM market_offers WHERE seller_commander_id = $1 AND buyer_commander_id IS NOT NULL AND buyer_commander_id <> $1 AND status = 'sold' AND ${dailyDaySql('sold_at')} = $2`, [id, dayKey]);
+        case 'transport_foreign': return one(`SELECT COUNT(*)::int AS n FROM transport_deliveries WHERE sender_commander_id = $1 AND recipient_commander_id <> $1 AND ${dailyDaySql('created_at')} = $2`, [id, dayKey]);
+        case 'transport_friend':  return one(`SELECT COUNT(*)::int AS n FROM transport_deliveries t WHERE t.sender_commander_id = $1 AND t.recipient_commander_id <> $1 AND ${dailyDaySql('t.created_at')} = $2
+                                              AND ${DAILY_PARTNER_SQL('t.sender_commander_id', 't.recipient_commander_id')}`, [id, dayKey]);
+        case 'treasury_deposit':  return one(`SELECT COUNT(*)::int AS n FROM alliance_treasury_log WHERE commander_id = $1 AND kind = 'deposit' AND ${dailyDaySql('created_at')} = $2`, [id, dayKey]);
+        case 'stationed_other':   return one(`SELECT COUNT(*)::int AS n FROM stationed_fleets WHERE owner_commander_id = $1 AND host_commander_id <> $1 AND ${dailyDaySql('stationed_at')} = $2`, [id, dayKey]);
+        case 'friend_request': case 'build_start': case 'research_start': case 'own_transport': case 'own_transfer': {
+            if (c.i !== undefined && c.kind === 'build_start')
+                return one('SELECT COUNT(*)::int AS n FROM daily_events WHERE commander_id = $1 AND day_key = $2 AND kind = $3 AND ref LIKE $4', [id, dayKey, c.kind, c.i + '|%']);
+            return one('SELECT COUNT(*)::int AS n FROM daily_events WHERE commander_id = $1 AND day_key = $2 AND kind = $3', [id, dayKey, c.kind]);
+        }
+        default: return 0;
     }
-    if (def.cond.kind === 'npc_kills') {
-        const r = await pool.query('SELECT COALESCE(SUM(kills), 0)::int AS n FROM npc_raids WHERE commander_id = $1 AND day_key = $2', [commanderId, dayKey]);
-        return r.rows[0] ? r.rows[0].n : 0;
+}
+
+// Ist die Voraussetzung einer Aufgabe erfuellt? (sonst erscheint die Ersatzaufgabe "alt")
+async function dailyNeedsMet(needs, commanderId) {
+    if (!needs) return true;
+    const exists = async (sql) => (await pool.query(sql, [commanderId])).rows.length > 0;
+    if (needs === 'alliance') return exists('SELECT 1 FROM alliance_members WHERE commander_id = $1 LIMIT 1');
+    if (needs === 'friend')   return exists(`SELECT 1 FROM (
+            SELECT 1 FROM player_relationships WHERE status = 'friend' AND (commander_id_a = $1 OR commander_id_b = $1)
+            UNION ALL SELECT 1 FROM alliance_members m1 JOIN alliance_members m2 ON m1.alliance_id = m2.alliance_id AND m2.commander_id <> m1.commander_id WHERE m1.commander_id = $1
+            UNION ALL SELECT 1 FROM alliance_members m1 JOIN alliance_relationships ar ON ar.status = 'ally' AND (ar.alliance_id_a = m1.alliance_id OR ar.alliance_id_b = m1.alliance_id) WHERE m1.commander_id = $1
+        ) x LIMIT 1`);
+    if (needs === 'colony')   return (await pool.query(`SELECT COUNT(*)::int AS n FROM planet_registry WHERE owner_commander_id = $1 AND kind = 'player'`, [commanderId])).rows[0].n >= 2;
+    return true;
+}
+
+// Die Aufgaben dieses Spielers fuer den Tag: je Platz im Wochenplan die Aufgabe, bzw. ihre Ersatzaufgabe, wenn die Voraussetzung fehlt.
+async function dailyListFor(commanderId, now) {
+    const wd = dailyWeekday(now);
+    const list = [], used = new Set();
+    for (const def of DAILY_CATALOG.filter(d => d.day === wd)) {
+        let use = def;
+        if (def.needs && !(await dailyNeedsMet(def.needs, commanderId))) {
+            const alt = def.alt ? DAILY_CATALOG.find(x => x.id === def.alt) : null;
+            if (alt && !used.has(alt.id)) use = alt;
+        }
+        used.add(use.id);
+        list.push(use);
     }
-    return 0;
+    return list;
 }
 
 function dailySecondsToReset(now) {
     const p = getBerlinParts(now);
     const secOfDay = Number(p.hour) * 3600 + Number(p.minute) * 60 + Number(p.second);
     return Math.max(1, 86400 - secOfDay);
+}
+
+// Ereignis fuer einen Spieler und Tag festhalten (je Art + Kennung nur einmal)
+async function dailyRecord(commanderId, kind, ref, now) {
+    try {
+        await pool.query('INSERT INTO daily_events (commander_id, day_key, kind, ref) VALUES ($1, $2, $3, $4) ON CONFLICT DO NOTHING',
+            [commanderId, npcBerlinDayKey(now || new Date()), kind, String(ref).slice(0, 120)]);
+    } catch (e) { console.error('[Daily] Ereignis nicht gespeichert:', e.message); }
 }
 
 app.get('/daily', async (req, res) => {
@@ -11801,15 +12023,19 @@ app.get('/daily', async (req, res) => {
     try {
         const now = new Date();
         const dayKey = npcBerlinDayKey(now);
+        const wd = dailyWeekday(now);
         const claimed = (await pool.query('SELECT quest_id FROM daily_quest_state WHERE commander_id = $1 AND day_key = $2', [caller.commanderId, dayKey])).rows.map(x => x.quest_id);
         const quests = [];
-        for (const def of DAILY_CATALOG) {
-            const current = await dailyProgress(def, caller.commanderId, dayKey);
-            quests.push({ id: def.id, current: Math.min(current, def.cond.target), target: def.cond.target, claimed: claimed.includes(def.id),
-                          reward: def.reward.random ? `${def.reward.random}x zufällige Kleine Kiste` : '' });
+        for (const def of await dailyListFor(caller.commanderId, now)) {
+            let current = 0;
+            try { current = await dailyProgress(def, caller.commanderId, dayKey); }
+            catch (e) { console.error('[Daily] Zaehler ' + def.cond.kind + ' nicht lesbar:', e.message); }   // eine kaputte Abfrage darf nicht alle Aufgaben lahmlegen
+            quests.push({ id: def.id, cat: def.cat, current: Math.min(current, def.cond.target), target: def.cond.target, claimed: claimed.includes(def.id),
+                          reward: achvRewardText(def.reward) });
         }
         const lock = await achvActiveLock(caller.commanderId);
-        res.json({ success: true, day: dayKey, resetInSeconds: dailySecondsToReset(now), locked: !!lock, quests });
+        const dayInfo = DAILY_DAYS[wd] || { name: '', motto: '' };
+        res.json({ success: true, day: dayKey, weekday: wd, dayName: dayInfo.name, motto: dayInfo.motto, resetInSeconds: dailySecondsToReset(now), locked: !!lock, quests });
     } catch (error) {
         console.error('[Daily] Abfrage:', error.message);
         res.status(500).json({ success: false, error: 'Abfrage fehlgeschlagen.' });
@@ -11818,7 +12044,7 @@ app.get('/daily', async (req, res) => {
 
 app.post('/daily/claim', async (req, res) => {
     const commanderId = parseInt(req.body && req.body.commanderId, 10);
-    const questId = String(req.body && req.body.questId || '').slice(0, 40);
+    const questId = String(req.body && req.body.questId || '').slice(0, 60);
     if (!commanderId || !questId) return res.status(400).json({ success: false, error: 'Ungültige Angaben.' });
     const caller = await requireCaller(req, res, { commanderId });
     if (!caller) return;
@@ -11830,6 +12056,9 @@ app.post('/daily/claim', async (req, res) => {
         if (lock) return res.status(423).json({ success: false, error: 'Belohnungen sind vorübergehend gesperrt.', lockedUntil: lock.until });
         const now = new Date();
         const dayKey = npcBerlinDayKey(now);
+        // nur Aufgaben, die dem Spieler HEUTE gestellt sind (Wochentag + Ersatzaufgaben)
+        const today = await dailyListFor(cid, now);
+        if (!today.some(x => x.id === questId)) return res.status(400).json({ success: false, error: 'Diese Aufgabe gehört nicht zu heute.' });
         const current = await dailyProgress(def, cid, dayKey);
         if (current < def.cond.target) return res.status(400).json({ success: false, error: 'Diese Aufgabe ist heute noch nicht erledigt.', current, target: def.cond.target });
         const claim = await pool.query(
@@ -11849,6 +12078,182 @@ app.post('/daily/claim', async (req, res) => {
     } catch (error) {
         console.error('[Daily] Abholen Fehler:', error.message);
         res.status(500).json({ success: false, error: 'Abholen gerade nicht möglich.' });
+    }
+});
+
+// Meldung des Clients "ich habe etwas gestartet" (Ausbau, Forschung, eigener Transport/Transfer). Der Server glaubt sie nicht blind, sondern prueft
+// sie gegen den gespeicherten Spielstand (commander_data in PlayFab): der Auftrag/die Flotte mit genau dieser Kennung und HEUTIGER Startzeit muss
+// dort stehen. Weil der Client erst NACH dem Speichern meldet, reichen wenige kurze Wiederholungen. Je Spieler und Tag hoechstens DAILY_EVENT_MAX Meldungen.
+const DAILY_EVENT_KINDS = ['build_start', 'research_start', 'own_transport', 'own_transfer'];
+const DAILY_EVENT_MAX = 60;
+
+function dailyIsToday(isoString, now) {
+    const t = new Date(isoString);
+    return !isNaN(t.getTime()) && npcBerlinDayKey(t) === npcBerlinDayKey(now);
+}
+
+async function dailyVerifyEvent(playFabId, commanderId, kind, ref, now) {
+    const r = await playfabServer('/Server/GetUserData', { PlayFabId: playFabId, Keys: ['commander_data'] });
+    const cm = r && r.Data && r.Data.commander_data ? JSON.parse(r.Data.commander_data.Value) : null;
+    if (!cm) return false;
+    if (kind === 'build_start') {
+        const parts = String(ref).split('|');
+        const bi = parseInt(parts[0], 10), start = parts.slice(1).join('|');
+        return (cm.activeBuildOrders || []).some(o => o && Number(o.buildingIndex) === bi && o.startTimeUtc === start && dailyIsToday(start, now));
+    }
+    if (kind === 'research_start') {
+        const a = cm.activeResearch;
+        return !!(a && a.startTimeUtc === ref && dailyIsToday(ref, now));
+    }
+    // own_transport / own_transfer: Flotte mit dieser Kennung, heute gestartet, kein Rueckflug, Ziel = eigener Planet
+    const fleet = (cm.activeFleets || []).find(f => f && f.fleetId === ref);
+    if (!fleet || fleet.isReturnFlight || !dailyIsToday(fleet.departureUtc, now)) return false;
+    const m = fleet.mission;
+    const isTransport = (m === 1 || m === 2 || m === 'Transport' || m === 'Verladen');
+    const isTransfer = (m === 0 || m === 'Transfer');
+    if (kind === 'own_transport' && !isTransport) return false;
+    if (kind === 'own_transfer' && !isTransfer) return false;
+    if (kind === 'own_transport' && !(fleet.ressources || []).some(x => Number(x) > 0)) return false;
+    if (kind === 'own_transfer' && !(fleet.warships || []).concat(fleet.ships || []).some(x => Number(x) > 0)) return false;
+    const reg = await pool.query(`SELECT 1 FROM planet_registry WHERE coord = $1 AND owner_commander_id = $2 AND kind = 'player'`, [fleet.destinationCoord, commanderId]);
+    return reg.rows.length > 0 && fleet.originCoord !== fleet.destinationCoord;
+}
+
+app.post('/daily/event', async (req, res) => {
+    const commanderId = parseInt(req.body && req.body.commanderId, 10);
+    const kind = String(req.body && req.body.kind || '');
+    const ref = String(req.body && req.body.ref || '').slice(0, 120);
+    if (!commanderId || !ref || !DAILY_EVENT_KINDS.includes(kind)) return res.status(400).json({ success: false, error: 'Ungültige Angaben.' });
+    const caller = await requireCaller(req, res, { commanderId });
+    if (!caller) return;
+    try {
+        const now = new Date();
+        const dayKey = npcBerlinDayKey(now);
+        const n = (await pool.query('SELECT COUNT(*)::int AS n FROM daily_events WHERE commander_id = $1 AND day_key = $2', [caller.commanderId, dayKey])).rows[0].n;
+        if (n >= DAILY_EVENT_MAX) return res.status(429).json({ success: false, error: 'Für heute sind genug Meldungen eingegangen.' });
+        const have = await pool.query('SELECT 1 FROM daily_events WHERE commander_id = $1 AND day_key = $2 AND kind = $3 AND ref = $4', [caller.commanderId, dayKey, kind, ref]);
+        if (have.rows.length > 0) return res.json({ success: true, duplicate: true });
+        let ok = false;
+        for (let attempt = 0; attempt < 3 && !ok; attempt++) {
+            if (attempt > 0) await new Promise(r => setTimeout(r, 1500));
+            ok = await dailyVerifyEvent(caller.playFabId, caller.commanderId, kind, ref, now);
+        }
+        if (!ok) return res.status(409).json({ success: false, error: 'Nicht bestätigt.' });
+        await dailyRecord(caller.commanderId, kind, ref, now);
+        res.json({ success: true });
+    } catch (error) {
+        console.error('[Daily] Meldung Fehler:', error.message);
+        res.status(500).json({ success: false, error: 'Meldung gerade nicht möglich.' });
+    }
+});
+
+// #####################################################################
+// §39  ANGEMELDET BLEIBEN (remember_tokens, POST /auth/remember, /auth/remembered-login, /auth/forget, /auth/forget-all) — NEU 23.10.2026
+//      Spieler setzt beim Login das Haekchen "Angemeldet bleiben": der Server erzeugt eine zufaellige Geraete-Kennung (32 Byte), speichert nur
+//      deren SHA-256-Pruefsumme (nie die Kennung selbst) und gibt die Kennung EINMAL an das Geraet. Beim naechsten Start schickt das Geraet die
+//      Kennung; ist sie gueltig, meldet der Server den Spieler bei PlayFab an (Server-API LoginWithServerCustomId, ServerCustomId 'vdr-<PlayFabId>',
+//      beim ersten Merken per LinkServerCustomId angelegt) und gibt dem Geraet ein frisches Sitzungsticket. Das Passwort wird NIE gespeichert.
+//        * mehrere Geraete moeglich (bis REMEMBER_MAX_DEVICES je Konto, das aelteste faellt heraus); Gueltigkeit REMEMBER_DAYS Tage ab letzter Nutzung
+//        * Abmelden im Spiel loescht die Kennung dieses Geraets (/auth/forget); "alle Geraete abmelden" = /auth/forget-all (mit Ticket)
+//        * Konto-Loeschung entfernt alle Kennungen (deleteAccountDataFor)
+//        * Ohne gueltige Kennung ist die Antwort immer gleich (401, invalid:true) - es verraet nichts ueber Konten. Fehlversuche sind global begrenzt.
+//      Tabelle: remember_tokens (bewusst NICHT in DB_EXPORT_TABLES: nur Pruefsummen, bei Wiederherstellung muessen sich Geraete neu anmelden).
+// #####################################################################
+
+const REMEMBER_DAYS = 90;
+const REMEMBER_MAX_DEVICES = 8;
+const REMEMBER_FAIL_LIMIT = 300;     // Fehlversuche je Minute, serverweit (zusaetzlich zur Unerratbarkeit der 256-Bit-Kennung)
+
+// Identitaet NUR aus dem geprueften Ticket (antwortet bei Fehlern selbst mit 401 und gibt dann null zurueck)
+async function rememberCaller(req, res) {
+    const ticket = req.get('X-Session-Ticket');
+    const playFabId = ticket ? await authenticateTicket(ticket) : null;
+    if (!playFabId) { res.status(401).json({ success: false, error: 'Nicht angemeldet.' }); return null; }
+    return { playFabId };
+}
+
+function rememberHash(token) { return require('crypto').createHash('sha256').update(String(token)).digest('hex'); }
+function rememberServerCustomId(playFabId) { return 'vdr-' + playFabId; }
+function rememberTokenValid(token) { return typeof token === 'string' && /^[0-9a-f]{64}$/.test(token); }
+
+app.post('/auth/remember', async (req, res) => {
+    const caller = await rememberCaller(req, res);
+    if (!caller) return;
+    try {
+        // PlayFab-Konto einmalig mit der Server-Kennung verknuepfen (schon verknuepft = in Ordnung)
+        try {
+            await playfabServer('/Server/LinkServerCustomId', { PlayFabId: caller.playFabId, ServerCustomId: rememberServerCustomId(caller.playFabId), ForceLink: true });
+        } catch (e) {
+            const code = e && e.response && e.response.data && (e.response.data.error || e.response.data.errorMessage || '');
+            if (!/AccountAlreadyLinked|alreadylinked|already linked/i.test(String(code))) throw e;
+        }
+        const token = require('crypto').randomBytes(32).toString('hex');
+        await pool.query('DELETE FROM remember_tokens WHERE playfab_id = $1 AND expires_at <= now()', [caller.playFabId]);
+        await pool.query(
+            `DELETE FROM remember_tokens WHERE id IN (SELECT id FROM remember_tokens WHERE playfab_id = $1 ORDER BY last_used_at DESC OFFSET $2)`,
+            [caller.playFabId, REMEMBER_MAX_DEVICES - 1]);
+        await pool.query(
+            `INSERT INTO remember_tokens (playfab_id, token_hash, expires_at) VALUES ($1, $2, now() + make_interval(days => $3))`,
+            [caller.playFabId, rememberHash(token), REMEMBER_DAYS]);
+        res.json({ success: true, token, days: REMEMBER_DAYS });
+    } catch (error) {
+        console.error('[Remember] Merken fehlgeschlagen:', error.message);
+        res.status(500).json({ success: false, error: 'Merken gerade nicht möglich.' });
+    }
+});
+
+app.post('/auth/remembered-login', async (req, res) => {
+    const token = req.body && req.body.token;
+    const invalid = () => res.status(401).json({ success: false, invalid: true, error: 'Dieses Gerät ist nicht mehr angemeldet.' });
+    if (rateLimited('remember-fail', REMEMBER_FAIL_LIMIT, 60000)) return res.status(429).json({ success: false, error: 'Zu viele Anfragen. Bitte warte einen Moment.' });
+    if (!rememberTokenValid(token)) return invalid();
+    try {
+        const hash = rememberHash(token);
+        const row = (await pool.query('SELECT id, playfab_id FROM remember_tokens WHERE token_hash = $1 AND expires_at > now()', [hash])).rows[0];
+        if (!row) return invalid();
+        const login = await playfabServer('/Server/LoginWithServerCustomId', {
+            ServerCustomId: rememberServerCustomId(row.playfab_id), CreateAccount: false,
+            InfoRequestParameters: { GetUserAccountInfo: true }
+        });
+        if (!login || !login.SessionTicket || login.PlayFabId !== row.playfab_id) throw new Error('Anmeldung bei PlayFab unvollstaendig');
+        await pool.query(`UPDATE remember_tokens SET last_used_at = now(), expires_at = now() + make_interval(days => $2) WHERE id = $1`, [row.id, REMEMBER_DAYS]);
+        const info = (login.InfoResultPayload && login.InfoResultPayload.AccountInfo) || {};
+        const ent = login.EntityToken || {};
+        res.json({
+            success: true, playFabId: login.PlayFabId, sessionTicket: login.SessionTicket,
+            entityToken: ent.EntityToken || '', entityId: (ent.Entity && ent.Entity.Id) || '', entityType: (ent.Entity && ent.Entity.Type) || '',
+            email: (info.PrivateInfo && info.PrivateInfo.Email) || '', username: info.Username || '',
+            displayName: (info.TitleInfo && info.TitleInfo.DisplayName) || ''
+        });
+    } catch (error) {
+        const status = error && error.response && error.response.status;
+        const data = error && error.response && error.response.data;
+        // Das Konto gibt es nicht mehr (geloescht) oder die Verknuepfung fehlt: Kennung ist wertlos
+        if (status === 400 && data && /AccountNotFound|AccountDeleted|AccountBanned/i.test(String(data.error || ''))) {
+            try { await pool.query('DELETE FROM remember_tokens WHERE token_hash = $1', [rememberHash(token)]); } catch (e2) { /* ignorieren */ }
+            return invalid();
+        }
+        console.error('[Remember] Anmeldung fehlgeschlagen:', error.message);
+        res.status(500).json({ success: false, error: 'Anmeldung gerade nicht möglich.' });
+    }
+});
+
+app.post('/auth/forget', async (req, res) => {
+    const token = req.body && req.body.token;
+    if (!rememberTokenValid(token)) return res.json({ success: true });
+    try { await pool.query('DELETE FROM remember_tokens WHERE token_hash = $1', [rememberHash(token)]); } catch (e) { console.error('[Remember] Vergessen:', e.message); }
+    res.json({ success: true });
+});
+
+app.post('/auth/forget-all', async (req, res) => {
+    const caller = await rememberCaller(req, res);
+    if (!caller) return;
+    try {
+        const r = await pool.query('DELETE FROM remember_tokens WHERE playfab_id = $1', [caller.playFabId]);
+        res.json({ success: true, removed: r.rowCount });
+    } catch (error) {
+        console.error('[Remember] Alle vergessen:', error.message);
+        res.status(500).json({ success: false, error: 'Gerade nicht möglich.' });
     }
 });
 
