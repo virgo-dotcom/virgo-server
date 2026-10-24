@@ -10692,7 +10692,7 @@ async function achvProgress(def, ctx) {
             for (const fl of ((await ctx.commander()).activeFleets || [])) sum += Math.max(0, Number(fl && fl.ships && fl.ships[c.i]) || 0);
             return clamp(sum, c.n);
         }
-        case 'system': {         // NEU 24.10.2026: ein ganzes Sonnensystem in Besitz (Piratenposten ausgenommen, mindestens c.min Planeten), ueberall Gebaeude i auf Stufe l
+        case 'system': {         // NEU 24.10.2026: ein ganzes Sonnensystem ALLEIN in Besitz (alle Planeten, auch Piraten-/Fremdplaneten muessen erobert sein; mindestens c.min Planeten; Regel des Nutzers 24.10.2026), ueberall Gebaeude i auf Stufe l
             const min = c.min || 3;
             const map = await ctx.planetMap();
             const systems = new Map();
@@ -10705,8 +10705,7 @@ async function achvProgress(def, ctx) {
             let best = { current: 0, target: min };
             for (const sy of systems.values()) {
                 const total = galaxyPlanetCount(sy.g, sy.s, sy.sys);
-                const pirates = (await pool.query(`SELECT COUNT(*)::int AS n FROM planet_registry WHERE galaxy_id = $1 AND sector_id = $2 AND system_id = $3 AND kind = 'pirate'`, [sy.g, sy.s, sy.sys])).rows[0].n;
-                const target = Math.max(min, total - pirates);
+                const target = Math.max(min, total);
                 const cand = { current: Math.min(sy.ready, target), target };
                 if (cand.current / cand.target > best.current / best.target || (cand.current / cand.target === best.current / best.target && cand.current > best.current)) best = cand;
             }
