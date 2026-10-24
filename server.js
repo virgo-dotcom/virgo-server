@@ -10506,23 +10506,29 @@ const ACHV_CATALOG = [
     {"id":"eco_energy_5","cat":"wirtschaft","cond":{"t":"building","i":1,"l":5},"reward":{"items":[{"i":"crate_res_0","q":1}]}},
     {"id":"eco_energy_10","cat":"wirtschaft","cond":{"t":"building","i":1,"l":10},"reward":{"items":[{"i":"crate_res_0","q":2}]}},
     {"id":"eco_energy_15","cat":"wirtschaft","cond":{"t":"building","i":1,"l":15},"reward":{"items":[{"i":"crate_res_0","q":3}]}},
+    {"id":"eco_energy_18","cat":"wirtschaft","cond":{"t":"building","i":1,"l":18},"reward":{"items":[{"i":"crate_res_0","q":4}]}},
     {"id":"eco_water_5","cat":"wirtschaft","cond":{"t":"building","i":2,"l":5},"reward":{"items":[{"i":"crate_res_1","q":1}]}},
     {"id":"eco_water_10","cat":"wirtschaft","cond":{"t":"building","i":2,"l":10},"reward":{"items":[{"i":"crate_res_1","q":2}]}},
     {"id":"eco_water_15","cat":"wirtschaft","cond":{"t":"building","i":2,"l":15},"reward":{"items":[{"i":"crate_res_1","q":3}]}},
+    {"id":"eco_water_18","cat":"wirtschaft","cond":{"t":"building","i":2,"l":18},"reward":{"items":[{"i":"crate_res_1","q":4}]}},
     {"id":"eco_metal_5","cat":"wirtschaft","cond":{"t":"building","i":3,"l":5},"reward":{"items":[{"i":"crate_res_2","q":1}]}},
     {"id":"eco_metal_10","cat":"wirtschaft","cond":{"t":"building","i":3,"l":10},"reward":{"items":[{"i":"crate_res_2","q":2}]}},
     {"id":"eco_metal_15","cat":"wirtschaft","cond":{"t":"building","i":3,"l":15},"reward":{"items":[{"i":"crate_res_2","q":3}]}},
+    {"id":"eco_metal_18","cat":"wirtschaft","cond":{"t":"building","i":3,"l":18},"reward":{"items":[{"i":"crate_res_2","q":4}]}},
     {"id":"eco_tools_5","cat":"wirtschaft","cond":{"t":"building","i":4,"l":5},"reward":{"items":[{"i":"crate_res_3","q":1}]}},
     {"id":"eco_tools_10","cat":"wirtschaft","cond":{"t":"building","i":4,"l":10},"reward":{"items":[{"i":"crate_res_3","q":2}]}},
     {"id":"eco_tools_15","cat":"wirtschaft","cond":{"t":"building","i":4,"l":15},"reward":{"items":[{"i":"crate_res_3","q":3}]}},
+    {"id":"eco_tools_18","cat":"wirtschaft","cond":{"t":"building","i":4,"l":18},"reward":{"items":[{"i":"crate_res_3","q":4}]}},
     {"id":"eco_hq_5","cat":"wirtschaft","cond":{"t":"building","i":0,"l":5},"reward":{"random":1}},
     {"id":"eco_hq_10","cat":"wirtschaft","cond":{"t":"building","i":0,"l":10},"reward":{"random":2}},
+    {"id":"eco_hq_15","cat":"wirtschaft","cond":{"t":"building","i":0,"l":15},"reward":{"random":3}},
+    {"id":"eco_hq_18","cat":"wirtschaft","cond":{"t":"building","i":0,"l":18},"reward":{"random":4}},
     {"id":"eco_sale_1","cat":"wirtschaft","cond":{"t":"count","s":"marketSales","n":1},"reward":{"random":1}},
     {"id":"eco_sale_10","cat":"wirtschaft","cond":{"t":"count","s":"marketSales","n":10},"reward":{"random":2}},
-    {"id":"eco_buy_1","cat":"wirtschaft","cond":{"t":"count","s":"marketPurchases","n":1},"reward":{"random":1}},
-    {"id":"eco_buy_10","cat":"wirtschaft","cond":{"t":"count","s":"marketPurchases","n":10},"reward":{"random":2}},
     {"id":"eco_sale_50","cat":"wirtschaft","cond":{"t":"count","s":"marketSales","n":50},"reward":{"random":3}},
     {"id":"eco_sale_250","cat":"wirtschaft","cond":{"t":"count","s":"marketSales","n":250},"reward":{"items":[{"i":"crate_ship_1","q":2}]}},
+    {"id":"eco_buy_1","cat":"wirtschaft","cond":{"t":"count","s":"marketPurchases","n":1},"reward":{"random":1}},
+    {"id":"eco_buy_10","cat":"wirtschaft","cond":{"t":"count","s":"marketPurchases","n":10},"reward":{"random":2}},
     {"id":"eco_cont_1","cat":"wirtschaft","cond":{"t":"ships","i":1,"n":1},"reward":{"random":1}},
     {"id":"eco_cont_5","cat":"wirtschaft","cond":{"t":"ships","i":1,"n":5},"reward":{"random":2}},
     {"id":"eco_cont_25","cat":"wirtschaft","cond":{"t":"ships","i":1,"n":25},"reward":{"items":[{"i":"crate_ship_1","q":1}]}},
@@ -10534,6 +10540,7 @@ const ACHV_CATALOG = [
     {"id":"eco_guest_5","cat":"wirtschaft","cond":{"t":"count","s":"transportRecipients","n":5},"reward":{"random":2}},
     {"id":"eco_guest_20","cat":"wirtschaft","cond":{"t":"count","s":"transportRecipients","n":20},"reward":{"random":4}},
     {"id":"first_warship","cat":"militaer","cond":{"t":"researchAll","r":[["weapon01",1],["shield01",1]]},"reward":{"random":1}},
+    {"id":"mil_yard_5","cat":"militaer","cond":{"t":"building","i":5,"l":5},"reward":{"random":1}},
     {"id":"mil_win_1","cat":"militaer","cond":{"t":"count","s":"combatWins","n":1},"reward":{"random":1}},
     {"id":"mil_win_10","cat":"militaer","cond":{"t":"count","s":"combatWins","n":10},"reward":{"random":2}},
     {"id":"mil_win_50","cat":"militaer","cond":{"t":"count","s":"combatWins","n":50},"reward":{"items":[{"i":"crate_warship_0","q":1}]}},
@@ -10550,18 +10557,22 @@ const ACHV_CATALOG = [
     {"id":"mil_npcclan_6","cat":"militaer","cond":{"t":"count","s":"npcClans","n":6},"reward":{"items":[{"i":"crate_warship_0","q":1}]}},
     {"id":"mil_npcloot_100k","cat":"militaer","cond":{"t":"count","s":"npcLoot","n":100000},"reward":{"random":2}},
     {"id":"mil_npcloot_1m","cat":"militaer","cond":{"t":"count","s":"npcLoot","n":1000000},"reward":{"random":3}},
-    {"id":"mil_yard_5","cat":"militaer","cond":{"t":"building","i":5,"l":5},"reward":{"random":1}},
     {"id":"tech_first","cat":"technologie","cond":{"t":"researchSum","l":1},"reward":{"random":1}},
+    {"id":"tech_admin_3","cat":"technologie","cond":{"t":"research","f":"verwaltung","l":3},"reward":{"random":1}},
+    {"id":"tech_engine_1","cat":"technologie","cond":{"t":"research","f":"engine01","l":1},"reward":{"random":1}},
     {"id":"tech_lab_5","cat":"technologie","cond":{"t":"building","i":6,"l":5},"reward":{"random":1}},
     {"id":"tech_lab_10","cat":"technologie","cond":{"t":"building","i":6,"l":10},"reward":{"random":2}},
     {"id":"tech_habitat_1","cat":"technologie","cond":{"t":"research","f":"terraforming","l":1},"reward":{"random":1}},
     {"id":"tech_habitat_5","cat":"technologie","cond":{"t":"research","f":"terraforming","l":5},"reward":{"random":2}},
-    {"id":"tech_admin_3","cat":"technologie","cond":{"t":"research","f":"verwaltung","l":3},"reward":{"random":1}},
-    {"id":"tech_engine_1","cat":"technologie","cond":{"t":"research","f":"engine01","l":1},"reward":{"random":1}},
     {"id":"tutorial_done","cat":"expansion","cond":{"t":"tutorial"},"reward":{"items":[{"i":"crate_res_0","q":1},{"i":"crate_res_1","q":1},{"i":"crate_res_2","q":1},{"i":"crate_res_3","q":1},{"i":"crate_warship_0","q":1}]}},
     {"id":"exp_email","cat":"expansion","cond":{"t":"emailVerified"},"reward":{"random":1}},
+    {"id":"exp_colony_2","cat":"expansion","cond":{"t":"count","s":"colonies","n":2},"reward":{"random":1}},
     {"id":"exp_colony_3","cat":"expansion","cond":{"t":"count","s":"colonies","n":3},"reward":{"random":2}},
     {"id":"exp_colony_5","cat":"expansion","cond":{"t":"count","s":"colonies","n":5},"reward":{"random":3}},
+    {"id":"exp_colony_8","cat":"expansion","cond":{"t":"count","s":"colonies","n":8},"reward":{"items":[{"i":"crate_ship_3","q":1}]}},
+    {"id":"exp_colship_1","cat":"expansion","cond":{"t":"ships","i":3,"n":1},"reward":{"random":1}},
+    {"id":"exp_colship_5","cat":"expansion","cond":{"t":"ships","i":3,"n":5},"reward":{"random":3}},
+    {"id":"exp_system_energy_18","cat":"expansion","cond":{"t":"system","i":1,"l":18,"min":3},"reward":{"items":[{"i":"crate_res_0","q":5}]}},
     {"id":"exp_alliance","cat":"expansion","cond":{"t":"count","s":"alliance","n":1},"reward":{"random":1}},
     {"id":"exp_friend_1","cat":"expansion","cond":{"t":"count","s":"friends","n":1},"reward":{"random":1}},
     {"id":"exp_friend_5","cat":"expansion","cond":{"t":"count","s":"friends","n":5},"reward":{"random":2}},
@@ -10569,10 +10580,6 @@ const ACHV_CATALOG = [
     {"id":"exp_treasury_1","cat":"expansion","cond":{"t":"count","s":"treasuryDeposits","n":1},"reward":{"random":1}},
     {"id":"exp_treasury_10","cat":"expansion","cond":{"t":"count","s":"treasuryDeposits","n":10},"reward":{"random":2}},
     {"id":"exp_treasury_value","cat":"expansion","cond":{"t":"count","s":"treasuryValue","n":100000},"reward":{"random":2}},
-    {"id":"exp_colony_2","cat":"expansion","cond":{"t":"count","s":"colonies","n":2},"reward":{"random":1}},
-    {"id":"exp_colony_8","cat":"expansion","cond":{"t":"count","s":"colonies","n":8},"reward":{"items":[{"i":"crate_ship_3","q":1}]}},
-    {"id":"exp_colship_1","cat":"expansion","cond":{"t":"ships","i":3,"n":1},"reward":{"random":1}},
-    {"id":"exp_colship_5","cat":"expansion","cond":{"t":"ships","i":3,"n":5},"reward":{"random":3}},
     {"id":"exp_nobel","cat":"expansion","cond":{"t":"all","parts":[{"t":"ships","i":1,"n":10},{"t":"research","f":"recycling","l":3},{"t":"count","s":"transportsSent","n":25},{"t":"count","s":"colonies","n":3}]},"reward":{"items":[{"i":"crate_ship_3","q":1},{"i":"crate_ship_1","q":3}]}},
     {"id":"exp_daily_7","cat":"expansion","cond":{"t":"count","s":"dailyDays","n":7},"reward":{"random":2}},
     {"id":"exp_daily_30","cat":"expansion","cond":{"t":"count","s":"dailyDays","n":30},"reward":{"random":4}},
@@ -10624,6 +10631,14 @@ function achvContext(playFabId, commanderId) {
             }
             return cache.planets;
         },
+        async planetMap() {      // NEU 24.10.2026: fertige eigene Planeten MIT Koordinate (coord -> Planetendaten)
+            if (!cache.planetMap) {
+                const reg = await pool.query(`SELECT coord FROM planet_registry WHERE owner_commander_id = $1 AND kind = 'player' AND terraform_until IS NULL`, [commanderId]);
+                const coords = reg.rows.map(x => x.coord);
+                cache.planetMap = coords.length > 0 ? await marketLoadPlanets(playFabId, coords) : {};
+            }
+            return cache.planetMap;
+        },
         async emailVerified() {
             if (cache.email === undefined) {
                 try {
@@ -10652,6 +10667,7 @@ function achvTarget(cond) {
         case 'researchAll': return cond.r.length;
         case 'count': return cond.n;
         case 'ships': return cond.n;
+        case 'system': return cond.min || 3;
         case 'all': return cond.parts.length;
         case 'tutorial': return 4;
         default: return 1;
@@ -10674,6 +10690,26 @@ async function achvProgress(def, ctx) {
             for (const p of await ctx.planets()) sum += Math.max(0, Number(p.ships && p.ships[c.i]) || 0);
             for (const fl of ((await ctx.commander()).activeFleets || [])) sum += Math.max(0, Number(fl && fl.ships && fl.ships[c.i]) || 0);
             return clamp(sum, c.n);
+        }
+        case 'system': {         // NEU 24.10.2026: ein ganzes Sonnensystem in Besitz (Piratenposten ausgenommen, mindestens c.min Planeten), ueberall Gebaeude i auf Stufe l
+            const min = c.min || 3;
+            const map = await ctx.planetMap();
+            const systems = new Map();
+            for (const coord of Object.keys(map)) {
+                const p = coord.split(':').map(Number);
+                const key = p[0] + ':' + p[1] + ':' + p[2];
+                if (!systems.has(key)) systems.set(key, { g: p[0], s: p[1], sys: p[2], ready: 0 });
+                if ((Number(map[coord].buildings && map[coord].buildings[c.i]) || 0) >= c.l) systems.get(key).ready++;
+            }
+            let best = { current: 0, target: min };
+            for (const sy of systems.values()) {
+                const total = galaxyPlanetCount(sy.g, sy.s, sy.sys);
+                const pirates = (await pool.query(`SELECT COUNT(*)::int AS n FROM planet_registry WHERE galaxy_id = $1 AND sector_id = $2 AND system_id = $3 AND kind = 'pirate'`, [sy.g, sy.s, sy.sys])).rows[0].n;
+                const target = Math.max(min, total - pirates);
+                const cand = { current: Math.min(sy.ready, target), target };
+                if (cand.current / cand.target > best.current / best.target || (cand.current / cand.target === best.current / best.target && cand.current > best.current)) best = cand;
+            }
+            return best;
         }
         case 'all': {            // NEU 23.10.2026: alle Teilbedingungen gleichzeitig; Fortschritt = Anzahl erfuellter Teile
             let done = 0;
