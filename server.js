@@ -54,6 +54,7 @@
 //  §25  KAMPF V2 (Rundenkampf, Mischbonus, Zivile in letzter Reihe): steht VOR §21; aktiv nur bei COMBAT_ENGINE=shadow|v2
 //  §26  GALAXIE-REGISTER (planet_registry): serverautoritative Belegung, Schritt 1 (nur lesen/befuellen); steht VOR §21
 //  §28  INVENTAR (PlayFab Internal Data "inventory"): Kisten (Rohstoffe Ress01-10, Schiffe), Oeffnen, Admin-Vergabe "#inv"; steht VOR §21
+//  §40  DATEN-AUSKUNFT (GET /account/export: Kopie der eigenen Daten, DSGVO); steht VOR §21
 //  §39  ANGEMELDET BLEIBEN (remember_tokens, POST /auth/remember|remembered-login|forget|forget-all; Geraete-Kennung, nur Pruefsumme gespeichert); steht VOR §21
 //  §37  TAEGLICHE AUFGABEN (daily_quest_state, GET /daily, POST /daily/claim; Katalog von Tools/Daily/sync_daily.js); steht VOR §21
 //  §36  PIRATEN / EnemyNPC (npc_clans/_bases/_raids/_events, ein Clan je Sektor, GET /npc/..., NPC-Verteidiger in resolveCombat, Admin "#npc"); steht VOR §21
@@ -12290,6 +12291,63 @@ app.post('/auth/forget-all', async (req, res) => {
     } catch (error) {
         console.error('[Remember] Alle vergessen:', error.message);
         res.status(500).json({ success: false, error: 'Gerade nicht möglich.' });
+    }
+});
+
+// #####################################################################
+// §40  DATEN-AUSKUNFT (GET /account/export) — NEU 24.10.2026
+//      Der Spieler kann im Optionsmenue eine Kopie SEINER Daten abrufen (DSGVO Art. 15/20): Stammdaten, Eintraege aus allen Datenbank-
+//      Tabellen, in denen seine Commander-ID vorkommt (Beziehungen, Allianz, Handel, Transporte, Erfolge, Tagesaufgaben, Kaempfe ohne den
+//      Inhalt der Berichte, Piratenangriffe, Planeten ...) und sein eigener Spielstand aus PlayFab (commander_data). Daten ANDERER Spieler
+//      (Berichtsinhalt, Mails anderer) sind nicht enthalten. Nur mit Ticket, hoechstens 5 Abrufe je Stunde. Jede Tabelle wird einzeln
+//      abgefragt: faellt eine aus, steht dort "nicht lesbar", der Rest kommt trotzdem.
+// #####################################################################
+
+app.get('/account/export', async (req, res) => {
+    const caller = await requireCaller(req, res);
+    if (!caller) return;
+    if (rateLimited('export|' + caller.playFabId, 5, 3600000)) return res.status(429).json({ success: false, error: 'Zu viele Abrufe. Bitte später erneut versuchen.' });
+    try {
+        const pf = caller.playFabId, id = caller.commanderId;
+        const part = async (sql, params, limit) => {
+            try { return (await pool.query(sql + ' LIMIT ' + (limit || 500), params)).rows; }
+            catch (e) { return { hinweis: 'nicht lesbar' }; }
+        };
+        const postgres = {
+            highscore:               await part('SELECT * FROM commander_highscore WHERE commander_id = $1', [id]),
+            beziehungen:             await part('SELECT * FROM player_relationships WHERE commander_id_a = $1 OR commander_id_b = $1', [id]),
+            allianz_mitgliedschaft:  await part('SELECT * FROM alliance_members WHERE commander_id = $1', [id]),
+            allianz_bewerbungen:     await part('SELECT * FROM alliance_applications WHERE commander_id = $1', [id]),
+            allianzkasse_buchungen:  await part('SELECT * FROM alliance_treasury_log WHERE commander_id = $1 ORDER BY id DESC', [id]),
+            handel_angebote:         await part('SELECT * FROM market_offers WHERE seller_commander_id = $1 OR buyer_commander_id = $1 ORDER BY id DESC', [id]),
+            transporte:              await part('SELECT * FROM transport_deliveries WHERE sender_commander_id = $1 OR recipient_commander_id = $1 ORDER BY id DESC', [id]),
+            stationierte_flotten:    await part('SELECT * FROM stationed_fleets WHERE owner_commander_id = $1 OR host_commander_id = $1', [id]),
+            kaempfe_uebersicht:      await part('SELECT report_id, planet_coord, attacker_commander_id, defender_commander_id, attacker_wins, created_at FROM combat_reports WHERE attacker_commander_id = $1 OR defender_commander_id = $1 ORDER BY created_at DESC', [id], 200),
+            piratenangriffe:         await part('SELECT * FROM npc_raids WHERE commander_id = $1 ORDER BY created_at DESC', [id], 300),
+            erfolge:                 await part('SELECT * FROM achievement_state WHERE commander_id = $1', [id]),
+            tagesaufgaben_abgeholt:  await part('SELECT * FROM daily_quest_state WHERE commander_id = $1 ORDER BY claimed_at DESC', [id], 300),
+            tagesaufgaben_ereignisse: await part('SELECT * FROM daily_events WHERE commander_id = $1 ORDER BY created_at DESC', [id], 300),
+            planeten:                await part('SELECT * FROM planet_registry WHERE owner_commander_id = $1', [id]),
+            geschenkkisten:          await part('SELECT * FROM giftbox_claims WHERE playfab_id = $1', [pf]),
+            geraete_angemeldet_bleiben: await part('SELECT created_at, last_used_at, expires_at FROM remember_tokens WHERE playfab_id = $1 ORDER BY created_at DESC', [pf], 20)
+        };
+        let spielstand = null;
+        try {
+            const r = await playfabServer('/Server/GetUserData', { PlayFabId: pf, Keys: ['commander_data'] });
+            if (r && r.Data && r.Data.commander_data) spielstand = JSON.parse(r.Data.commander_data.Value);
+        } catch (e) { spielstand = { hinweis: 'nicht lesbar' }; }
+        if (spielstand && JSON.stringify(spielstand).length > 1500000) { spielstand.inbox = '(Postfach wegen der Größe weggelassen - auf Anfrage per E-Mail)'; }
+        const out = {
+            erstellt_am: new Date().toISOString(),
+            hinweis: 'Kopie deiner bei uns gespeicherten Daten. Daten anderer Spieler (z. B. Kampfbericht-Inhalte) sind nicht enthalten. Fragen: virgo.space.dominion@gmail.com',
+            konto: { playFabId: pf, commanderId: id },
+            datenbank: postgres,
+            spielstand
+        };
+        res.json({ success: true, text: JSON.stringify(out, null, 2) });
+    } catch (error) {
+        console.error('[Export] Fehler:', error.message);
+        res.status(500).json({ success: false, error: 'Der Abruf ist gerade nicht möglich.' });
     }
 });
 
