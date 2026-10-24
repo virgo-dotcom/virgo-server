@@ -12344,7 +12344,27 @@ app.get('/account/export', async (req, res) => {
             datenbank: postgres,
             spielstand
         };
-        res.json({ success: true, text: JSON.stringify(out, null, 2) });
+        // Lesbare Zusammenfassung fuer die Anzeige im Spiel; "text" bleibt die vollstaendige, maschinenlesbare Auskunft (Kopieren/Export)
+        const labels = {
+            highscore: 'Rangliste (Punkte)', beziehungen: 'Beziehungen zu anderen Spielern', allianz_mitgliedschaft: 'Allianz-Mitgliedschaft',
+            allianz_bewerbungen: 'Allianz-Bewerbungen', allianzkasse_buchungen: 'Buchungen in der Allianzkasse', handel_angebote: 'Handelsangebote',
+            transporte: 'Transporte', stationierte_flotten: 'Stationierte Flotten', kaempfe_uebersicht: 'Kämpfe (Übersicht)', piratenangriffe: 'Piratenangriffe',
+            erfolge: 'Erfolge', tagesaufgaben_abgeholt: 'Abgeholte Tagesaufgaben', tagesaufgaben_ereignisse: 'Tagesaufgaben-Ereignisse', planeten: 'Planeten',
+            geschenkkisten: 'Geschenkkisten', geraete_angemeldet_bleiben: 'Geräte mit "Angemeldet bleiben"'
+        };
+        const lines = ['DEINE GESPEICHERTEN DATEN', 'Stand: ' + out.erstellt_am.replace('T', ' ').slice(0, 16) + ' UTC', '',
+            'Commander-ID: ' + id, 'Spielername: ' + ((spielstand && spielstand.visibleName) || '(unbekannt)'), '', 'EINTRÄGE JE BEREICH'];
+        for (const k of Object.keys(labels)) {
+            const v = postgres[k];
+            lines.push('  ' + labels[k] + ': ' + (Array.isArray(v) ? v.length : 'nicht lesbar'));
+        }
+        const hs = Array.isArray(postgres.highscore) && postgres.highscore[0];
+        if (hs) lines.push('', 'RANGLISTE', '  Gesamtpunkte: ' + hs.total_points, '  Flotte: ' + hs.fleet_points, '  Infrastruktur: ' + hs.infrastructure_points, '  Forschung: ' + hs.research_points);
+        lines.push('', 'SPIELSTAND', spielstand ? '  Dein kompletter Spielstand (Planeten, Gebäude, Flotten, Postfach ...) ist gespeichert.' : '  Kein Spielstand gefunden.');
+        lines.push('', 'Daten anderer Spieler (z. B. Inhalte von Kampfberichten) sind nicht enthalten.',
+            'Die vollständige Auskunft mit jedem einzelnen Eintrag bekommst du mit "Alles kopieren" (z. B. zum Einfügen in ein Textdokument).',
+            'Fragen oder Löschwunsch: virgo.space.dominion@gmail.com');
+        res.json({ success: true, text: JSON.stringify(out, null, 2), summary: lines.join('\n') });
     } catch (error) {
         console.error('[Export] Fehler:', error.message);
         res.status(500).json({ success: false, error: 'Der Abruf ist gerade nicht möglich.' });
